@@ -34,3 +34,9 @@ build/
 out/
 *.tar
 *.tar.gz
+
+# OMC / Claude Code session artifacts (never commit)
+.omc/
+.claude/
+CLAUDE.md
+AGENTS.md
