@@ -1,0 +1,51 @@
+services:
+  scenario-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: scenario-runner:latest
+    container_name: scenario-runner
+    restart: unless-stopped
+
+    # host network: 컨테이너가 호스트 네트워크를 공유하므로
+    #   1) uvicorn 이 호스트의 ${PORT} 에 직접 bind
+    #   2) 컨테이너 내부에서 localhost:6443 = 109서버 K3s API
+    # 별도 포트 매핑 / extra_hosts 불필요.
+    network_mode: host
+
+    command:
+      - "uv"
+      - "run"
+      - "--no-dev"
+      - "uvicorn"
+      - "app.main:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "${PORT:-8090}"
+
+    volumes:
+      # 호스트의 kubeconfig 를 read-only 로 노출. 컨테이너 안에서도
+      # 호스트와 동일한 경로(/home/nkia/.kube)로 보이게 해서 NKIAAI-480
+      # 스크립트들이 `export KUBECONFIG=/home/nkia/.kube/config` 를 그대로
+      # 쓸 수 있게 한다. 스크립트 수정을 피하기 위한 선택.
+      - ${KUBECONFIG_HOST_PATH:-/home/nkia/.kube}:/home/nkia/.kube:ro
+
+      # 109서버의 장애 시나리오 스크립트 (NKIAAI-480 산출물) 를 read-only 마운트
+      - ${SCRIPTS_HOST_PATH:-/home/nkia/scenarios}:/app/scripts:ro
+
+      # 실행 로그를 호스트에 보존 (컨테이너 재시작 시에도 유지)
+      - ${LOGS_HOST_PATH:-./logs}:/app/logs:rw
+
+    environment:
+      - KUBECONFIG=/home/nkia/.kube/config
+      - SCRIPT_DIR=/app/scripts
+      - LOG_DIR=/app/logs
+      - STATIC_DIR=/app/static
+
+    # 선택: 기본 stdout/stderr 로깅 (docker logs scenario-runner 로 확인)
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

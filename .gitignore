@@ -21,7 +21,7 @@ dist/
 # Runtime / logs
 logs/
 *.pid
-*.lock
+# Note: package lock files (uv.lock, package-lock.json) are COMMITTED for reproducibility.
 
 # Editor / OS
 .vscode/
