@@ -16,7 +16,8 @@ export type IconName =
   | "sparkle"
   | "shield"
   | "split"
-  | "search";
+  | "search"
+  | "spinner";
 
 const PATHS: Record<IconName, ReactNode> = {
   play: <path d="M7 5l12 7-12 7V5z" />,
@@ -63,6 +64,14 @@ const PATHS: Record<IconName, ReactNode> = {
     <>
       <circle cx="11" cy="11" r="7" />
       <path d="M21 21l-4.3-4.3" />
+    </>
+  ),
+  // Faint full circle + 90° accent arc. Rotated via `.spin` class to give a
+  // classic loading look without being as busy as the bolt icon.
+  spinner: (
+    <>
+      <circle cx="12" cy="12" r="9" opacity="0.2" />
+      <path d="M21 12a9 9 0 0 0-9-9" />
     </>
   ),
 };

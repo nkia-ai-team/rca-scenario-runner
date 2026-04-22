@@ -23,7 +23,7 @@ const STATUS_META: Record<DisplayStatus, BigStatusMeta> = {
   },
   running: {
     bg: "bg-violet-50 text-violet-800 ring-violet-200",
-    icon: <Icon name="bolt" className="w-5 h-5 spin" />,
+    icon: <Icon name="spinner" className="w-5 h-5 spin" />,
     label: "실행 중",
     sub: "fault 주입 · telemetry 스트리밍",
   },
