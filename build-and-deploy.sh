@@ -19,6 +19,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Load .env so PORT / mount paths match what docker-compose will interpolate.
+# docker-compose auto-loads .env, but this shell script does not, which caused
+# the health-check loop to hit a wrong port.
+if [[ -f "${SCRIPT_DIR}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/.env"
+    set +a
+fi
+
 # --- 색상 ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
