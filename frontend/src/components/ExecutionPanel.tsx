@@ -66,8 +66,13 @@ interface Props {
 export function ExecutionPanel({ exec, elapsed, onCopy, onDownload }: Props) {
   const scn = exec?.scenario ?? null;
   const duration = scn?.estimated_duration_sec ?? 0;
-  const progress = duration > 0 ? Math.min(1, elapsed / duration) : 0;
   const status: DisplayStatus = exec?.status ?? "idle";
+  const isTerminal = status === "succeeded" || status === "failed";
+  const progress = isTerminal
+    ? 1
+    : duration > 0
+      ? Math.min(1, elapsed / duration)
+      : 0;
 
   return (
     <div className="card flex flex-col overflow-hidden h-full relative">
