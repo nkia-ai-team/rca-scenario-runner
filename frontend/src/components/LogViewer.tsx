@@ -57,7 +57,7 @@ export function LogViewer({ lines, onCopy, onDownload }: Props) {
   });
 
   return (
-    <div className="terminal terminal-hair flex flex-col overflow-hidden flex-1 min-h-0 relative">
+    <div className="terminal terminal-hair flex flex-col overflow-hidden relative">
       <div className="px-3 py-2 flex items-center justify-between border-b border-[oklch(24%_0.015_270)]">
         <div className="flex items-center gap-2.5">
           <div className="flex items-center gap-1">
@@ -110,7 +110,7 @@ export function LogViewer({ lines, onCopy, onDownload }: Props) {
       <div
         ref={scrollRef}
         onScroll={onScroll}
-        className="log-scroll flex-1 min-h-[300px] overflow-y-auto mono text-[12px] leading-[1.6] py-2"
+        className="log-scroll h-[440px] overflow-y-auto mono text-[12px] leading-[1.6] py-2"
       >
         {shown.length === 0 ? (
           <div className="px-3 py-10 text-slate-500 text-center">

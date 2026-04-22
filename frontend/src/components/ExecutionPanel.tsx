@@ -70,7 +70,7 @@ export function ExecutionPanel({ exec, elapsed, onCopy, onDownload }: Props) {
   const status: DisplayStatus = exec?.status ?? "idle";
 
   return (
-    <div className="card flex flex-col overflow-hidden h-full relative">
+    <div className="card flex flex-col overflow-hidden relative">
       <div className="p-5 border-b hair relative">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
@@ -166,7 +166,7 @@ export function ExecutionPanel({ exec, elapsed, onCopy, onDownload }: Props) {
         </div>
       </div>
 
-      <div className="p-4 flex-1 flex flex-col min-h-0 bg-[var(--bg-2)] relative">
+      <div className="p-4 flex flex-col bg-[var(--bg-2)] relative">
         <LogViewer
           lines={exec?.lines ?? []}
           onCopy={onCopy}

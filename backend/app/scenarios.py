@@ -44,15 +44,16 @@ SCENARIOS: dict[str, Scenario] = {
     "04": Scenario(
         id="04",
         name="Black Friday Traffic Flood",
-        description="동시 주문 요청 폭주로 order-service thread pool 포화",
-        cause="Apache Bench 동시 500 requests",
-        propagation="order thread pool 포화 → 하위 서비스 cascading 5xx",
+        description="동시 주문 요청 폭주로 order-service thread pool 포화 + DB 커넥션/락 경합",
+        cause="4단계 점진적 트래픽 폭주 (5 → 50 → 200 → 500 concurrent)",
+        propagation="order thread pool 포화 → 하위 서비스 cascading 5xx → DB 세션/Lock 급증",
         expected_alarms=[
-            "SMS host CPU/MEM 증가",
-            "APM order error rate",
-            "inventory CPU 급증 (4m → 48m)",
+            "APM 평균응답시간 초과 (order/inventory/payment/product)",
+            "DPM DB 연결 수 폭증 (≥55 세션)",
+            "DPM DB Lock 수 급증 (≥40 Lock)",
+            "DPM 트랜잭션 시간 초과",
         ],
-        estimated_duration_sec=60,
+        estimated_duration_sec=240,
         script_filename="scenario-04-traffic-flood.sh",
     ),
 }
