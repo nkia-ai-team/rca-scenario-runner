@@ -38,5 +38,4 @@ out/
 # OMC / Claude Code session artifacts (never commit)
 .omc/
 .claude/
-CLAUDE.md
-AGENTS.md
+# Note: CLAUDE.md 는 레포 문서로 사용하므로 commit 함 (session artifact 아님)
