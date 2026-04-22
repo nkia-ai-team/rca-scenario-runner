@@ -91,7 +91,7 @@ class ScenarioRunner:
             args.append("cleanup")
 
         env = os.environ.copy()
-        env.setdefault("KUBECONFIG", "/root/.kube/config")
+        env.setdefault("KUBECONFIG", "/home/nkia/.kube/config")
 
         async with self._lock:
             try:
