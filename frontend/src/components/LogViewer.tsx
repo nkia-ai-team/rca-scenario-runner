@@ -110,7 +110,7 @@ export function LogViewer({ lines, onCopy, onDownload }: Props) {
       <div
         ref={scrollRef}
         onScroll={onScroll}
-        className="log-scroll flex-1 min-h-0 overflow-y-auto mono text-[12px] leading-[1.6] py-2"
+        className="log-scroll flex-1 min-h-0 max-h-[60vh] overflow-y-auto mono text-[12px] leading-[1.6] py-2"
       >
         {shown.length === 0 ? (
           <div className="px-3 py-10 text-slate-500 text-center">
