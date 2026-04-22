@@ -46,7 +46,7 @@ export function Hero({ anyRunning, scenarioCount, history }: Props) {
                     : "bg-emerald-500 pulse-ok"
                 }`}
               />
-              {anyRunning ? "시나리오 실행 중" : "모든 시스템 정상"}
+              {anyRunning ? "시나리오 실행 중" : "실행 중인 시나리오 없음"}
             </span>
             <span className="mono text-[11px] text-[var(--ink-3)]">
               · {today()}
