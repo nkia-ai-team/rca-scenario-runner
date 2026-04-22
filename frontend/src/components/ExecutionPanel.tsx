@@ -59,7 +59,7 @@ function BigStatus({ status }: { status: DisplayStatus }) {
 interface Props {
   exec: ExecutionState | null;
   elapsed: number;
-  onCopy: () => void | Promise<void>;
+  onCopy: () => Promise<boolean>;
   onDownload: () => void | Promise<void>;
 }
 

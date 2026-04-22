@@ -14,14 +14,14 @@ const LVL: Record<LogLine["lvl"], string> = {
 
 interface Props {
   lines: LogLine[];
-  onCopy: () => void | Promise<void>;
+  onCopy: () => Promise<boolean>;
   onDownload: () => void | Promise<void>;
 }
 
 export function LogViewer({ lines, onCopy, onDownload }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [autoscroll, setAutoscroll] = useState(true);
-  const [copyState, setCopyState] = useState<"idle" | "done">("idle");
+  const [copyState, setCopyState] = useState<"idle" | "done" | "fail">("idle");
   const [filter, setFilter] = useState<Filter>("all");
 
   useEffect(() => {
@@ -38,9 +38,9 @@ export function LogViewer({ lines, onCopy, onDownload }: Props) {
   };
 
   const handleCopy = async () => {
-    await onCopy();
-    setCopyState("done");
-    setTimeout(() => setCopyState("idle"), 1200);
+    const ok = await onCopy();
+    setCopyState(ok ? "done" : "fail");
+    setTimeout(() => setCopyState("idle"), 1400);
   };
 
   const filtered = filter === "all" ? lines : lines.filter((l) => l.lvl === filter);
@@ -94,7 +94,7 @@ export function LogViewer({ lines, onCopy, onDownload }: Props) {
             data-tip="전체 로그 복사"
           >
             <Icon name="copy" className="w-3 h-3" />
-            {copyState === "done" ? "copied" : "copy"}
+            {copyState === "done" ? "copied" : copyState === "fail" ? "failed" : "copy"}
           </button>
           <button
             onClick={onDownload}

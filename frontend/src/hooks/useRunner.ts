@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api, ApiError } from "../api/client";
+import { writeClipboard } from "../lib/clipboard";
 import { parseLogTail } from "../lib/parseLog";
 import type {
   DisplayStatus,
@@ -33,7 +34,7 @@ export interface RunnerApi {
   run: (scn: ScenarioView) => Promise<void>;
   cleanup: (scn: ScenarioView) => Promise<void>;
   downloadLog: () => Promise<void>;
-  copyLog: () => Promise<void>;
+  copyLog: () => Promise<boolean>;
 }
 
 function toDisplay(status: Status): DisplayStatus {
@@ -191,13 +192,11 @@ export function useRunner(scenarios: ScenarioView[]): RunnerApi {
       .join("\n");
   }, [exec]);
 
-  const copyLog = useCallback(async () => {
-    if (!exec) return;
-    try {
-      await navigator.clipboard?.writeText(linesToText());
-    } catch (e) {
-      console.warn("clipboard failed", e);
-    }
+  const copyLog = useCallback(async (): Promise<boolean> => {
+    if (!exec) return false;
+    const ok = await writeClipboard(linesToText());
+    if (!ok) console.warn("clipboard write failed");
+    return ok;
   }, [exec, linesToText]);
 
   const downloadLog = useCallback(async () => {
