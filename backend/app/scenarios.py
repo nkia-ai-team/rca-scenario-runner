@@ -34,18 +34,20 @@ SCENARIOS: dict[str, Scenario] = {
     "03": Scenario(
         id="03",
         name="PostgreSQL Pod CPU Throttle",
-        description="postgres pod CPU limit 도달로 전 서비스 쿼리 지연",
-        cause="K8s CPU limit (500m) 도달 → CPU throttling",
-        propagation="DB slow query → 전 서비스 RT 증가 (GET 180x, POST 17x)",
+        description="postgres pod CPU limit 500m → 10m 축소로 전 서비스 쿼리 지연",
+        cause="K8s CPU limit 10m 로 조정 → 극심한 CPU throttling",
+        propagation="DB slow query → POST /api/orders 평균 3.23s (최대 6.11s), 서비스 에러율 급증",
         expected_alarms=[
-            "KCM postgres Pod CPU throttling",
-            "APM 전 서비스 response time 증가",
+            "APM 평균응답시간 초과 (inventory/payment/order/product 모두 12~16s, >5s 임계치)",
+            "APM 서비스 에러율 급증 (payment 최고 66.7%, inventory/order 33.3%, product 25%)",
+            "KCM postgres Pod CPU throttling (K3s metrics-server 설치된 경우에만 발동)",
         ],
-        estimated_duration_sec=120,
+        estimated_duration_sec=150,
         script_filename="scenario-03-db-cpu-throttle.sh",
         warnings=[
             "cleanup 중 postgres pod 가 재기동되면서 KCM 의 postgres 개별 알람 설정이 disable 될 수 있음",
             "재기동 후 KCM 콘솔에서 개별 알람 룰을 다시 활성화해야 함",
+            "K3s 에 metrics-server 미설치 시 kubectl top / KCM Pod CPU 알람 안 뜸 (시나리오 실행엔 영향 없음)",
         ],
     ),
     "04": Scenario(
