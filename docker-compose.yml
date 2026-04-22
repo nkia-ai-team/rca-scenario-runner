@@ -37,6 +37,11 @@ services:
       # 실행 로그를 호스트에 보존 (컨테이너 재시작 시에도 유지)
       - ${LOGS_HOST_PATH:-./logs}:/app/logs:rw
 
+      # 호스트 docker daemon socket. scenario-02 가 pg-mock 컨테이너를
+      # start/stop 하는 데 사용. 보안: 컨테이너가 호스트의 모든 docker
+      # 작업을 root 권한으로 수행 가능하므로 내부 신뢰 환경에서만 사용.
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+
     environment:
       - KUBECONFIG=/home/nkia/.kube/config
       - SCRIPT_DIR=/app/scripts
