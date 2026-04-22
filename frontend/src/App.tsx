@@ -193,7 +193,7 @@ export default function App() {
               <span>내부 전용 도구 · 외부 노출 금지</span>
             </div>
             <div className="flex items-center gap-4">
-              <span className="mono">rca-scenario-runner · NKIAAI-498</span>
+              <span>개선사항은 AI1팀 방성준에게 말씀해주세요</span>
             </div>
           </footer>
         </main>
