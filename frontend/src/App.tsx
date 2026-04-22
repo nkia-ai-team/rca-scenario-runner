@@ -189,7 +189,10 @@ export default function App() {
             <section
               className="col-span-3 sticky top-[72px] self-start overflow-hidden"
               style={{
-                maxHeight: leftHeight
+                // height (not max-height) 라야 자식 ExecutionPanel 의 h-full
+                // 이 실제 픽셀로 해석되고, 그 안의 flex-1 min-h-0 체인이
+                // LogViewer 의 overflow-y-auto 를 트리거할 수 있다.
+                height: leftHeight
                   ? `min(${leftHeight}px, calc(100vh - 96px))`
                   : "calc(100vh - 96px)",
               }}
