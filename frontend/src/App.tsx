@@ -170,7 +170,7 @@ export default function App() {
               </div>
             </section>
 
-            <section className="col-span-3">
+            <section className="col-span-3 max-h-[calc(100vh-180px)]">
               <ExecutionPanel
                 exec={runner.exec}
                 elapsed={elapsed}
