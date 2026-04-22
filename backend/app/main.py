@@ -1,5 +1,9 @@
+import os
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.models import HealthResponse, HistoryEntry, RunInfo, Scenario
 from app.runner import get_runner
@@ -80,3 +84,13 @@ async def api_full_log(scenario_id: str, run_id: str) -> Response:
 @app.get("/api/history", response_model=list[HistoryEntry])
 async def api_history() -> list[HistoryEntry]:
     return get_runner().get_history()
+
+
+# Static frontend (production). Mount LAST so /api/* routes above win.
+_STATIC_DIR = Path(os.environ.get("STATIC_DIR", "/app/static"))
+if _STATIC_DIR.is_dir():
+    app.mount(
+        "/",
+        StaticFiles(directory=str(_STATIC_DIR), html=True),
+        name="static",
+    )
