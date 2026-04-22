@@ -15,6 +15,7 @@ class Scenario(BaseModel):
     expected_alarms: list[str]
     estimated_duration_sec: int
     script_filename: str
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RunInfo(BaseModel):

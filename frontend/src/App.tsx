@@ -135,7 +135,7 @@ export default function App() {
             </div>
           )}
 
-          <div className="grid grid-cols-5 gap-5">
+          <div className="grid grid-cols-5 gap-5 items-start">
             <section className="col-span-2 space-y-3">
               <div className="flex items-baseline justify-between px-1">
                 <div>
@@ -170,7 +170,7 @@ export default function App() {
               </div>
             </section>
 
-            <section className="col-span-3 max-h-[calc(100vh-180px)]">
+            <section className="col-span-3 sticky top-[72px] self-start max-h-[calc(100vh-96px)] overflow-hidden">
               <ExecutionPanel
                 exec={runner.exec}
                 elapsed={elapsed}

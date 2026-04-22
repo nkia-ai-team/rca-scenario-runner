@@ -43,6 +43,10 @@ SCENARIOS: dict[str, Scenario] = {
         ],
         estimated_duration_sec=120,
         script_filename="scenario-03-db-cpu-throttle.sh",
+        warnings=[
+            "cleanup 중 postgres pod 가 재기동되면서 KCM 의 postgres 개별 알람 설정이 disable 될 수 있음",
+            "재기동 후 KCM 콘솔에서 개별 알람 룰을 다시 활성화해야 함",
+        ],
     ),
     "04": Scenario(
         id="04",
@@ -58,6 +62,11 @@ SCENARIOS: dict[str, Scenario] = {
         ],
         estimated_duration_sec=240,
         script_filename="scenario-04-traffic-flood.sh",
+        warnings=[
+            "cleanup 시 애플리케이션 서비스가 rolling restart 되어 WPM 에이전트가 재등록됨",
+            "기존 에이전트는 disabled 상태로 남고, 에이전트 총 개수가 실행할 때마다 증가",
+            "disabled 에이전트를 삭제하면 해당 에이전트가 수집한 WPM 데이터 전부 함께 삭제됨 — 주의해서 관리",
+        ],
     ),
 }
 

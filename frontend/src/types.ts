@@ -18,6 +18,7 @@ export interface ApiScenario {
   expected_alarms: string[];
   estimated_duration_sec: number;
   script_filename: string;
+  warnings: string[];
 }
 
 export interface RunInfo {

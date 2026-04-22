@@ -143,6 +143,27 @@ export function ScenarioCard({
                     ))}
                   </ul>
                 </div>
+
+                {scn.warnings.length > 0 && (
+                  <>
+                    <div className="mono text-[10.5px] uppercase tracking-wider text-amber-700 pt-0.5">
+                      주의사항
+                    </div>
+                    <div className="rounded-md bg-amber-50 ring-1 ring-amber-200 px-2.5 py-2">
+                      <ul className="space-y-1.5">
+                        {scn.warnings.map((w, i) => (
+                          <li
+                            key={i}
+                            className="flex items-start gap-2 text-amber-900"
+                          >
+                            <span className="mt-[7px] w-1 h-1 rounded-full bg-amber-600 shrink-0" />
+                            <span className="text-[12px] leading-relaxed">{w}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </>
+                )}
               </div>
             )}
 
