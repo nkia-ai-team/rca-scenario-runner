@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { ExecutionPanel } from "./components/ExecutionPanel";
 import { Hero } from "./components/Hero";
@@ -43,6 +43,22 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(true);
   const [toast, setToast] = useState<ToastData | null>(null);
   const prevStatusRef = useRef<DisplayStatus | null>(null);
+  const leftSectionRef = useRef<HTMLElement | null>(null);
+  const [leftHeight, setLeftHeight] = useState<number | null>(null);
+
+  // 왼쪽 시나리오 리스트 높이를 추적해 오른쪽 실행 패널 max-height 로 사용한다.
+  // 카드 펼침/접힘마다 높이가 변하므로 ResizeObserver 로 동기화. CSS sibling
+  // 높이 매칭은 순수하게 불가능해서 JS 가 유일한 깔끔한 경로.
+  useLayoutEffect(() => {
+    const el = leftSectionRef.current;
+    if (!el) return;
+    const update = () =>
+      setLeftHeight(Math.round(el.getBoundingClientRect().height));
+    update();
+    const obs = new ResizeObserver(update);
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, []);
 
   const elapsed = useElapsed(
     runner.exec?.status ?? "idle",
@@ -136,7 +152,7 @@ export default function App() {
           )}
 
           <div className="grid grid-cols-5 gap-5 items-start">
-            <section className="col-span-2 space-y-3">
+            <section ref={leftSectionRef} className="col-span-2 space-y-3">
               <div className="flex items-baseline justify-between px-1">
                 <div>
                   <h2 className="text-[15px] font-semibold text-[var(--ink)] tracking-[-0.01em]">
@@ -170,7 +186,14 @@ export default function App() {
               </div>
             </section>
 
-            <section className="col-span-3 sticky top-[72px] self-start max-h-[calc(100vh-96px)] overflow-hidden">
+            <section
+              className="col-span-3 sticky top-[72px] self-start overflow-hidden"
+              style={{
+                maxHeight: leftHeight
+                  ? `min(${leftHeight}px, calc(100vh - 96px))`
+                  : "calc(100vh - 96px)",
+              }}
+            >
               <ExecutionPanel
                 exec={runner.exec}
                 elapsed={elapsed}
