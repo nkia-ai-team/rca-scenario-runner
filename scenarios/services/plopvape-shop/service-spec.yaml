@@ -1,0 +1,47 @@
+service:
+  name: plopvape-shop
+  description: |
+    RCA 테스트베드용 쇼핑몰 마이크로서비스.
+    109서버 K3s rca-testbed 네임스페이스에 배포: nginx + 5개 shop 서비스(order/product/inventory/payment/notification) + postgres + redis.
+  owner: BangSungjoon
+  linear_project: RCA 테스트베드
+
+target:
+  server: "192.168.200.109"
+  ssh_user: nkia
+  arch: arm64
+  namespace: rca-testbed
+  kubeconfig: /home/nkia/.kube/config
+  api_base: "http://127.0.0.1:30080"
+
+scenarios:
+  - id: scenario-01
+    file: scenario-01-inventory-lock.sh
+    title: Inventory Row Lock Contention
+    root_cause: inventory 테이블 row lock + 동시 주문
+    propagation: inventory lock wait → product timeout → order 5xx → Nginx 502
+    estimated_duration_sec: 360
+
+  - id: scenario-02
+    file: scenario-02-payment-timeout.sh
+    title: 외부 PG API 무응답 → 결제/주문 캐스케이드 장애
+    root_cause: pg-mock 중단 + TCP blackhole
+    propagation: pg-mock 무응답 → payment read timeout(10s) → order thread starvation → 502
+    estimated_duration_sec: 300
+
+  - id: scenario-03
+    file: scenario-03-db-cpu-throttle.sh
+    title: PostgreSQL CPU Throttle
+    root_cause: postgres pod CPU 제한
+    propagation: DB 느림 → 전 서비스 지연
+    estimated_duration_sec: 300
+    side_effects:
+      - "cleanup 중 postgres pod 재기동 → KCM postgres 개별 알람 설정 disable (콘솔에서 수동 재활성화)"
+
+  - id: scenario-04
+    file: scenario-04-traffic-flood.sh
+    title: Traffic Flood
+    root_cause: 대량 트래픽 주입
+    estimated_duration_sec: 300
+    side_effects:
+      - "cleanup이 5개 서비스 rolling restart → WPM 에이전트 재등록, 기존 에이전트 disabled + 카운트 증가"

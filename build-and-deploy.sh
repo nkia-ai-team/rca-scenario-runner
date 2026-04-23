@@ -42,7 +42,7 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 PORT="${PORT:-8090}"
-SCRIPTS_HOST_PATH="${SCRIPTS_HOST_PATH:-/home/nkia/scenarios}"
+SCRIPTS_HOST_PATH="${SCRIPTS_HOST_PATH:-./scenarios/services/plopvape-shop/scripts}"
 KUBECONFIG_HOST_PATH="${KUBECONFIG_HOST_PATH:-/home/nkia/.kube}"
 
 # compose v1 vs v2 감지
@@ -76,12 +76,16 @@ phase_prereqs() {
 
     if [[ ! -d "$SCRIPTS_HOST_PATH" ]]; then
         log_error "시나리오 스크립트 경로 누락: $SCRIPTS_HOST_PATH"
-        log_error "NKIAAI-480 의 스크립트를 109 호스트의 이 경로에 배치해야 합니다."
+        log_error "기본 경로는 레포 내부 scenarios/services/<name>/scripts/ 입니다. git pull 후 재시도하거나 .env 의 SCRIPTS_HOST_PATH 를 확인하세요."
         exit 1
     fi
     local script_count
     script_count="$(find "$SCRIPTS_HOST_PATH" -name 'scenario-*.sh' -maxdepth 1 | wc -l)"
     log_ok "시나리오 스크립트: $script_count 개 (${SCRIPTS_HOST_PATH})"
+    if [[ "$script_count" -eq 0 ]]; then
+        log_error "시나리오 스크립트가 0개 입니다. 경로 확인: $SCRIPTS_HOST_PATH"
+        exit 1
+    fi
 
     if [[ ! -f "${KUBECONFIG_HOST_PATH}/config" ]]; then
         log_error "kubeconfig 누락: ${KUBECONFIG_HOST_PATH}/config"

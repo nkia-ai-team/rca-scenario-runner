@@ -72,7 +72,7 @@ git pull                                            # 이후엔 pull 만
 | `LOG_DIR` | `/app/logs` | 실행 로그 저장 |
 | `STATIC_DIR` | `/app/static` | React dist 서빙 경로 |
 | `KUBECONFIG` | `/home/nkia/.kube/config` | **스크립트가 하드코딩** 한 경로. 컨테이너 안 마운트 경로를 이것에 맞춤 |
-| `SCRIPTS_HOST_PATH` | `/home/nkia/scenarios` | 호스트의 시나리오 bash 파일 경로 |
+| `SCRIPTS_HOST_PATH` | `./scenarios/services/plopvape-shop/scripts` | 레포 내부 시나리오 경로(기본). 다른 서비스로 전환 시 `./scenarios/services/<name>/scripts` |
 | `LOGS_HOST_PATH` | `./logs` | 호스트 로그 보존 경로 |
 | `KUBECONFIG_HOST_PATH` | `/home/nkia/.kube` | 호스트 kubeconfig 디렉토리 |
 
@@ -81,7 +81,7 @@ git pull                                            # 이후엔 pull 만
 `docker-compose.yml` 에 3개, 각각 이유 있음:
 
 1. **`${KUBECONFIG_HOST_PATH}:/home/nkia/.kube:ro`** — 컨테이너 안에서도 호스트와 **동일 경로** 로 노출. 이유: NKIAAI-480 bash 스크립트 1번째 줄 `export KUBECONFIG=/home/nkia/.kube/config` 하드코딩. 스크립트 수정 회피 목적.
-2. **`${SCRIPTS_HOST_PATH}:/app/scripts:ro`** — 시나리오 스크립트를 이 레포에 두지 않고, 109서버의 `/home/nkia/scenarios/` 에 배치된 파일을 런타임 마운트. NKIAAI-480 업데이트 시 scp 로 동기화.
+2. **`${SCRIPTS_HOST_PATH}:/app/scripts:ro`** — 시나리오 스크립트는 **레포에 포함**(`scenarios/services/<name>/scripts/`). 기본 서비스 `plopvape-shop`. 다른 서비스 전환 시 `.env` 의 `SCRIPTS_HOST_PATH` 오버라이드. (구 디자인: `/home/nkia/scenarios/` scp 방식 — 2026-04 이관으로 레포 내부 경로가 source of truth.)
 3. **`/var/run/docker.sock:/var/run/docker.sock:rw`** — **Docker-out-of-Docker**. scenario-02 가 호스트 `pg-mock` 컨테이너를 start/stop. 컨테이너가 호스트 docker root 권한 획득이라 보안상 내부 신뢰 환경 한정.
 
 ## Known Gotchas / Conventions
@@ -115,6 +115,6 @@ git pull                                            # 이후엔 pull 만
 
 ## Related Repos
 
-- **lucida-rca-agent** (GitLab cims2, 제품 레포) — RCA 분석 엔진. NKIAAI-480 의 scenario bash 스크립트 원본(`scripts/testbed/scenarios/`) 보유. 109서버엔 파일만 복사됨.
+- **lucida-rca-agent** (GitLab cims2, 제품 레포) — RCA 분석 엔진. NKIAAI-480 시나리오 스크립트는 2026-04 본 레포(`scenarios/services/plopvape-shop/scripts/`)로 이관되어 현재 rca-agent 에는 없음.
 - **plopvape-shop** (GitHub, ARM64 빌드 패턴 참조) — 109서버 K3s `rca-testbed` ns 의 testbed-* pods 배포. scenario-runner 가 이 pods 를 `kubectl exec` 로 조작.
 - **Polestar10** 관측 도메인: APM/WPM/DPM/NMS/KCM/SMS. 자세한 맵은 `lucida-rca-agent/docs/testbed/architecture.md` §3.2.

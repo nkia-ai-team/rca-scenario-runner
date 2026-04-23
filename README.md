@@ -7,7 +7,7 @@ Linear 이슈: [NKIAAI-498](https://linear.app/nkia/issue/NKIAAI-498).
 
 - 109서버 K3s 의 `rca-testbed` 네임스페이스에 배포된 쇼핑몰 마이크로서비스를 대상으로 사전 정의된 4종 장애 시나리오를 웹 UI 로 실행
 - 테스터가 SSH 없이 브라우저에서 버튼 클릭만으로 장애 주입 + 실시간 상태/로그 확인
-- 시나리오 스크립트(NKIAAI-480 산출물)는 볼륨 마운트로 참조 (레포에 포함하지 않음)
+- 시나리오 스크립트는 레포에 포함 (`scenarios/services/<service-name>/scripts/`). 배포 시 레포 내부 경로가 컨테이너로 마운트됨. 자세한 구조는 [scenarios/README.md](scenarios/README.md) 참조.
 
 ## Architecture
 
@@ -35,9 +35,9 @@ Browser ──HTTP──▶ 109서버:8090 ──▶ [Docker (host network)]
 ## Prerequisites (109서버)
 
 - Docker 24+ 및 docker compose v2 플러그인
-- `/home/nkia/scenarios/` 에 NKIAAI-480 시나리오 스크립트 4종
 - `/home/nkia/.kube/config` 로 로컬 K3s API 접근 가능
 - 호스트 포트 8090 free (변경 가능, `.env` 참조)
+- 시나리오 스크립트는 **레포 내부**(`scenarios/services/<service-name>/scripts/`)에 포함되어 있어 별도 배치 불필요. 기본 서비스: `plopvape-shop`. 다른 서비스로 전환하려면 `.env` 의 `SCRIPTS_HOST_PATH` 오버라이드.
 
 ## Deploy (109서버)
 
@@ -74,10 +74,10 @@ git pull
 ```bash
 # 터미널 1: backend
 cd backend
-SCRIPT_DIR=/home/sjbang/dev/lucida-rca-agent/scripts/testbed/scenarios \
+SCRIPT_DIR=../scenarios/services/plopvape-shop/scripts \
   LOG_DIR=/tmp/scenario-runner-logs \
   uv sync
-SCRIPT_DIR=/home/sjbang/dev/lucida-rca-agent/scripts/testbed/scenarios \
+SCRIPT_DIR=../scenarios/services/plopvape-shop/scripts \
   LOG_DIR=/tmp/scenario-runner-logs \
   uv run uvicorn app.main:app --reload --port 8000
 
@@ -107,7 +107,7 @@ cd frontend && npm run build
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
 | `PORT` | `8090` | 호스트 바인드 포트 |
-| `SCRIPTS_HOST_PATH` | `/home/nkia/scenarios` | 컨테이너 `/app/scripts` 로 마운트되는 호스트 경로 |
+| `SCRIPTS_HOST_PATH` | `./scenarios/services/plopvape-shop/scripts` | 컨테이너 `/app/scripts` 로 마운트되는 경로. 레포 내부가 기본값 — 다른 서비스로 바꾸려면 `./scenarios/services/<name>/scripts` 로 변경 |
 | `KUBECONFIG_HOST_PATH` | `/home/nkia/.kube` | 컨테이너 `/root/.kube` 로 마운트되는 호스트 경로 |
 | `LOGS_HOST_PATH` | `./logs` | 실행 로그 영구 보존 경로 |
 
