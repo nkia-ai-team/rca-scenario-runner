@@ -50,7 +50,7 @@ npm run build                                       # dist/
 
 ```bash
 ssh nkia@192.168.200.109
-git clone https://github.com/BangSungjoon/rca-scenario-runner.git ~/rca-scenario-runner    # 최초 1회
+git clone https://github.com/nkia-ai-team/rca-scenario-runner.git ~/rca-scenario-runner    # 최초 1회
 cd ~/rca-scenario-runner
 git pull                                            # 이후엔 pull 만
 ./build-and-deploy.sh                               # 빌드 + compose up + healthz 확인

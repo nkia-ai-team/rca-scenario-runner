@@ -43,7 +43,7 @@ Browser ──HTTP──▶ 109서버:8090 ──▶ [Docker (host network)]
 
 ```bash
 # 최초
-git clone https://github.com/BangSungjoon/rca-scenario-runner.git ~/rca-scenario-runner
+git clone https://github.com/nkia-ai-team/rca-scenario-runner.git ~/rca-scenario-runner
 cd ~/rca-scenario-runner
 git checkout feature/nkiaai-498   # 통합 후에는 develop/main
 
