@@ -26,6 +26,8 @@ export function ScenarioCard({
   const [open, setOpen] = useState(false);
   const tone = TONE[scn.tone];
   const durationMin = Math.max(1, Math.round(scn.estimated_duration_sec / 60));
+  const isThisRunning = status === "running";
+  const runButtonDisabled = runDisabled || isThisRunning;
 
   return (
     <div
@@ -171,20 +173,35 @@ export function ScenarioCard({
               <div
                 className="tip"
                 data-tip={
-                  runDisabled ? "다른 시나리오가 실행 중입니다" : undefined
+                  isThisRunning
+                    ? "이 시나리오가 실행 중입니다"
+                    : runDisabled
+                      ? "다른 시나리오가 실행 중입니다"
+                      : undefined
                 }
               >
                 <button
-                  onClick={() => !runDisabled && onRun(scn)}
-                  disabled={runDisabled}
+                  onClick={() => !runButtonDisabled && onRun(scn)}
+                  disabled={runButtonDisabled}
                   className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-[12.5px] font-medium transition ${
-                    runDisabled
-                      ? "bg-slate-100 text-slate-400 cursor-not-allowed"
-                      : "bg-[var(--ink)] text-white hover:bg-black shadow-sm hover:shadow"
+                    isThisRunning
+                      ? "bg-violet-50 text-violet-700 ring-1 ring-violet-200 cursor-not-allowed"
+                      : runDisabled
+                        ? "bg-slate-100 text-slate-400 cursor-not-allowed"
+                        : "bg-[var(--ink)] text-white hover:bg-black shadow-sm hover:shadow"
                   }`}
                 >
-                  <Icon name="play" className="w-3.5 h-3.5" />
-                  실행
+                  {isThisRunning ? (
+                    <>
+                      <Icon name="spinner" className="w-3.5 h-3.5 spin" />
+                      실행 중
+                    </>
+                  ) : (
+                    <>
+                      <Icon name="play" className="w-3.5 h-3.5" />
+                      실행
+                    </>
+                  )}
                 </button>
               </div>
               <button
