@@ -49,14 +49,14 @@ npm run build                                       # dist/
 ## Deploy (109서버)
 
 ```bash
-ssh nkia@192.168.200.109
+ssh <host-user>@<target-host>
 git clone https://github.com/nkia-ai-team/rca-scenario-runner.git ~/rca-scenario-runner    # 최초 1회
 cd ~/rca-scenario-runner
 git pull                                            # 이후엔 pull 만
 ./build-and-deploy.sh                               # 빌드 + compose up + healthz 확인
 ```
 
-- 접속: `http://192.168.200.109:8091/`
+- 접속: `http://<target-host>:8091/`
 - 정지: `docker compose down`
 - uvicorn 로그: `docker logs -f scenario-runner`
 - 시나리오 bash stdout: `~/rca-scenario-runner/logs/{run_id}.log` (호스트 볼륨 마운트로 보존)

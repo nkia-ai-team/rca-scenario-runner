@@ -12,7 +12,7 @@
 #   ./scenario-02-payment-timeout.sh          # 시나리오 실행
 #   ./scenario-02-payment-timeout.sh cleanup  # 원상복구
 #
-# 실행 환경: 109서버 (ssh nkia@192.168.200.109)
+# 실행 환경: K3s + plopvape-shop 이 배포된 호스트 (rca-scenario-runner 가 같은 호스트에 떠있음)
 # =============================================================================
 
 set -uo pipefail

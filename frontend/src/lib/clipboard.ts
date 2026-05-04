@@ -3,7 +3,7 @@
  *
  * The modern `navigator.clipboard.writeText` API is only available in a
  * "secure context" — HTTPS pages or `http://localhost`. This tool is served
- * over `http://192.168.200.109:8091` (intranet), so browsers treat it as
+ * over private LAN HTTP endpoints (intranet), so browsers treat it as
  * insecure and `navigator.clipboard` is `undefined`. We fall back to the
  * legacy `document.execCommand('copy')` which works in insecure contexts.
  *

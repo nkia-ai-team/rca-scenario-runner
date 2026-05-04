@@ -9,7 +9,7 @@ services:
 
     # host network: 컨테이너가 호스트 네트워크를 공유하므로
     #   1) uvicorn 이 호스트의 ${PORT} 에 직접 bind
-    #   2) 컨테이너 내부에서 localhost:6443 = 109서버 K3s API
+    #   2) 컨테이너 내부에서 localhost:6443 = 호스트 K3s API
     # 별도 포트 매핑 / extra_hosts 불필요.
     network_mode: host
 
