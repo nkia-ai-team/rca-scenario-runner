@@ -7,12 +7,14 @@ service:
   linear_project: RCA 테스트베드
 
 target:
-  server: "192.168.200.109"
-  ssh_user: nkia
-  arch: arm64
-  namespace: rca-testbed
-  kubeconfig: /home/nkia/.kube/config
-  api_base: "http://127.0.0.1:30080"
+  # rca-scenario-runner 는 본인이 떠있는 호스트의 K3s 와 통신 (network_mode: host).
+  # 즉 다른 서버에 띄우면 그 서버의 testbed 를 조작. 본 metadata 는 참고용.
+  server: "<target-host>"          # 사내 K3s 호스트 (rca-scenario-runner 가 같이 떠있음)
+  ssh_user: "<host-user>"           # 예: nkia
+  arch: "<arch>"                    # 예: arm64 / amd64
+  namespace: rca-testbed             # K3s namespace (testbed-services 의 app_namespace)
+  kubeconfig: /home/<host-user>/.kube/config
+  api_base: "http://127.0.0.1:30080"  # localhost — host network 공유
 
 scenarios:
   - id: scenario-01

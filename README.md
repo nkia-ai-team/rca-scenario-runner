@@ -53,7 +53,7 @@ git checkout feature/nkiaai-498   # 통합 후에는 develop/main
 # 확인
 curl http://localhost:8090/healthz
 curl http://localhost:8090/api/scenarios
-# 브라우저: http://192.168.200.109:8090/
+# 브라우저: http://<target-host>:${PORT}/
 
 # 업데이트 (새 변경 반영)
 git pull
