@@ -1,0 +1,71 @@
+service:
+  name: social-feed
+  description: |
+    RCA 테스트베드용 SNS 마이크로서비스.
+    109서버 K3s rca-testbed-social 네임스페이스에 배포: nginx + 4개 서비스(post/feed/comment/notification) + mysql + mock-push-gateway.
+  owner: BangSungjoon
+  linear_project: RCA 테스트베드
+
+target:
+  server: "192.168.200.109"
+  ssh_user: "nkia"
+  arch: "arm64"
+  namespace: rca-testbed-social
+  kubeconfig: /home/nkia/.kube/config
+  api_base: "http://127.0.0.1:30081"
+
+scenarios:
+  - id: scenario-01
+    file: scenario-01-feed-entries-lock.sh
+    title: Feed Entries Row Lock Contention
+    description: feed_entries 테이블 long-held SELECT FOR UPDATE lock 로 동시 게시물 fan-out contention 재현
+    root_cause: 장시간 SELECT FOR UPDATE lock 점유 + 동시 POST /api/posts 폭주
+    propagation: feed_entries lock wait → post fan-out timeout → POST /api/posts 5xx → Nginx 502
+    estimated_duration_sec: 360
+    expected_alarms:
+      - DPM lock wait
+      - APM post-service response time 증가
+      - SMS mysql process CPU%
+
+  - id: scenario-02
+    file: scenario-02-notification-timeout.sh
+    title: Mock Push Gateway Timeout
+    description: mock-push-gateway 중단 + TCP black-hole 로 notification read-timeout 유발 → notification 캐스케이드 장애
+    root_cause: 외부 push gateway 무응답 (TCP 연결은 되지만 HTTP 응답 없음, 10초 대기)
+    propagation: notification read-timeout → notification thread starvation → 502 응답
+    estimated_duration_sec: 300
+    expected_alarms:
+      - APM notification 평균응답시간 초과 (3~5s, 외부 push gateway 대기)
+      - APM notification 서비스 에러율 급증 (최대 100%)
+      - DPM 트랜잭션 시간 초과 (≥5s)
+
+  - id: scenario-03
+    file: scenario-03-mysql-cpu-throttle.sh
+    title: MySQL Pod CPU Throttle
+    description: mysql pod CPU limit 500m → 10m 축소로 전 서비스 쿼리 지연
+    root_cause: K8s CPU limit 10m 로 조정 → 극심한 CPU throttling
+    propagation: DB slow query → 모든 endpoint 평균 3~5s, 서비스 에러율 급증
+    estimated_duration_sec: 300
+    expected_alarms:
+      - APM 평균응답시간 초과 (post/feed/comment/notification 모두 12~16s, >5s 임계치)
+      - APM 서비스 에러율 급증 (notification 최고 66.7%, feed/post 33.3%, comment 25%)
+      - KCM mysql Pod CPU throttling (K3s metrics-server 설치된 경우에만 발동)
+    side_effects:
+      - cleanup 중 mysql pod 가 재기동되면서 KCM 의 mysql 개별 알람 설정이 disable 될 수 있음
+      - 재기동 후 KCM 콘솔에서 개별 알람 룰을 다시 활성화해야 함
+
+  - id: scenario-04
+    file: scenario-04-traffic-flood.sh
+    title: Viral Post Traffic Flood
+    description: 동시 게시물 작성 폭주로 post-service thread pool 포화 + DB 커넥션/락 경합
+    root_cause: 4단계 점진적 트래픽 폭주 (5 → 50 → 200 → 500 concurrent)
+    propagation: post thread pool 포화 → fan-out 하위 서비스 cascading 5xx → DB 세션/Lock 급증
+    estimated_duration_sec: 300
+    expected_alarms:
+      - APM 평균응답시간 초과 (post/feed/comment/notification)
+      - DPM DB 연결 수 폭증 (≥55 세션)
+      - DPM DB Lock 수 급증 (≥40 Lock)
+      - DPM 트랜잭션 시간 초과
+    side_effects:
+      - cleanup 시 애플리케이션 서비스가 rolling restart 되어 WPM 에이전트가 재등록됨
+      - 기존 에이전트는 disabled 상태로 남고, 에이전트 총 개수가 실행할 때마다 증가
