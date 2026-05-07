@@ -1,0 +1,77 @@
+service:
+  name: food-delivery
+  description: |
+    RCA 테스트베드용 음식 배달 주문 처리 마이크로서비스.
+    109서버 K3s rca-testbed-food 네임스페이스에 배포: 4개 서비스(order/restaurant/dispatch/payment) + external-pg-mock + postgres + redis.
+  owner: BangSungjoon
+  linear_project: RCA 테스트베드
+
+target:
+  # rca-scenario-runner 는 본인이 떠있는 호스트의 K3s 와 통신 (network_mode: host).
+  # 즉 다른 서버에 띄우면 그 서버의 testbed 를 조작. 본 metadata 는 참고용.
+  server: "<target-host>"          # 사내 K3s 호스트 (rca-scenario-runner 가 같이 떠있음)
+  ssh_user: "<host-user>"           # 예: nkia
+  arch: "<arch>"                    # 예: arm64 / amd64
+  namespace: rca-testbed-food             # K3s namespace (testbed-services 의 app_namespace)
+  kubeconfig: /home/<host-user>/.kube/config
+  api_base: "http://127.0.0.1:30080"  # localhost — host network 공유
+
+scenarios:
+  - id: scenario-01
+    file: scenario-01-orders-lock.sh
+    title: Orders Row Lock Contention
+    description: orders 테이블 long-held SELECT FOR UPDATE lock 로 동시 주문 contention 재현
+    root_cause: 장시간 SELECT FOR UPDATE lock 점유 + 동시 주문 폭주
+    propagation: orders lock wait → restaurant timeout → order 5xx → Nginx 502
+    estimated_duration_sec: 360
+    expected_alarms:
+      - DPM lock wait
+      - APM orders response time 증가
+      - SMS postgres process CPU%
+
+  - id: scenario-02
+    file: scenario-02-payments-pgmock-timeout.sh
+    title: External PG API Timeout
+    description: pg-mock 중단 + TCP black-hole 로 payment read-timeout 유발 → order 캐스케이드 장애
+    root_cause: 외부 PG API 무응답 (TCP 연결은 되지만 HTTP 응답 없음, 10초 대기)
+    propagation: payment read-timeout → order thread starvation → 502 응답
+    estimated_duration_sec: 300
+    expected_alarms:
+      - APM payment 평균응답시간 초과 (3~5s, 외부 PG 대기)
+      - APM order 평균응답시간 초과 (10s+, payment 대기 누적)
+      - APM order 서비스 에러율 급증 (최대 100%)
+      - DPM 트랜잭션 시간 초과 (≥5s)
+      - DPM DB Lock 수 급증 (≥40 Lock)
+
+  - id: scenario-03
+    file: scenario-03-db-cpu-throttle.sh
+    title: PostgreSQL Pod CPU Throttle
+    description: postgres pod CPU limit 500m → 10m 축소로 전 서비스 쿼리 지연
+    root_cause: K8s CPU limit 10m 로 조정 → 극심한 CPU throttling
+    propagation: DB slow query → POST /api/orders 평균 3.23s (최대 6.11s), 서비스 에러율 급증
+    estimated_duration_sec: 300
+    expected_alarms:
+      - APM 평균응답시간 초과 (orders/payment/order/restaurant 모두 12~16s, >5s 임계치)
+      - APM 서비스 에러율 급증 (payment 최고 66.7%, orders/order 33.3%, restaurant 25%)
+      - KCM postgres Pod CPU throttling (K3s metrics-server 설치된 경우에만 발동)
+    side_effects:
+      - cleanup 중 postgres pod 가 재기동되면서 KCM 의 postgres 개별 알람 설정이 disable 될 수 있음
+      - 재기동 후 KCM 콘솔에서 개별 알람 룰을 다시 활성화해야 함
+      - K3s 에 metrics-server 미설치 시 kubectl top / KCM Pod CPU 알람 안 뜸 (시나리오 실행엔 영향 없음)
+
+  - id: scenario-04
+    file: scenario-04-traffic-flood.sh
+    title: Black Friday Traffic Flood
+    description: 동시 주문 요청 폭주로 order-service thread pool 포화 + DB 커넥션/락 경합
+    root_cause: 4단계 점진적 트래픽 폭주 (5 → 50 → 200 → 500 concurrent)
+    propagation: order thread pool 포화 → 하위 서비스 cascading 5xx → DB 세션/Lock 급증
+    estimated_duration_sec: 300
+    expected_alarms:
+      - APM 평균응답시간 초과 (order/orders/payment/restaurant)
+      - DPM DB 연결 수 폭증 (≥55 세션)
+      - DPM DB Lock 수 급증 (≥40 Lock)
+      - DPM 트랜잭션 시간 초과
+    side_effects:
+      - cleanup 시 애플리케이션 서비스가 rolling restart 되어 WPM 에이전트가 재등록됨
+      - 기존 에이전트는 disabled 상태로 남고, 에이전트 총 개수가 실행할 때마다 증가
+      - disabled 에이전트를 삭제하면 해당 에이전트가 수집한 WPM 데이터 전부 함께 삭제됨 — 주의해서 관리
