@@ -1,0 +1,82 @@
+service:
+  name: food-delivery
+  description: |
+    RCA 테스트베드용 음식 배달 마이크로서비스.
+    109서버 k3d 클러스터 rca-testbed-food 네임스페이스에 배포:
+      - 4개 Spring Boot 서비스: order / restaurant / dispatch / payment
+      - postgres (DB) + external-pg-mock (외부 PG API 시뮬레이터)
+    rca-scenario-runner 는 같은 109 호스트에서 network_mode: host 로 띄워져 있고
+    kubectl exec 로 testbed pods 를 조작.
+
+    시나리오 4종은 plopvape-shop 의 일반적 인프라 패턴 (row-lock / external-timeout /
+    CPU-throttle / 균등 traffic-flood) 과 의도적으로 겹치지 않도록 food-delivery
+    도메인 specific 한 장애 원인으로 선정:
+      1. 식당 영업 종료 mid-order (비즈니스 검증 폭주)
+      2. 배달원 capacity 부족 (delivery 도메인 unique)
+      3. 메뉴 매진 toggle race (boolean availability 캐시 race)
+      4. 점심 강남 region 단일 hotspot (데이터 분포 편향)
+  owner: BangSungjoon
+  linear_project: RCA 테스트베드
+
+target:
+  server: "192.168.200.109"
+  ssh_user: "nkia"
+  arch: "arm64"
+  namespace: rca-testbed-food
+  kubeconfig: /home/nkia/.kube/food-delivery.yaml
+  api_base: "kubectl exec testbed-order:8080"   # NodePort 없음 — exec 로 pod 내부 호출
+
+scenarios:
+  - id: scenario-01
+    file: scenario-01-restaurant-closed-storm.sh
+    title: Restaurant Closed Mid-Order Storm
+    description: 모든 식당 status='CLOSED' UPDATE → 동시 POST /api/orders 폭주 → restaurant validation 단계에서 비즈니스 검증 거부 폭증 (4xx). plopvape inventory-lock (데이터 lock) 과 다른 비즈니스 검증 실패 패턴.
+    root_cause: 식당 영업 종료 시점에 사용자 주문이 일제히 들어오는 race
+    propagation: status='CLOSED' → POST /api/orders → restaurant 검증 거부 → order 4xx 응답 폭증 → 사용자 재시도 → restaurant-service GET rate 폭증
+    estimated_duration_sec: 240
+    expected_alarms:
+      - APM order-service 에러율 급증 (validation 4xx)
+      - APM restaurant-service GET 호출 rate 폭증 (재시도)
+      - DPM restaurants SELECT rate 증가 (validation 폭주)
+
+  - id: scenario-02
+    file: scenario-02-courier-pool-exhaustion.sh
+    title: Courier Pool Exhaustion
+    description: dispatches 테이블에 가상 courier 200건 ASSIGNED pre-seed → courier pool 포화 상태에서 동시 주문 → dispatch-service 가 신규 ETA 계산 + 신규 dispatch row insert 시 capacity 한계 노출. food-delivery 의 핵심 도메인 제약 (배달원 수).
+    root_cause: 배달원 capacity 한계 — 모든 courier 가 ASSIGNED 상태일 때 신규 주문 처리
+    propagation: courier pool 포화 → POST /api/orders dispatch fan-out 지연 → ETA 무한 증가 → dispatches 테이블 row 폭증 → DB DML 부하
+    estimated_duration_sec: 300
+    expected_alarms:
+      - APM dispatch-service 응답시간 spike
+      - DPM dispatches INSERT rate 폭증
+      - DPM dispatches 테이블 row 수 폭증 (200+ ASSIGNED)
+    side_effects:
+      - 시나리오 진행 중 dispatches 에 가상 courier row 200+ 잔존
+      - cleanup 에서 자동 삭제 — order_id BETWEEN 900000~ 영역만 정리
+
+  - id: scenario-03
+    file: scenario-03-menu-availability-flapping.sh
+    title: Menu Availability Flapping
+    description: 0.5초 주기로 menus.available 50% random toggle + 동시 주문 (random menu 선택) → 일부 주문은 통과, 일부는 매진 4xx → 비결정적 retry storm + DB UPDATE/SELECT 경합. plopvape stock (integer lock 필요) 와 다른 boolean toggle race.
+    root_cause: 메뉴 가용성 (boolean) 이 실시간 토글되는 동안 클라이언트가 stale 데이터로 주문
+    propagation: menus available flap → POST /api/orders 시 item validation 비결정적 4xx → 사용자 retry → DB menus 테이블 UPDATE/SELECT 경합 → restaurant-service 의 menu 조회 캐시 stale
+    estimated_duration_sec: 200
+    expected_alarms:
+      - "APM 2xx/4xx 비결정적 분포 (정상시 거의 100% 2xx — 본건 ~50% 4xx)"
+      - DPM menus UPDATE rate spike (~120/min)
+      - APM order-service item validation 시간 증가
+
+  - id: scenario-04
+    file: scenario-04-lunch-rush-region-hotspot.sh
+    title: Lunch Rush GANGNAM Region Hot-Spot
+    description: 점심 시간 강남 (restaurant_id=1, GANGNAM region) 단일 region 만 4단계 점진적 폭주 (10 → 60 → 150 → 400). 균등 분산 flood 와 달리 데이터 분포 편향 — restaurant row 1개 + menus 5개만 hit → 단일 row hotspot + region partition skew.
+    root_cause: 점심 시간 강남 오피스 밀집 지역만 트래픽 집중 (region 데이터 편향)
+    propagation: GANGNAM 단일 region 폭주 → restaurant_id=1 row hot + menu 1~5 hot → orders.restaurant_id 인덱스 partition skew → DB cache LRU 가 한 region 만 hot → 다른 region 식당 조회 cold cache miss
+    estimated_duration_sec: 240
+    expected_alarms:
+      - APM order/restaurant/dispatch/payment 응답시간 증가 (단일 row hot)
+      - DPM orders(restaurant_id=1) row 폭증 vs 다른 region 정체
+      - DPM restaurants(id=1) SELECT rate 폭증
+    side_effects:
+      - cleanup 시 4 service rolling restart (thread pool reset) → WPM agent 재등록
+      - 기존 WPM agent disabled 상태로 남음 (plopvape 04 와 동일 부작용)
