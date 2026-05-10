@@ -35,6 +35,12 @@ services:
       # 기본값은 plopvape-shop 서비스. 다른 서비스로 바꾸려면 .env 에서 SCRIPTS_HOST_PATH 오버라이드.
       - ${SCRIPTS_HOST_PATH:-./scenarios/services/plopvape-shop/scripts}:/app/scripts:ro
 
+      # service-spec.yaml 카탈로그 — scenarios.py 가 <repo>/scenarios/services/*/service-spec.yaml glob.
+      # Dockerfile 이 scenarios/ 를 COPY 안 하므로 호스트의 scenarios/ 를 명시 mount.
+      # SCRIPTS_HOST_PATH 가 testbed-별 subdir 인 것과 별개로 모든 testbed 의 service-spec 이
+      # 컨테이너에서 보이게 해서 multi-testbed 환경에서도 시나리오 자동 발견 가능.
+      - ./scenarios:/app/scenarios:ro
+
       # 실행 로그를 호스트에 보존 (컨테이너 재시작 시에도 유지)
       - ${LOGS_HOST_PATH:-./logs}:/app/logs:rw
 
