@@ -34,10 +34,10 @@ DB_USER="fooddelivery"
 DB_PASS="fooddelivery1234"
 DB_NAME="fooddelivery"
 ORDER_POD_LABEL="app=testbed-order"
-FLAP_DURATION=180
+FLAP_DURATION=300           # 5분 — APM polling 60s × 최소 5 cycle 보장
 FLAP_INTERVAL_MS=500        # 0.5초 토글 주기
-CONCURRENT_ORDERS=15
-ORDER_ROUNDS=12
+CONCURRENT_ORDERS=20
+ORDER_ROUNDS=60             # 60 rounds × ~5s = ~5min sustained — APM 평가 cycle 여러 번 hit
 FLAPPER_PID_FILE="/tmp/scenario-03-fd-flapper.pid"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'

@@ -103,6 +103,31 @@ send_orders_capacity_test() {
     for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 
+# 추가 부하: dispatch endpoint 자체에 직접 동시 호출 폭주.
+# order-service 의 capacity check 가 0.05초도 안 돼서 빨리 reject 하므로 dispatch hop
+# 응답시간 spike 가 발생 안 함. 이를 보완하기 위해 dispatch /api/deliveries/dispatch 를
+# 직접 동시 호출 → capacity full 일 때 DB count + 503 반환 단계가 부하 누적 → AvgResponseTime 증가.
+send_dispatch_flood() {
+    local round=$1
+    log_info "=== Round $round: dispatch endpoint 직접 폭주 (50건 concurrent) ==="
+    local op; op=$(order_pod)
+    local pids=()
+    for i in $(seq 1 50); do
+        # 임의 orderId — FK 제거됐으므로 존재 안 해도 OK
+        local fake_oid=$((900000 + RANDOM % 1000))
+        kubectl -n "$NAMESPACE" exec "$op" -- \
+            curl -s -o /dev/null \
+            -w "disp-${round}-${i}: HTTP %{http_code} in %{time_total}s\n" \
+            --max-time 30 \
+            -X POST "http://testbed-dispatch:8082/api/deliveries/dispatch" \
+            -H "Content-Type: application/json" \
+            -d "{\"orderId\":${fake_oid},\"region\":\"GANGNAM\"}" \
+            >> /tmp/scenario-02-fd-dispatch.log 2>&1 &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+}
+
 monitor_dispatch_growth() {
     log_info "=== dispatch table growth + ETA distribution ==="
     psql_exec -c "
@@ -152,6 +177,7 @@ main() {
     seed_courier_pool; echo
     for r in $(seq 1 "$ORDER_ROUNDS"); do
         send_orders_capacity_test "$r"
+        send_dispatch_flood "$r"
         monitor_dispatch_growth; echo
         sleep 8
     done
