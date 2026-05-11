@@ -119,8 +119,10 @@ analyze_results() {
 cleanup() {
     log_info "=== 원상복구 (restaurant 영업 재개) ==="
     psql_exec -c "UPDATE restaurants SET status='OPEN';" 2>/dev/null || true
+    # 시나리오 도중 들어온 real 주문의 ASSIGNED dispatch 정리 — capacity 누적 방지.
+    psql_exec -c "UPDATE dispatches SET status='DELIVERED' WHERE status='ASSIGNED';" 2>/dev/null || true
     rm -f /tmp/scenario-01-fd-*.log
-    log_ok "전체 restaurant OPEN 복구"
+    log_ok "전체 restaurant OPEN 복구 + leftover ASSIGNED bulk DELIVERED"
 }
 
 main() {

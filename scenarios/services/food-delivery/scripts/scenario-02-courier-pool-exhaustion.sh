@@ -162,8 +162,11 @@ cleanup() {
     log_info "=== 원상복구 (courier pool 정리) ==="
     psql_exec -c "DELETE FROM dispatches WHERE order_id BETWEEN $SEED_ORDER_BASE_ID AND $SEED_ORDER_BASE_ID + $COURIER_POOL_SIZE * 2;" 2>/dev/null || true
     psql_exec -c "DELETE FROM orders WHERE id BETWEEN $SEED_ORDER_BASE_ID AND $SEED_ORDER_BASE_ID + $COURIER_POOL_SIZE * 2;" 2>/dev/null || true
+    # 시나리오 도중 들어온 real 주문의 ASSIGNED 도 정리해야 capacity 영구히 차는 일 없음.
+    # 그렇지 않으면 매 시나리오 후 dispatch pool 누적 → 후속 traffic 503 fast-fail → WPM "served=-".
+    psql_exec -c "UPDATE dispatches SET status='DELIVERED' WHERE status='ASSIGNED';" 2>/dev/null || true
     rm -f /tmp/scenario-02-fd-*.log
-    log_ok "seed orders/dispatches 정리 완료"
+    log_ok "seed orders/dispatches 정리 완료 + leftover ASSIGNED bulk DELIVERED"
 }
 
 main() {
