@@ -139,8 +139,10 @@ cleanup() {
     for svc in testbed-order testbed-restaurant testbed-dispatch testbed-payment; do
         kubectl -n "$NAMESPACE" rollout status deployment/"$svc" --timeout=120s 2>/dev/null || true
     done
+    # 시나리오 도중 들어온 real 주문의 ASSIGNED dispatch 정리 — capacity 누적 방지.
+    psql_exec -c "UPDATE dispatches SET status='DELIVERED' WHERE status='ASSIGNED';" 2>/dev/null || true
     rm -f /tmp/scenario-04-fd-*.log
-    log_ok "rolling restart 완료"
+    log_ok "rolling restart 완료 + leftover ASSIGNED bulk DELIVERED"
 }
 
 main() {
