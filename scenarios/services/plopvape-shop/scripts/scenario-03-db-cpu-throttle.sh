@@ -19,10 +19,10 @@ set -uo pipefail
 
 # --- 설정 ---
 export KUBECONFIG=/home/nkia/.kube/config
-NAMESPACE="rca-testbed"
+NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 PG_STATEFULSET="testbed-postgres"
-PG_POD="testbed-postgres-0"
-API_BASE="http://127.0.0.1:30080"
+PG_POD="${PG_POD:-testbed-postgres-0}"
+API_BASE="${API_BASE:-http://127.0.0.1:30080}"
 ORIGINAL_CPU_LIMIT="500m"
 ORIGINAL_CPU_REQUEST="200m"
 THROTTLE_CPU_LIMIT="10m"        # 극도로 낮은 CPU limit

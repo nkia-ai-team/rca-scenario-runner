@@ -18,9 +18,9 @@ set -uo pipefail
 
 # --- 설정 ---
 export KUBECONFIG=/home/nkia/.kube/config
-NAMESPACE="rca-testbed"
-PG_POD="testbed-postgres-0"
-API_BASE="http://127.0.0.1:30080"
+NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
+PG_POD="${PG_POD:-testbed-postgres-0}"
+API_BASE="${API_BASE:-http://127.0.0.1:30080}"
 LOCK_PRODUCT_ID=1          # lock을 걸 상품 ID
 LOCK_DURATION=120           # lock 유지 시간 (초)
 CONCURRENT_ORDERS=20        # 동시 주문 요청 수

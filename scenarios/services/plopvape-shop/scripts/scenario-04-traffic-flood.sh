@@ -19,9 +19,9 @@ set -uo pipefail
 
 # --- 설정 ---
 export KUBECONFIG=/home/nkia/.kube/config
-NAMESPACE="rca-testbed"
-PG_POD="testbed-postgres-0"
-API_BASE="http://127.0.0.1:30080"
+NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
+PG_POD="${PG_POD:-testbed-postgres-0}"
+API_BASE="${API_BASE:-http://127.0.0.1:30080}"
 
 # 트래픽 단계 (점진적 증가)
 PHASE_1_CONCURRENT=5            # 정상 트래픽

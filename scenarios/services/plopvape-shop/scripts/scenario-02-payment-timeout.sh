@@ -19,8 +19,8 @@ set -uo pipefail
 
 # --- 설정 ---
 export KUBECONFIG=/home/nkia/.kube/config
-NAMESPACE="rca-testbed"
-API_BASE="http://127.0.0.1:30080"
+NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
+API_BASE="${API_BASE:-http://127.0.0.1:30080}"
 PG_MOCK_CONTAINER="pg-mock"
 PG_MOCK_PORT=8090
 BLACKHOLE_PID_FILE="/tmp/scenario-02-blackhole.pid"
