@@ -5,9 +5,9 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.models import HealthResponse, HistoryEntry, RunInfo, Scenario
+from app.models import ActiveRun, Domain, HealthResponse, HistoryEntry, RunInfo, Scenario
 from app.runner import get_runner
-from app.scenarios import get_scenario, list_scenarios
+from app.scenarios import get_scenario, list_domains, list_scenarios
 
 app = FastAPI(
     title="RCA Testbed Scenario Runner",
@@ -24,6 +24,17 @@ async def healthz() -> HealthResponse:
 @app.get("/api/scenarios", response_model=list[Scenario])
 async def api_list_scenarios() -> list[Scenario]:
     return list_scenarios()
+
+
+@app.get("/api/domains", response_model=list[Domain])
+async def api_list_domains() -> list[Domain]:
+    return list_domains()
+
+
+@app.get("/api/active", response_model=ActiveRun)
+async def api_active() -> ActiveRun:
+    """Global snapshot — any client polls this to know if anyone else is busy."""
+    return get_runner().get_active()
 
 
 @app.get("/api/scenarios/{scenario_id}", response_model=Scenario)
@@ -64,7 +75,10 @@ async def api_cleanup(scenario_id: str) -> RunInfo:
 async def api_status(scenario_id: str) -> RunInfo:
     runner = get_runner()
     current = runner.get_current()
-    if current is None or current.scenario_id != scenario_id:
+    # Resolve bare short_id (legacy) to composite before comparing — current.scenario_id is always composite.
+    resolved = get_scenario(scenario_id)
+    canonical_id = resolved.id if resolved is not None else scenario_id
+    if current is None or current.scenario_id != canonical_id:
         raise HTTPException(
             status_code=404,
             detail=f"No active or recent run for scenario {scenario_id}",

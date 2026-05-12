@@ -42,7 +42,7 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 PORT="${PORT:-8090}"
-SCRIPTS_HOST_PATH="${SCRIPTS_HOST_PATH:-./scenarios/services/plopvape-shop/scripts}"
+SCENARIOS_HOST_PATH="${SCENARIOS_HOST_PATH:-./scenarios/services}"
 KUBECONFIG_HOST_PATH="${KUBECONFIG_HOST_PATH:-/home/nkia/.kube}"
 
 # compose v1 vs v2 감지
@@ -74,18 +74,21 @@ phase_prereqs() {
         log_warn "109서버는 ARM64 여야 합니다 (현재: $arch). 다른 호스트라면 빌드/실행은 되지만 운영 타겟과 아키텍처가 다릅니다."
     fi
 
-    if [[ ! -d "$SCRIPTS_HOST_PATH" ]]; then
-        log_error "시나리오 스크립트 경로 누락: $SCRIPTS_HOST_PATH"
-        log_error "기본 경로는 레포 내부 scenarios/services/<name>/scripts/ 입니다. git pull 후 재시도하거나 .env 의 SCRIPTS_HOST_PATH 를 확인하세요."
+    if [[ ! -d "$SCENARIOS_HOST_PATH" ]]; then
+        log_error "시나리오 디렉토리 누락: $SCENARIOS_HOST_PATH"
+        log_error "기본 경로는 레포 내부 scenarios/services/ 입니다. git pull 후 재시도하거나 .env 의 SCENARIOS_HOST_PATH 를 확인하세요."
+        exit 1
+    fi
+    local domain_count
+    domain_count="$(find "$SCENARIOS_HOST_PATH" -mindepth 2 -maxdepth 2 -name 'service-spec.yaml' | wc -l)"
+    log_ok "도메인 (service-spec.yaml): $domain_count 개 (${SCENARIOS_HOST_PATH})"
+    if [[ "$domain_count" -eq 0 ]]; then
+        log_error "service-spec.yaml 이 0개 입니다. 경로 확인: $SCENARIOS_HOST_PATH"
         exit 1
     fi
     local script_count
-    script_count="$(find "$SCRIPTS_HOST_PATH" -name 'scenario-*.sh' -maxdepth 1 | wc -l)"
-    log_ok "시나리오 스크립트: $script_count 개 (${SCRIPTS_HOST_PATH})"
-    if [[ "$script_count" -eq 0 ]]; then
-        log_error "시나리오 스크립트가 0개 입니다. 경로 확인: $SCRIPTS_HOST_PATH"
-        exit 1
-    fi
+    script_count="$(find "$SCENARIOS_HOST_PATH" -path '*/scripts/scenario-*.sh' | wc -l)"
+    log_ok "시나리오 스크립트 총합: $script_count 개"
 
     if [[ ! -f "${KUBECONFIG_HOST_PATH}/config" ]]; then
         log_error "kubeconfig 누락: ${KUBECONFIG_HOST_PATH}/config"

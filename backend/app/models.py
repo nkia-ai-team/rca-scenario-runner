@@ -7,7 +7,10 @@ Status = Literal["idle", "running", "succeeded", "failed", "cleanup_running"]
 
 
 class Scenario(BaseModel):
-    id: str
+    id: str                       # composite "<domain>:<short_id>" — globally unique
+    short_id: str                 # within-domain id, e.g. "01"
+    domain: str                   # folder slug, e.g. "plopvape-shop"
+    domain_label: str             # human-readable, e.g. "Plopvape Shop"
     name: str
     description: str
     cause: str
@@ -16,6 +19,21 @@ class Scenario(BaseModel):
     estimated_duration_sec: int
     script_filename: str
     warnings: list[str] = Field(default_factory=list)
+
+
+class Domain(BaseModel):
+    slug: str
+    label: str
+    scenario_count: int
+
+
+class ActiveRun(BaseModel):
+    """Returned by /api/active. Tells everyone if the runner is busy and on what."""
+    is_active: bool
+    scenario_id: Optional[str] = None
+    run_id: Optional[str] = None
+    mode: Optional[Literal["run", "cleanup"]] = None
+    started_at: Optional[datetime] = None
 
 
 class RunInfo(BaseModel):
