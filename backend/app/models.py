@@ -19,6 +19,14 @@ class Scenario(BaseModel):
     estimated_duration_sec: int
     script_filename: str
     warnings: list[str] = Field(default_factory=list)
+    # --- RCA ground-truth (optional; populated from service-spec.yaml) ---
+    # 1~5. 5 = 결정적 (트레이스/메트릭 만으로 RCA 가 근본 원인 짚어야 함),
+    # 1 = 추정만 가능 (수집 데이터 한계로 RCA 보고서 가 가설 형태여도 합격).
+    difficulty: Optional[int] = None
+    # RCA agent 가 "이 근본 원인" 이라고 보고해야 하는 기대 결론.
+    # 반드시 수집 가능한 시그널 (트레이스 span / 메트릭 / 로그) 기반으로만 기술.
+    # 보이지 않는 것 (코드 어노테이션, 런타임 설정값) 채점 기준 금지.
+    expected_rca_root_cause: Optional[str] = None
 
 
 class Domain(BaseModel):

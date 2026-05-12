@@ -22,6 +22,11 @@ export interface ApiScenario {
   estimated_duration_sec: number;
   script_filename: string;
   warnings: string[];
+  // RCA ground-truth (optional; populated from service-spec.yaml)
+  // 1~5 — 5 = 결정적, 1 = 추정만 가능
+  difficulty: number | null;
+  // 관측 가능한 시그널 기반 채점 기준. UI 의 "RCA 채점 기준" 섹션에 표시.
+  expected_rca_root_cause: string | null;
 }
 
 export interface Domain {

@@ -64,6 +64,18 @@ export function ScenarioCard({
                     {scn.name}
                   </h3>
                   <Pill tone={scn.tone}>{scn.tag}</Pill>
+                  {typeof scn.difficulty === "number" && (
+                    <span
+                      className="text-[11px] text-amber-700 leading-none select-none"
+                      title={`난이도 ${scn.difficulty}/5 — 높을수록 RCA agent 가 결정적으로 짚어야 함`}
+                      aria-label={`difficulty ${scn.difficulty} out of 5`}
+                    >
+                      {"★".repeat(scn.difficulty)}
+                      <span className="text-[var(--ink-3)] opacity-40">
+                        {"★".repeat(5 - scn.difficulty)}
+                      </span>
+                    </span>
+                  )}
                 </div>
                 <p
                   className="text-[13px] text-[var(--ink-2)] mt-1.5 leading-relaxed"
@@ -145,6 +157,17 @@ export function ScenarioCard({
                     ))}
                   </ul>
                 </div>
+
+                {scn.expected_rca_root_cause && (
+                  <>
+                    <div className="mono text-[10.5px] uppercase tracking-wider text-violet-700 pt-0.5">
+                      RCA 채점 기준
+                    </div>
+                    <div className="rounded-md bg-violet-50/60 ring-1 ring-violet-200 px-2.5 py-2 text-[12px] leading-relaxed text-[var(--ink)] whitespace-pre-wrap">
+                      {scn.expected_rca_root_cause}
+                    </div>
+                  </>
+                )}
 
                 {scn.warnings.length > 0 && (
                   <>

@@ -63,6 +63,14 @@ def _composite_id(domain: str, short_id: str) -> str:
 def _spec_entry_to_scenario(domain: str, domain_label: str, entry: dict) -> Scenario:
     """Map one item under service-spec.yaml's `scenarios:` list to the Scenario model."""
     short_id = _normalize_short_id(entry["id"])
+    difficulty = entry.get("difficulty")
+    if not (isinstance(difficulty, int) and 1 <= difficulty <= 5):
+        difficulty = None  # out-of-range or non-int treated as unset
+    expected = entry.get("expected_rca_root_cause")
+    if isinstance(expected, str):
+        expected = expected.strip() or None
+    else:
+        expected = None
     return Scenario(
         id=_composite_id(domain, short_id),
         short_id=short_id,
@@ -76,6 +84,8 @@ def _spec_entry_to_scenario(domain: str, domain_label: str, entry: dict) -> Scen
         estimated_duration_sec=entry["estimated_duration_sec"],
         script_filename=entry["file"],
         warnings=entry.get("side_effects", []),
+        difficulty=difficulty,
+        expected_rca_root_cause=expected,
     )
 
 
