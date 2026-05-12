@@ -111,7 +111,7 @@ git pull                                            # 이후엔 pull 만
 각 시나리오의 cleanup 은 멱등이지만 **Polestar10 관측 자산에 부작용** 남김. UI 카드의 "주의사항" 섹션에 표시됨 (`backend/app/scenarios.py` `warnings` 필드).
 
 - **시나리오 03** (PostgreSQL CPU throttle): cleanup 중 postgres pod 재기동 → KCM 의 postgres 개별 알람 설정 disable. KCM 콘솔에서 재활성화 필요.
-- **시나리오 04** (Traffic Flood): cleanup 이 5개 서비스 rolling restart → WPM 에이전트 재등록, 기존 에이전트 disabled + 카운트 증가. disabled 에이전트 삭제 시 해당 에이전트 수집 WPM 데이터도 함께 삭제.
+- **시나리오 04** (Traffic Flood): cleanup 이 5개 서비스 rolling restart → WPM 에이전트 재등록, 기존 에이전트 disabled + 카운트 증가. disabled 에이전트 삭제 시 해당 에이전트 수집 WPM 데이터도 함께 삭제. 또한 호스트에서 500 동시 curl 을 fork 하므로 multi-testbed 동거 호스트(예: 109)에선 sshd 인증 슬롯·KCM agent 메트릭 push 가 일시적으로 sparse 해질 수 있음 — 시나리오 종료 후 자동 회복, 의도된 부하 패턴이며 RCA agent 의 sparse 관측 환경 대응 능력 평가 케이스로 본다 (`kubectl exec` 안 사용 = "외부 폭주" 의도 유지).
 
 ## Related Repos
 
