@@ -31,15 +31,12 @@ services:
       # 쓸 수 있게 한다. 스크립트 수정을 피하기 위한 선택.
       - ${KUBECONFIG_HOST_PATH:-/home/nkia/.kube}:/home/nkia/.kube:ro
 
-      # 시나리오 스크립트는 레포 내부(scenarios/services/<name>/scripts/) 에 포함.
-      # 기본값은 plopvape-shop 서비스. 다른 서비스로 바꾸려면 .env 에서 SCRIPTS_HOST_PATH 오버라이드.
-      - ${SCRIPTS_HOST_PATH:-./scenarios/services/plopvape-shop/scripts}:/app/scripts:ro
-
-      # service-spec.yaml 카탈로그 — scenarios.py 가 <repo>/scenarios/services/*/service-spec.yaml glob.
-      # Dockerfile 이 scenarios/ 를 COPY 안 하므로 호스트의 testbed-specific dir 만 mount.
-      # ⚠️ 전체 scenarios/ mount 시 testbed 간 ID 충돌 (모두 01~04 사용) → 가장 마지막 sort 결과만 노출.
-      # testbed-별 격리: TESTBED_NAME env 가 가리키는 단일 testbed dir 만 노출.
-      - ./scenarios/services/${TESTBED_NAME:-plopvape-shop}:/app/scenarios/services/${TESTBED_NAME:-plopvape-shop}:ro
+      # Multi-domain scenarios tree — service-spec.yaml + scripts/ per domain.
+      # backend/scenarios.py globs <root>/*/service-spec.yaml; runner picks
+      # <root>/<domain>/scripts/<file> at execution time. composite scenario
+      # IDs (`<domain>:<short_id>`) eliminate the cross-testbed ID collision
+      # that previously forced single-testbed mounting.
+      - ${SCENARIOS_HOST_PATH:-./scenarios/services}:/app/scenarios:ro
 
       # 실행 로그를 호스트에 보존 (컨테이너 재시작 시에도 유지)
       - ${LOGS_HOST_PATH:-./logs}:/app/logs:rw
@@ -51,7 +48,9 @@ services:
 
     environment:
       - KUBECONFIG=/home/nkia/.kube/config
-      - SCRIPT_DIR=/app/scripts
+      - SCRIPT_DIR=/app/scenarios
+      - SCENARIOS_ROOT=/app/scenarios
+      - DEFAULT_DOMAIN=${DEFAULT_DOMAIN:-plopvape-shop}
       - LOG_DIR=/app/logs
       - STATIC_DIR=/app/static
 

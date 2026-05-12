@@ -1,11 +1,26 @@
 import { Icon } from "./Icon";
 
+interface DomainTab {
+  slug: string;
+  label: string;
+  scenario_count: number;
+}
+
 interface Props {
   backendOk: boolean;
   envTag?: string;
+  domains: DomainTab[];
+  selectedDomain: string | null;
+  onSelectDomain: (slug: string) => void;
 }
 
-export function TopBar({ backendOk, envTag = "testbed-109" }: Props) {
+export function TopBar({
+  backendOk,
+  envTag = "testbed-109",
+  domains,
+  selectedDomain,
+  onSelectDomain,
+}: Props) {
   return (
     <header className="sticky top-0 z-40 border-b hair bg-[var(--bg)]/70 backdrop-blur-md">
       <div className="max-w-[1440px] mx-auto px-6 py-3 flex items-center justify-between">
@@ -35,25 +50,41 @@ export function TopBar({ backendOk, envTag = "testbed-109" }: Props) {
               Scenario Runner · 내부 QA 도구
             </div>
           </div>
-          <nav className="ml-6 hidden md:flex items-center gap-0.5 p-0.5 rounded-lg ring-1 hair bg-white/60">
-            {[
-              { k: "runner", label: "Runner", active: true },
-              { k: "alarms", label: "Alarms" },
-              { k: "env", label: "Environments" },
-              { k: "audit", label: "Audit" },
-            ].map((t) => (
-              <button
-                key={t.k}
-                disabled={!t.active}
-                className={`text-[12px] px-2.5 py-1 rounded-md transition ${
-                  t.active
-                    ? "bg-white text-[var(--ink)] shadow-sm ring-1 ring-[var(--hair)]"
-                    : "text-[var(--ink-3)] hover:text-[var(--ink)] cursor-not-allowed opacity-60"
-                }`}
-              >
-                {t.label}
-              </button>
-            ))}
+          <nav
+            className="ml-6 hidden md:flex items-center gap-0.5 p-0.5 rounded-lg ring-1 hair bg-white/60"
+            aria-label="testbed domain selector"
+          >
+            {domains.length === 0 && (
+              <span className="text-[12px] px-2.5 py-1 text-[var(--ink-3)]">
+                도메인 로드 중…
+              </span>
+            )}
+            {domains.map((d) => {
+              const active = d.slug === selectedDomain;
+              return (
+                <button
+                  key={d.slug}
+                  onClick={() => onSelectDomain(d.slug)}
+                  className={`text-[12px] px-2.5 py-1 rounded-md transition flex items-center gap-1.5 ${
+                    active
+                      ? "bg-white text-[var(--ink)] shadow-sm ring-1 ring-[var(--hair)]"
+                      : "text-[var(--ink-3)] hover:text-[var(--ink)]"
+                  }`}
+                  title={`${d.label} · 시나리오 ${d.scenario_count}건`}
+                >
+                  <span>{d.label}</span>
+                  <span
+                    className={`mono text-[10px] rounded-full px-1.5 py-px ring-1 ${
+                      active
+                        ? "ring-[var(--hair)] text-[var(--ink-2)] bg-[var(--ink-tint,#f4f4f5)]"
+                        : "ring-[var(--hair)] text-[var(--ink-3)] bg-white/50"
+                    }`}
+                  >
+                    {d.scenario_count}
+                  </span>
+                </button>
+              );
+            })}
           </nav>
         </div>
         <div className="flex items-center gap-2">

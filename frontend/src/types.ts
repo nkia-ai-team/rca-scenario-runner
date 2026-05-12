@@ -10,7 +10,10 @@ export type DisplayStatus = "idle" | "running" | "succeeded" | "failed";
 export type ScenarioMode = "run" | "cleanup";
 
 export interface ApiScenario {
-  id: string;
+  id: string;            // composite "<domain>:<short_id>"
+  short_id: string;      // within-domain id, e.g. "01"
+  domain: string;        // folder slug
+  domain_label: string;  // human-readable
   name: string;
   description: string;
   cause: string;
@@ -19,6 +22,20 @@ export interface ApiScenario {
   estimated_duration_sec: number;
   script_filename: string;
   warnings: string[];
+}
+
+export interface Domain {
+  slug: string;
+  label: string;
+  scenario_count: number;
+}
+
+export interface ActiveRun {
+  is_active: boolean;
+  scenario_id: string | null;
+  run_id: string | null;
+  mode: ScenarioMode | null;
+  started_at: string | null;
 }
 
 export interface RunInfo {

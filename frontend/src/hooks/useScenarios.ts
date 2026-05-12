@@ -5,7 +5,9 @@ import { presentationFor } from "../lib/tones";
 import type { ApiScenario, ScenarioView } from "../types";
 
 function toView(s: ApiScenario): ScenarioView {
-  const p = presentationFor(s.id);
+  // presentationFor is keyed by within-domain short_id ("01", "02", ...)
+  // so the legacy tone/tag map keeps working across all domains.
+  const p = presentationFor(s.short_id);
   const hops = s.propagation
     .split(/\s*(?:→|->|>)\s*/)
     .map((x) => x.trim())

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-from app.models import HistoryEntry, RunInfo, Status
+from app.models import ActiveRun, HistoryEntry, RunInfo, Status
 from app.scenarios import get_scenario
 
 _LOG_TAIL_SIZE = 200
@@ -43,6 +43,18 @@ class ScenarioRunner:
             return None
         return self._current.model_copy(update={"log_tail": list(self._log_buffer)})
 
+    def get_active(self) -> ActiveRun:
+        """Snapshot for /api/active — what (if anything) the runner is busy with right now."""
+        if not self.is_busy or self._current is None:
+            return ActiveRun(is_active=False)
+        return ActiveRun(
+            is_active=True,
+            scenario_id=self._current.scenario_id,
+            run_id=self._current.run_id,
+            mode=self._current.mode,
+            started_at=self._current.started_at,
+        )
+
     def get_history(self) -> list[HistoryEntry]:
         return list(reversed(self._history))
 
@@ -61,15 +73,22 @@ class ScenarioRunner:
         if self._lock.locked() or self.is_busy:
             raise RuntimeError("Another scenario is already running")
 
-        script_path = self.script_dir / scenario.script_filename
-        if not script_path.exists():
-            raise FileNotFoundError(f"Script not found: {script_path}")
+        # Multi-domain layout: <script_dir>/<domain>/scripts/<file>
+        # Legacy/flat layout (tests, old compose mount): <script_dir>/<file>
+        multi = self.script_dir / scenario.domain / "scripts" / scenario.script_filename
+        flat = self.script_dir / scenario.script_filename
+        if multi.exists():
+            script_path = multi
+        elif flat.exists():
+            script_path = flat
+        else:
+            raise FileNotFoundError(f"Script not found: tried {multi} and {flat}")
 
-        run_id = f"{scenario_id}-{mode}-{uuid.uuid4().hex[:8]}"
+        run_id = f"{scenario.id}-{mode}-{uuid.uuid4().hex[:8]}"
         status: Status = "cleanup_running" if mode == "cleanup" else "running"
         self._current = RunInfo(
             run_id=run_id,
-            scenario_id=scenario_id,
+            scenario_id=scenario.id,
             mode=mode,
             status=status,
             started_at=datetime.now(timezone.utc),

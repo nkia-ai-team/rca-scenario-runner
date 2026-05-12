@@ -15,7 +15,7 @@ from pathlib import Path
 
 import yaml
 
-from app.models import Scenario
+from app.models import Domain, Scenario
 
 # scenarios.py lives at <repo>/backend/app/scenarios.py — go up 3 to reach repo root.
 _DEFAULT_SCENARIOS_ROOT = (
@@ -30,7 +30,17 @@ def _resolve_scenarios_root() -> Path:
     return _DEFAULT_SCENARIOS_ROOT
 
 
-def _normalize_id(raw: str) -> str:
+def get_default_domain() -> str:
+    """Domain used to resolve bare short_ids (e.g. '01') from legacy clients.
+
+    Browser tabs that were open before the multi-domain deploy keep polling
+    /api/scenarios/01/status — those resolve against this default so the
+    in-flight plopvape session never breaks.
+    """
+    return os.environ.get("DEFAULT_DOMAIN", "plopvape-shop")
+
+
+def _normalize_short_id(raw: str) -> str:
     """'scenario-01' -> '01'; already-normalized '01' -> '01'."""
     prefix = "scenario-"
     if raw.startswith(prefix):
@@ -38,10 +48,26 @@ def _normalize_id(raw: str) -> str:
     return raw
 
 
-def _spec_entry_to_scenario(entry: dict) -> Scenario:
+def _domain_label(slug: str, data: dict) -> str:
+    for key in ("label", "name", "title"):
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return slug.replace("-", " ").title()
+
+
+def _composite_id(domain: str, short_id: str) -> str:
+    return f"{domain}:{short_id}"
+
+
+def _spec_entry_to_scenario(domain: str, domain_label: str, entry: dict) -> Scenario:
     """Map one item under service-spec.yaml's `scenarios:` list to the Scenario model."""
+    short_id = _normalize_short_id(entry["id"])
     return Scenario(
-        id=_normalize_id(entry["id"]),
+        id=_composite_id(domain, short_id),
+        short_id=short_id,
+        domain=domain,
+        domain_label=domain_label,
         name=entry["title"],
         description=entry["description"],
         cause=entry["root_cause"],
@@ -59,10 +85,12 @@ def _load_scenarios() -> dict[str, Scenario]:
     if not root.is_dir():
         return catalog
     for spec_file in sorted(root.glob("*/service-spec.yaml")):
+        domain = spec_file.parent.name
         with spec_file.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
+        domain_label = _domain_label(domain, data)
         for entry in data.get("scenarios", []):
-            scenario = _spec_entry_to_scenario(entry)
+            scenario = _spec_entry_to_scenario(domain, domain_label, entry)
             catalog[scenario.id] = scenario
     return catalog
 
@@ -70,12 +98,43 @@ def _load_scenarios() -> dict[str, Scenario]:
 SCENARIOS: dict[str, Scenario] = _load_scenarios()
 
 
+def _resolve_scenario_id(scenario_id: str) -> str:
+    """Map a possibly-bare short_id ('01') to its composite form ('plopvape-shop:01').
+
+    Composite IDs pass through. Bare short_ids are first tried against
+    DEFAULT_DOMAIN; if no match, fall back to a unique short_id across the
+    catalog (useful for tests / single-domain dev setups where the default
+    differs from the fixture's domain name).
+    """
+    if ":" in scenario_id:
+        return scenario_id
+    default_composite = _composite_id(get_default_domain(), scenario_id)
+    if default_composite in SCENARIOS:
+        return default_composite
+    matches = [k for k in SCENARIOS if k.endswith(f":{scenario_id}")]
+    if len(matches) == 1:
+        return matches[0]
+    return default_composite  # let the caller see a 404 against the default
+
+
 def get_scenario(scenario_id: str) -> Scenario | None:
-    return SCENARIOS.get(scenario_id)
+    return SCENARIOS.get(_resolve_scenario_id(scenario_id))
 
 
 def list_scenarios() -> list[Scenario]:
     return list(SCENARIOS.values())
+
+
+def list_domains() -> list[Domain]:
+    counts: dict[str, int] = {}
+    labels: dict[str, str] = {}
+    for s in SCENARIOS.values():
+        counts[s.domain] = counts.get(s.domain, 0) + 1
+        labels[s.domain] = s.domain_label
+    return [
+        Domain(slug=slug, label=labels[slug], scenario_count=counts[slug])
+        for slug in sorted(counts)
+    ]
 
 
 def reload_scenarios() -> dict[str, Scenario]:

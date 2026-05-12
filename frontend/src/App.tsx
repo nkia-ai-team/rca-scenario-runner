@@ -7,11 +7,14 @@ import { Icon } from "./components/Icon";
 import { ScenarioCard } from "./components/ScenarioCard";
 import { Toast, type ToastData } from "./components/Toast";
 import { TopBar } from "./components/TopBar";
+import { useActiveRun } from "./hooks/useActiveRun";
 import { useHealth } from "./hooks/useHealth";
 import { useRunner } from "./hooks/useRunner";
 import { useScenarios } from "./hooks/useScenarios";
 import { durationSec } from "./lib/format";
 import type { DisplayStatus } from "./types";
+
+const DEFAULT_DOMAIN_SLUG = "plopvape-shop";
 
 function useElapsed(
   status: DisplayStatus,
@@ -39,6 +42,44 @@ export default function App() {
   const { scenarios, loading, error: scenariosError } = useScenarios();
   const backendOk = useHealth();
   const runner = useRunner(scenarios);
+  const activeRun = useActiveRun();
+
+  // Derive domain tabs from the loaded scenarios (one /api/scenarios call
+  // already covers it — avoids a second /api/domains roundtrip).
+  const domains = (() => {
+    const acc = new Map<string, { slug: string; label: string; scenario_count: number }>();
+    for (const s of scenarios) {
+      const cur = acc.get(s.domain);
+      if (cur) cur.scenario_count += 1;
+      else acc.set(s.domain, { slug: s.domain, label: s.domain_label, scenario_count: 1 });
+    }
+    return Array.from(acc.values()).sort((a, b) => a.slug.localeCompare(b.slug));
+  })();
+
+  // Initial selection: plopvape-shop if present (preserves what the team is
+  // already using); otherwise the first domain alphabetically.
+  const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
+  useEffect(() => {
+    if (selectedDomain !== null) return;
+    if (domains.length === 0) return;
+    const preferred = domains.find((d) => d.slug === DEFAULT_DOMAIN_SLUG);
+    setSelectedDomain(preferred?.slug ?? domains[0].slug);
+  }, [domains, selectedDomain]);
+
+  const visibleScenarios = selectedDomain
+    ? scenarios.filter((s) => s.domain === selectedDomain)
+    : scenarios;
+
+  // Concurrency banner — only show when someone *else* is running.
+  // "Someone else" = the active run_id is not what this tab launched.
+  const myRunId = runner.exec?.runId ?? null;
+  const someoneElseRunning =
+    activeRun.is_active &&
+    activeRun.run_id !== null &&
+    activeRun.run_id !== myRunId;
+  const occupiedScenario = someoneElseRunning && activeRun.scenario_id
+    ? scenarios.find((s) => s.id === activeRun.scenario_id)
+    : undefined;
 
   const [historyOpen, setHistoryOpen] = useState(true);
   const [toast, setToast] = useState<ToastData | null>(null);
@@ -130,13 +171,38 @@ export default function App() {
       />
 
       <div className="relative">
-        <TopBar backendOk={backendOk} />
+        <TopBar
+          backendOk={backendOk}
+          domains={domains}
+          selectedDomain={selectedDomain}
+          onSelectDomain={setSelectedDomain}
+        />
 
         <Hero
           anyRunning={runner.anyRunning}
-          scenarioCount={scenarios.length}
+          scenarioCount={visibleScenarios.length}
           history={runner.history}
         />
+
+        {someoneElseRunning && (
+          <div className="max-w-[1440px] mx-auto px-6 pt-3">
+            <div className="card p-3 fade-in flex items-center gap-3 ring-1 ring-amber-200 bg-amber-50/60">
+              <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+              <div className="text-[12.5px] text-amber-900">
+                다른 사용자가 시나리오 실행 중 — 새 실행은 동시에 불가합니다.
+                {occupiedScenario && (
+                  <span className="ml-1 text-amber-800">
+                    · {occupiedScenario.domain_label} / {occupiedScenario.name}
+                    {" "}
+                    <span className="mono text-[11px] opacity-75">
+                      (S{occupiedScenario.num})
+                    </span>
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         <main className="max-w-[1440px] mx-auto px-6 pb-10 space-y-5">
           {scenariosError && (
@@ -159,7 +225,9 @@ export default function App() {
                     시나리오
                   </h2>
                   <p className="text-[11.5px] text-[var(--ink-3)] mt-0.5">
-                    사전 정의 {scenarios.length}건 · cleanup 멱등 보장
+                    {selectedDomain && domains.find((d) => d.slug === selectedDomain)?.label}
+                    {" · "}
+                    {visibleScenarios.length}건 · cleanup 멱등 보장
                   </p>
                 </div>
               </div>
@@ -169,14 +237,20 @@ export default function App() {
                     시나리오 불러오는 중…
                   </div>
                 )}
-                {scenarios.map((s) => (
+                {!loading && visibleScenarios.length === 0 && selectedDomain && (
+                  <div className="card p-6 text-center text-[13px] text-[var(--ink-3)]">
+                    이 도메인에 등록된 시나리오가 없습니다.
+                  </div>
+                )}
+                {visibleScenarios.map((s) => (
                   <ScenarioCard
                     key={s.id}
                     scn={s}
                     status={runner.statuses[s.id] ?? "idle"}
                     runDisabled={
-                      runner.anyRunning &&
-                      runner.statuses[s.id] !== "running"
+                      someoneElseRunning ||
+                      (runner.anyRunning &&
+                        runner.statuses[s.id] !== "running")
                     }
                     isSelected={selectedId === s.id}
                     onRun={runner.run}
