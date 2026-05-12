@@ -45,6 +45,23 @@ async def test_list_domains(client: AsyncClient) -> None:
     assert plopvape["scenario_count"] == 4
 
 
+async def test_plopvape_scenarios_have_rca_ground_truth(client: AsyncClient) -> None:
+    """plopvape 4 시나리오 모두 difficulty + expected_rca_root_cause 채워져 RCA 채점 가능해야 한다."""
+    resp = await client.get("/api/scenarios")
+    plopvape = [s for s in resp.json() if s["domain"] == "plopvape-shop"]
+    assert len(plopvape) == 4
+    for s in plopvape:
+        assert isinstance(s["difficulty"], int) and 1 <= s["difficulty"] <= 5, (
+            f"{s['id']} difficulty missing or out of range"
+        )
+        assert isinstance(s["expected_rca_root_cause"], str), (
+            f"{s['id']} expected_rca_root_cause missing"
+        )
+        assert len(s["expected_rca_root_cause"].strip()) > 50, (
+            f"{s['id']} expected_rca_root_cause too short — observable signals 부족"
+        )
+
+
 async def test_get_unknown_scenario_returns_404(client: AsyncClient) -> None:
     resp = await client.get("/api/scenarios/99")
     assert resp.status_code == 404

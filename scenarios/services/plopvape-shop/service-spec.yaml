@@ -28,6 +28,16 @@ scenarios:
       - DPM lock wait
       - APM inventory response time 증가
       - SMS postgres process CPU%
+    difficulty: 4
+    expected_rca_root_cause: |
+      PostgreSQL inventory 테이블에 장시간 점유된 SELECT FOR UPDATE lock 이 존재해
+      동시 주문 트랜잭션이 lock wait 에 걸려 cascade 장애 발생.
+      결정적 시그널:
+        - DPM lock count / lock wait time 메트릭이 평소의 N배 증가
+        - APM 트레이스에 inventory-service 의 SQL span 이 수초간 대기 후 timeout
+        - DPM 의 active session 중 long-running query (statement_start_time 오래된 트랜잭션) 1건
+      RCA 보고서 합격 기준: "inventory 테이블 lock contention 으로 인한 cascade" 까지 짚으면 통과.
+      어떤 코드가 lock 을 잡았는지 (소스 inspect) 까지 요구하지 않음.
 
   - id: scenario-02
     file: scenario-02-payment-timeout.sh
@@ -42,6 +52,15 @@ scenarios:
       - APM order 서비스 에러율 급증 (최대 100%)
       - DPM 트랜잭션 시간 초과 (≥5s)
       - DPM DB Lock 수 급증 (≥40 Lock)
+    difficulty: 5
+    expected_rca_root_cause: |
+      payment-service 가 외부 PG API (http://192.168.200.109:8190) 호출 시 TCP 연결은
+      되지만 HTTP 응답이 오지 않아 read-timeout (10s) 까지 thread 가 점유됨.
+      결정적 시그널:
+        - APM 트레이스의 payment span 안에 외부 HTTP call 자식 span 이 ~10s read-timeout 으로 종료
+        - 같은 trace_id 의 order span 이 payment 응답을 기다리다 누적 timeout (10s+)
+        - payment-service 의 thread pool 사용량 100% (외부 호출 대기로 thread 점유)
+      RCA 보고서 합격 기준: "외부 PG API 응답 없음 (192.168.200.109:8190) 으로 인한 cascade timeout" 명시.
 
   - id: scenario-03
     file: scenario-03-db-cpu-throttle.sh
@@ -58,6 +77,16 @@ scenarios:
       - cleanup 중 postgres pod 가 재기동되면서 KCM 의 postgres 개별 알람 설정이 disable 될 수 있음
       - 재기동 후 KCM 콘솔에서 개별 알람 룰을 다시 활성화해야 함
       - K3s 에 metrics-server 미설치 시 kubectl top / KCM Pod CPU 알람 안 뜸 (시나리오 실행엔 영향 없음)
+    difficulty: 4
+    expected_rca_root_cause: |
+      postgres pod 가 K8s CPU limit 축소 (500m → 10m) 로 CPU throttling 에 걸려 모든
+      서비스의 DB 쿼리가 동반 지연.
+      결정적 시그널:
+        - KCM 의 postgres pod CPU throttling % 가 ~100% (metrics-server 설치 가정)
+        - 모든 서비스 (order/inventory/payment/product) 의 DB span latency 가 동시에 폭증
+        - DPM transaction duration 평균이 평소의 수십 배
+        - 단일 서비스가 아닌 *모든 서비스가 같은 시점에 함께 느려짐* — 공통 의존성 (DB) 문제 신호
+      RCA 보고서 합격 기준: "postgres pod 의 K8s CPU limit/throttling 으로 인한 DB 지연" 명시.
 
   - id: scenario-04
     file: scenario-04-traffic-flood.sh
@@ -75,3 +104,15 @@ scenarios:
       - cleanup 시 애플리케이션 서비스가 rolling restart 되어 WPM 에이전트가 재등록됨
       - 기존 에이전트는 disabled 상태로 남고, 에이전트 총 개수가 실행할 때마다 증가
       - disabled 에이전트를 삭제하면 해당 에이전트가 수집한 WPM 데이터 전부 함께 삭제됨 — 주의해서 관리
+      - 재등록 후 polestar collector 가 TCP 인식하는 데 1~5h 지연 발생 가능. 그 동안 WPM UI 가 status=DOWN 표시되지만 정상 — 시나리오 즉시 연달아 돌리지 말 것
+    difficulty: 4
+    expected_rca_root_cause: |
+      order-service 의 throughput 이 평소 100배 (5 → 500 concurrent) 로 spike 하여
+      application thread pool 포화 + DB connection pool 고갈 + 하위 서비스 cascade.
+      결정적 시그널:
+        - APM order 의 throughput 메트릭이 평소의 N배 spike
+        - order-service thread pool active 100% / queue saturated
+        - DPM 의 DB session 수가 평소의 수배 (≥55 세션) 로 폭증
+        - 트레이스 span tree 에 order → product/inventory/payment cascade 호출
+        - 단일 의존성 문제가 아니라 *상위 서비스 (order) 의 인입 트래픽 폭증이 시작점*
+      RCA 보고서 합격 기준: "order-service 인입 트래픽 폭증으로 인한 thread pool / DB connection 고갈" 명시.
