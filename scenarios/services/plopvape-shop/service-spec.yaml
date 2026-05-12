@@ -105,6 +105,7 @@ scenarios:
       - 기존 에이전트는 disabled 상태로 남고, 에이전트 총 개수가 실행할 때마다 증가
       - disabled 에이전트를 삭제하면 해당 에이전트가 수집한 WPM 데이터 전부 함께 삭제됨 — 주의해서 관리
       - 재등록 후 polestar collector 가 TCP 인식하는 데 1~5h 지연 발생 가능. 그 동안 WPM UI 가 status=DOWN 표시되지만 정상 — 시나리오 즉시 연달아 돌리지 말 것
+      - 외부 사용자 폭주를 모사하기 위해 호스트에서 500 동시 curl 을 fork. multi-testbed 가 같이 떠있는 호스트(예 109)에선 호스트의 process slot / sshd 인증 슬롯이 일시적으로 고갈될 수 있음 — 시나리오 실행 중 SSH/KCM 메트릭이 잠시 sparse 해질 수 있으나 시나리오 종료 후 자동 회복. 의도된 동작이며 RCA agent 가 sparse 관측 환경에서도 root cause 짚을 수 있는지 평가하는 부가 가치
     difficulty: 4
     expected_rca_root_cause: |
       order-service 의 throughput 이 평소 100배 (5 → 500 concurrent) 로 spike 하여
