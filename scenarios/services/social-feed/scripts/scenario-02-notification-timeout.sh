@@ -16,7 +16,7 @@ set -uo pipefail
 
 export KUBECONFIG=/home/nkia/.kube/config
 NAMESPACE="rca-testbed-social"
-PUSH_DEPLOY="mock-push-gateway"
+PUSH_DEPLOY="testbed-mock-push-gateway"
 API_BASE="http://127.0.0.1:30081"
 NOTIF_BURST=30
 NOTIF_ROUNDS=5
