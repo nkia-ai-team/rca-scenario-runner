@@ -18,9 +18,14 @@
 set -uo pipefail
 
 # --- 설정 ---
-export KUBECONFIG=/home/nkia/.kube/config
+# k3d 도메인별 클러스터: plopvape 전용 kubeconfig (공유 config 의 current-context 드리프트 무관)
+export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
-API_BASE="${API_BASE:-http://127.0.0.1:30080}"
+# k3d 는 호스트로 NodePort 를 publish 하지 않으므로, API 호출은 클러스터 내부에서
+# 앱 파드(curl 보유) 를 kubectl exec 경유로 nginx 게이트웨이로 보낸다.
+# (단, pg-mock/black-hole 은 호스트 컨테이너 조작이므로 호스트 curl 유지)
+API_BASE="${API_BASE:-http://testbed-nginx-external}"
+APP_POD_LABEL="app=testbed-order"
 PG_MOCK_CONTAINER="pg-mock"
 PG_MOCK_PORT=8190
 BLACKHOLE_PID_FILE="/tmp/scenario-02-blackhole.pid"
@@ -39,6 +44,15 @@ log_info()  { echo -e "${CYAN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_ok()    { echo -e "${GREEN}[OK]${NC}   $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
+
+# --- 클러스터 내부 HTTP 호출 헬퍼 (k3d: 호스트 NodePort 미노출 → 앱 파드 exec 경유) ---
+API_POD=""
+resolve_api_pod() {
+    API_POD=$(kubectl -n "$NAMESPACE" get pod -l "$APP_POD_LABEL" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+}
+# api_curl: curl 과 동일 인자. URL 은 $API_BASE(=cluster nginx) 기준. 클러스터 안에서 실행됨.
+api_curl() { kubectl -n "$NAMESPACE" exec "$API_POD" -- curl "$@"; }
 
 # --- 사전 조건 확인 ---
 check_prerequisites() {
@@ -63,9 +77,14 @@ check_prerequisites() {
         exit 1
     fi
 
-    # API 접근 확인
+    # API 호출용 파드 확인 + API 접근 확인 (cluster 내부 → nginx)
+    resolve_api_pod
+    if [[ -z "$API_POD" ]]; then
+        log_error "order-service Pod 없음 (API 호출 불가)"
+        exit 1
+    fi
     local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "$API_BASE/api/products" 2>/dev/null || echo "000")
+    http_code=$(api_curl -s -o /dev/null -w "%{http_code}" "$API_BASE/api/products" 2>/dev/null || echo "000")
     if [[ "$http_code" != "200" ]]; then
         log_error "API 접근 불가 (HTTP $http_code)"
         exit 1
@@ -85,7 +104,7 @@ measure_baseline() {
     log_info "베이스라인 응답시간 측정 중..." >&2
 
     local order_time
-    order_time=$(curl -s -o /dev/null -w "%{time_total}" \
+    order_time=$(api_curl -s -o /dev/null -w "%{time_total}" \
         --max-time 30 \
         -X POST "$API_BASE/api/orders" \
         -H "Content-Type: application/json" \
@@ -93,7 +112,7 @@ measure_baseline() {
     log_info "베이스라인 주문 응답시간: ${order_time}s" >&2
 
     local product_time
-    product_time=$(curl -s -o /dev/null -w "%{time_total}" \
+    product_time=$(api_curl -s -o /dev/null -w "%{time_total}" \
         "$API_BASE/api/products" 2>/dev/null || echo "N/A")
     log_info "베이스라인 상품조회 응답시간: ${product_time}s" >&2
 
@@ -180,7 +199,7 @@ send_concurrent_orders() {
     start_time=$(date +%s)
 
     for i in $(seq 1 "$CONCURRENT_ORDERS"); do
-        curl -s -o /tmp/scenario-02-order-${round}-${i}.log \
+        api_curl -s -o /dev/null \
             -w "order-${round}-${i}: HTTP %{http_code} in %{time_total}s\n" \
             --max-time 60 \
             -X POST "$API_BASE/api/orders" \
@@ -196,8 +215,8 @@ send_concurrent_orders() {
     sleep 5
     log_info "--- 장애 중 상품 조회 (payment 미사용 경로) ---"
     local product_code product_time
-    product_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$API_BASE/api/products" 2>/dev/null || echo "000")
-    product_time=$(curl -s -o /dev/null -w "%{time_total}" --max-time 10 "$API_BASE/api/products" 2>/dev/null || echo "timeout")
+    product_code=$(api_curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$API_BASE/api/products" 2>/dev/null || echo "000")
+    product_time=$(api_curl -s -o /dev/null -w "%{time_total}" --max-time 10 "$API_BASE/api/products" 2>/dev/null || echo "timeout")
     log_info "GET /api/products: HTTP $product_code in ${product_time}s (이 경로는 정상이어야 함)"
 
     # 모든 주문 요청 완료 대기
@@ -334,8 +353,9 @@ cleanup() {
 
     # 5. 주문 API 정상 확인
     sleep 3
+    resolve_api_pod
     local order_code
-    order_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+    order_code=$(api_curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
         -X POST "$API_BASE/api/orders" \
         -H "Content-Type: application/json" \
         -d '{"customerName":"recovery-test","customerEmail":"recover@test.com","items":[{"productId":5,"quantity":1}]}' 2>/dev/null || echo "000")
