@@ -14,10 +14,14 @@
 
 set -uo pipefail
 
-export KUBECONFIG=/home/nkia/.kube/config
+# k3d 도메인별 클러스터: social 전용 kubeconfig (공유 config 의 current-context 드리프트 무관)
+export KUBECONFIG=/home/nkia/.kube/social.yaml
 NAMESPACE="rca-testbed-social"
 DB_STS="testbed-mysql"
-API_BASE="http://127.0.0.1:30081"
+# k3d 는 호스트로 NodePort 를 publish 하지 않으므로, API 호출은 클러스터 내부에서
+# 앱 파드(curl 보유) 를 kubectl exec 경유로 nginx 게이트웨이로 보낸다.
+API_BASE="http://testbed-nginx-external"
+APP_POD_LABEL="app=testbed-post"
 THROTTLE_DURATION=180
 QUERY_BURST=15
 QUERY_ROUNDS=8
@@ -34,10 +38,24 @@ log_ok()    { echo -e "${GREEN}[OK]${NC}   $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
+# --- 클러스터 내부 HTTP 호출 헬퍼 (k3d: 호스트 NodePort 미노출 → 앱 파드 exec 경유) ---
+API_POD=""
+resolve_api_pod() {
+    API_POD=$(kubectl -n "$NAMESPACE" get pod -l "$APP_POD_LABEL" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+}
+# api_curl: curl 과 동일 인자. URL 은 $API_BASE(=cluster nginx) 기준. 클러스터 안에서 실행됨.
+api_curl() { kubectl -n "$NAMESPACE" exec "$API_POD" -- curl "$@"; }
+
 check_prerequisites() {
     log_info "사전 조건 확인 중..."
     if ! kubectl -n "$NAMESPACE" get sts "$DB_STS" &>/dev/null; then
         log_error "StatefulSet $DB_STS 부재"
+        exit 1
+    fi
+    resolve_api_pod
+    if [[ -z "$API_POD" ]]; then
+        log_error "post-service Pod 없음 (API 호출 불가)"
         exit 1
     fi
     log_ok "사전 조건 확인 완료"
@@ -61,8 +79,8 @@ burst_queries() {
     for round in $(seq 1 "$QUERY_ROUNDS"); do
         log_info "Round $round/$QUERY_ROUNDS"
         for i in $(seq 1 "$QUERY_BURST"); do
-            curl -s -o /dev/null -w "feed:%{http_code}/%{time_total}\n"     --max-time 20 "$API_BASE/api/feed/$((i % 5 + 1))" &
-            curl -s -o /dev/null -w "comment:%{http_code}/%{time_total}\n"  --max-time 20 "$API_BASE/api/posts/$((i % 5 + 1))/comments" &
+            api_curl -s -o /dev/null -w "feed:%{http_code}/%{time_total}\n"     --max-time 20 "$API_BASE/api/feed/$((i % 5 + 1))" &
+            api_curl -s -o /dev/null -w "comment:%{http_code}/%{time_total}\n"  --max-time 20 "$API_BASE/api/posts/$((i % 5 + 1))/comments" &
         done
         wait
         sleep 5

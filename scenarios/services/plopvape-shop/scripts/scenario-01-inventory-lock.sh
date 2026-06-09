@@ -17,10 +17,14 @@
 set -uo pipefail
 
 # --- 설정 ---
-export KUBECONFIG=/home/nkia/.kube/config
+# k3d 도메인별 클러스터: plopvape 전용 kubeconfig (공유 config 의 current-context 드리프트 무관)
+export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 PG_POD="${PG_POD:-testbed-postgres-0}"
-API_BASE="${API_BASE:-http://127.0.0.1:30080}"
+# k3d 는 호스트로 NodePort 를 publish 하지 않으므로, API 호출은 클러스터 내부에서
+# 앱 파드(curl 보유) 를 kubectl exec 경유로 nginx 게이트웨이로 보낸다.
+API_BASE="${API_BASE:-http://testbed-nginx-external}"
+APP_POD_LABEL="app=testbed-order"
 LOCK_PRODUCT_ID=1          # lock을 걸 상품 ID
 LOCK_DURATION=120           # lock 유지 시간 (초)
 CONCURRENT_ORDERS=20        # 동시 주문 요청 수
@@ -39,6 +43,15 @@ log_ok()    { echo -e "${GREEN}[OK]${NC}   $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
+# --- 클러스터 내부 HTTP 호출 헬퍼 (k3d: 호스트 NodePort 미노출 → 앱 파드 exec 경유) ---
+API_POD=""
+resolve_api_pod() {
+    API_POD=$(kubectl -n "$NAMESPACE" get pod -l "$APP_POD_LABEL" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+}
+# api_curl: curl 과 동일 인자. URL 은 $API_BASE(=cluster nginx) 기준. 클러스터 안에서 실행됨.
+api_curl() { kubectl -n "$NAMESPACE" exec "$API_POD" -- curl "$@"; }
+
 # --- 사전 조건 확인 ---
 check_prerequisites() {
     log_info "사전 조건 확인 중..."
@@ -49,9 +62,16 @@ check_prerequisites() {
         exit 1
     fi
 
-    # API 접근 확인
+    # API 호출용 파드 확인 (이 파드 안에서 cluster-internal 로 nginx 호출)
+    resolve_api_pod
+    if [[ -z "$API_POD" ]]; then
+        log_error "order-service Pod 없음 (API 호출 불가)"
+        exit 1
+    fi
+
+    # API 접근 확인 (cluster 내부 → nginx)
     local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "$API_BASE/api/products" 2>/dev/null || echo "000")
+    http_code=$(api_curl -s -o /dev/null -w "%{http_code}" "$API_BASE/api/products" 2>/dev/null || echo "000")
     if [[ "$http_code" != "200" ]]; then
         log_error "API 접근 불가 (HTTP $http_code)"
         exit 1
@@ -79,7 +99,7 @@ measure_baseline() {
     log_info "베이스라인 응답시간 측정 중..." >&2
 
     local total_time
-    total_time=$(curl -s -o /dev/null -w "%{time_total}" \
+    total_time=$(api_curl -s -o /dev/null -w "%{time_total}" \
         --max-time 30 \
         -X POST "$API_BASE/api/orders" \
         -H "Content-Type: application/json" \
@@ -135,7 +155,7 @@ send_concurrent_orders() {
     start_time=$(date +%s)
 
     for i in $(seq 1 "$CONCURRENT_ORDERS"); do
-        curl -s -o /tmp/scenario-01-order-${round}-${i}.log \
+        api_curl -s -o /dev/null \
             -w "order-${round}-${i}: HTTP %{http_code} in %{time_total}s\n" \
             -X POST "$API_BASE/api/orders" \
             -H "Content-Type: application/json" \

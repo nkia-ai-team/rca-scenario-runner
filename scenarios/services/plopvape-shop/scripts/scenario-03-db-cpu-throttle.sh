@@ -18,11 +18,15 @@
 set -uo pipefail
 
 # --- 설정 ---
-export KUBECONFIG=/home/nkia/.kube/config
+# k3d 도메인별 클러스터: plopvape 전용 kubeconfig (공유 config 의 current-context 드리프트 무관)
+export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 PG_STATEFULSET="testbed-postgres"
 PG_POD="${PG_POD:-testbed-postgres-0}"
-API_BASE="${API_BASE:-http://127.0.0.1:30080}"
+# k3d 는 호스트로 NodePort 를 publish 하지 않으므로, API 호출은 클러스터 내부에서
+# 앱 파드(curl 보유) 를 kubectl exec 경유로 nginx 게이트웨이로 보낸다.
+API_BASE="${API_BASE:-http://testbed-nginx-external}"
+APP_POD_LABEL="app=testbed-order"
 ORIGINAL_CPU_LIMIT="500m"
 ORIGINAL_CPU_REQUEST="200m"
 THROTTLE_CPU_LIMIT="10m"        # 극도로 낮은 CPU limit
@@ -42,6 +46,15 @@ log_ok()    { echo -e "${GREEN}[OK]${NC}   $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
+# --- 클러스터 내부 HTTP 호출 헬퍼 (k3d: 호스트 NodePort 미노출 → 앱 파드 exec 경유) ---
+API_POD=""
+resolve_api_pod() {
+    API_POD=$(kubectl -n "$NAMESPACE" get pod -l "$APP_POD_LABEL" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+}
+# api_curl: curl 과 동일 인자. URL 은 $API_BASE(=cluster nginx) 기준. 클러스터 안에서 실행됨.
+api_curl() { kubectl -n "$NAMESPACE" exec "$API_POD" -- curl "$@"; }
+
 # --- 사전 조건 확인 ---
 check_prerequisites() {
     log_info "사전 조건 확인 중..."
@@ -58,9 +71,14 @@ check_prerequisites() {
         -o jsonpath='{.spec.template.spec.containers[0].resources.limits.cpu}' 2>/dev/null)
     log_info "현재 PostgreSQL CPU limit: $current_limit"
 
-    # API 접근 확인
+    # API 호출용 파드 확인 + API 접근 확인 (cluster 내부 → nginx)
+    resolve_api_pod
+    if [[ -z "$API_POD" ]]; then
+        log_error "order-service Pod 없음 (API 호출 불가)"
+        exit 1
+    fi
     local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "$API_BASE/api/products" 2>/dev/null || echo "000")
+    http_code=$(api_curl -s -o /dev/null -w "%{http_code}" "$API_BASE/api/products" 2>/dev/null || echo "000")
     if [[ "$http_code" != "200" ]]; then
         log_error "API 접근 불가 (HTTP $http_code)"
         exit 1
@@ -81,12 +99,12 @@ measure_baseline() {
 
     # 상품 조회
     local product_time
-    product_time=$(curl -s -o /dev/null -w "%{time_total}" "$API_BASE/api/products" 2>/dev/null || echo "N/A")
+    product_time=$(api_curl -s -o /dev/null -w "%{time_total}" "$API_BASE/api/products" 2>/dev/null || echo "N/A")
     log_info "베이스라인 GET /api/products: ${product_time}s" >&2
 
     # 주문 생성
     local order_time
-    order_time=$(curl -s -o /dev/null -w "%{time_total}" \
+    order_time=$(api_curl -s -o /dev/null -w "%{time_total}" \
         --max-time 30 \
         -X POST "$API_BASE/api/orders" \
         -H "Content-Type: application/json" \
@@ -169,13 +187,13 @@ generate_load() {
         for i in $(seq 1 "$CONCURRENT_REQUESTS"); do
             if (( i % 3 == 0 )); then
                 # 상품 조회 (SELECT)
-                curl -s -o /dev/null -w "GET-products-${round}-${i}: HTTP %{http_code} in %{time_total}s\n" \
+                api_curl -s -o /dev/null -w "GET-products-${round}-${i}: HTTP %{http_code} in %{time_total}s\n" \
                     --max-time 30 \
                     "$API_BASE/api/products" \
                     >> /tmp/scenario-03-results.log 2>&1 &
             elif (( i % 3 == 1 )); then
                 # 주문 생성 (SELECT + INSERT + UPDATE - 전체 호출 체인)
-                curl -s -o /dev/null -w "POST-order-${round}-${i}: HTTP %{http_code} in %{time_total}s\n" \
+                api_curl -s -o /dev/null -w "POST-order-${round}-${i}: HTTP %{http_code} in %{time_total}s\n" \
                     --max-time 60 \
                     -X POST "$API_BASE/api/orders" \
                     -H "Content-Type: application/json" \
@@ -330,9 +348,9 @@ cleanup() {
         -c "UPDATE inventory_schema.inventory SET stock = GREATEST(stock, 50);" 2>/dev/null || true
     log_ok "재고 보충 완료"
 
-    # 4. API 정상 확인
+    # 4. API 정상 확인 (cleanup 은 postgres 만 재시작 → order 파드/API_POD 유효)
     local api_code
-    api_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$API_BASE/api/products" 2>/dev/null || echo "000")
+    api_code=$(api_curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$API_BASE/api/products" 2>/dev/null || echo "000")
     if [[ "$api_code" == "200" ]]; then
         log_ok "API 정상 복구 확인 (HTTP 200)"
     else

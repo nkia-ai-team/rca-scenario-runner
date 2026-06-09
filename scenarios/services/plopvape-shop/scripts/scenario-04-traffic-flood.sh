@@ -18,10 +18,14 @@
 set -uo pipefail
 
 # --- 설정 ---
-export KUBECONFIG=/home/nkia/.kube/config
+# k3d 도메인별 클러스터: plopvape 전용 kubeconfig (공유 config 의 current-context 드리프트 무관)
+export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 PG_POD="${PG_POD:-testbed-postgres-0}"
-API_BASE="${API_BASE:-http://127.0.0.1:30080}"
+# k3d 는 호스트로 NodePort 를 publish 하지 않으므로, API 호출은 클러스터 내부에서
+# 앱 파드(curl 보유) 를 kubectl exec 경유로 nginx 게이트웨이로 보낸다.
+API_BASE="${API_BASE:-http://testbed-nginx-external}"
+APP_POD_LABEL="app=testbed-order"
 
 # 트래픽 단계 (점진적 증가)
 PHASE_1_CONCURRENT=5            # 정상 트래픽
@@ -41,6 +45,15 @@ log_ok()    { echo -e "${GREEN}[OK]${NC}   $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
+# --- 클러스터 내부 HTTP 호출 헬퍼 (k3d: 호스트 NodePort 미노출 → 앱 파드 exec 경유) ---
+API_POD=""
+resolve_api_pod() {
+    API_POD=$(kubectl -n "$NAMESPACE" get pod -l "$APP_POD_LABEL" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+}
+# api_curl: curl 과 동일 인자. URL 은 $API_BASE(=cluster nginx) 기준. 클러스터 안에서 실행됨.
+api_curl() { kubectl -n "$NAMESPACE" exec "$API_POD" -- curl "$@"; }
+
 # --- 사전 조건 확인 ---
 check_prerequisites() {
     log_info "사전 조건 확인 중..."
@@ -50,8 +63,14 @@ check_prerequisites() {
         exit 1
     fi
 
+    resolve_api_pod
+    if [[ -z "$API_POD" ]]; then
+        log_error "order-service Pod 없음 (API 호출 불가)"
+        exit 1
+    fi
+
     local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "$API_BASE/api/products" 2>/dev/null || echo "000")
+    http_code=$(api_curl -s -o /dev/null -w "%{http_code}" "$API_BASE/api/products" 2>/dev/null || echo "000")
     if [[ "$http_code" != "200" ]]; then
         log_error "API 접근 불가 (HTTP $http_code)"
         exit 1
@@ -76,35 +95,26 @@ send_orders() {
     log_info "  Phase $phase: $label ($concurrent건 동시 주문)"
     log_info "====================================================="
 
-    local pids=()
     local start_time
     start_time=$(date +%s)
 
-    # 다양한 상품에 대해 주문 (hot product + 분산)
-    for i in $(seq 1 "$concurrent"); do
-        local product_id
-        if (( i % 2 == 0 )); then
-            product_id=1  # 인기 상품 (50%가 동일 상품 집중 → row lock contention)
-        else
-            product_id=$(( (i % 16) + 1 ))  # 나머지 분산
-        fi
+    # 파드 내부에서 $concurrent 개의 주문을 단일 exec 로 동시 fan-out.
+    # (k3d 에선 호스트→ClusterIP 직접 불가 + 수백 개의 개별 kubectl exec 는 apiserver
+    #  inflight 한계를 치므로, 부하는 앱 파드 안에서 한 번에 생성한다)
+    kubectl -n "$NAMESPACE" exec "$API_POD" -- bash -c '
+        API_BASE="'"$API_BASE"'"; phase="'"$phase"'"; concurrent="'"$concurrent"'"
+        for i in $(seq 1 "$concurrent"); do
+            if (( i % 2 == 0 )); then product_id=1; else product_id=$(( (i % 16) + 1 )); fi
+            curl -s -o /dev/null \
+                -w "phase${phase}-order-${i}: HTTP %{http_code} in %{time_total}s\n" \
+                --max-time 35 -X POST "${API_BASE}/api/orders" \
+                -H "Content-Type: application/json" \
+                -d "{\"customerName\":\"flood-p${phase}-${i}\",\"customerEmail\":\"flood${i}@test.com\",\"items\":[{\"productId\":${product_id},\"quantity\":1}]}" &
+        done
+        wait
+    ' >> /tmp/scenario-04-results.log 2>&1
 
-        curl -s -o /dev/null \
-            -w "phase${phase}-order-${i}: HTTP %{http_code} in %{time_total}s\n" \
-            --max-time 35 \
-            -X POST "$API_BASE/api/orders" \
-            -H "Content-Type: application/json" \
-            -d "{\"customerName\":\"flood-p${phase}-${i}\",\"customerEmail\":\"flood${i}@test.com\",\"items\":[{\"productId\":${product_id},\"quantity\":1}]}" \
-            >> /tmp/scenario-04-results.log 2>&1 &
-        pids+=($!)
-    done
-
-    log_info "  $concurrent건 전송 완료, 응답 대기 중..."
-
-    # 완료 대기
-    for pid in "${pids[@]}"; do
-        wait "$pid" 2>/dev/null || true
-    done
+    log_info "  $concurrent건 전송 완료"
 
     local end_time
     end_time=$(date +%s)
@@ -144,8 +154,8 @@ take_snapshot() {
         psql -U plopvape -d plopvape -t -A \
         -c "SELECT 'DB 연결: ' || count(*) || '/' || (SELECT setting FROM pg_settings WHERE name='max_connections') || ' (idle:' || count(*) FILTER (WHERE state='idle') || ', active:' || count(*) FILTER (WHERE state='active') || ')' FROM pg_stat_activity WHERE datname='plopvape';" 2>/dev/null || true
 
-    # Pod 리소스
-    kubectl --kubeconfig=/home/nkia/.kube/config -n "$NAMESPACE" top pod --no-headers 2>/dev/null | \
+    # Pod 리소스 (KUBECONFIG 는 상단 export(plopvape.yaml) 사용)
+    kubectl -n "$NAMESPACE" top pod --no-headers 2>/dev/null | \
         grep -E "order|product|inventory|payment" | \
         awk '{printf "  %-45s CPU:%-6s MEM:%s\n", $1, $2, $3}' || true
 }
@@ -221,10 +231,11 @@ cleanup() {
     done
     log_ok "전 서비스 rolling restart 완료"
 
-    # API 정상 확인
+    # API 정상 확인 (rolling restart 로 order 파드가 교체됐으므로 API_POD 재확인)
     sleep 3
+    resolve_api_pod
     local api_code
-    api_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$API_BASE/api/products" 2>/dev/null || echo "000")
+    api_code=$(api_curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$API_BASE/api/products" 2>/dev/null || echo "000")
     if [[ "$api_code" == "200" ]]; then
         log_ok "API 정상 확인 (HTTP 200)"
     else
