@@ -1,119 +1,250 @@
 service:
   name: plopvape-shop
-  description: |
-    RCA 테스트베드용 쇼핑몰 마이크로서비스.
-    109서버 K3s rca-testbed 네임스페이스에 배포: nginx + 5개 shop 서비스(order/product/inventory/payment/notification) + postgres + redis.
+  description: 'RCA 테스트베드용 쇼핑몰 마이크로서비스.
+
+    109서버 K3s rca-testbed 네임스페이스에 배포: nginx + 5개 shop 서비스(order/product/inventory/payment/notification)
+    + postgres + redis.
+
+    '
   owner: BangSungjoon
   linear_project: RCA 테스트베드
-
 target:
-  # rca-scenario-runner 는 본인이 떠있는 호스트의 K3s 와 통신 (network_mode: host).
-  # 즉 다른 서버에 띄우면 그 서버의 testbed 를 조작. 본 metadata 는 참고용.
-  server: "<target-host>"          # 사내 K3s 호스트 (rca-scenario-runner 가 같이 떠있음)
-  ssh_user: "<host-user>"           # 예: nkia
-  arch: "<arch>"                    # 예: arm64 / amd64
-  namespace: rca-testbed             # K3s namespace (testbed-services 의 app_namespace)
-  kubeconfig: /home/<host-user>/.kube/config
-  api_base: "http://127.0.0.1:30080"  # localhost — host network 공유
-
+  server: <target-host>
+  ssh_user: <host-user>
+  arch: <arch>
+  namespace: rca-testbed-plopvape
+  kubeconfig: /home/nkia/.kube/plopvape.yaml
+  api_base: http://127.0.0.1:30080
 scenarios:
-  - id: scenario-01
-    file: scenario-01-inventory-lock.sh
-    title: Inventory Row Lock Contention
-    description: inventory 테이블 long-held SELECT FOR UPDATE lock 로 동시 주문 contention 재현
-    root_cause: 장시간 SELECT FOR UPDATE lock 점유 + 동시 주문 폭주
-    propagation: inventory lock wait → product timeout → order 5xx → Nginx 502
-    estimated_duration_sec: 360
-    expected_alarms:
-      - DPM lock wait
-      - APM inventory response time 증가
-      - SMS postgres process CPU%
-    difficulty: 4
-    expected_rca_root_cause: |
-      PostgreSQL inventory 테이블에 장시간 점유된 SELECT FOR UPDATE lock 이 존재해
-      동시 주문 트랜잭션이 lock wait 에 걸려 cascade 장애 발생.
-      결정적 시그널:
-        - DPM lock count / lock wait time 메트릭이 평소의 N배 증가
-        - APM 트레이스에 inventory-service 의 SQL span 이 수초간 대기 후 timeout
-        - DPM 의 active session 중 long-running query (statement_start_time 오래된 트랜잭션) 1건
-      RCA 보고서 합격 기준: "inventory 테이블 lock contention 으로 인한 cascade" 까지 짚으면 통과.
-      어떤 코드가 lock 을 잡았는지 (소스 inspect) 까지 요구하지 않음.
+- id: scenario-01
+  file: scenario-01-inventory-lock.sh
+  title: Inventory Row Lock Contention
+  description: inventory 테이블 long-held SELECT FOR UPDATE lock 로 동시 주문 contention 재현
+  root_cause: 장시간 SELECT FOR UPDATE lock 점유 + 동시 주문 폭주
+  propagation: inventory lock wait → product timeout → order 5xx → Nginx 502
+  estimated_duration_sec: 360
+  expected_alarms:
+  - DPM lock wait
+  - APM inventory response time 증가
+  - SMS postgres process CPU%
+  difficulty: 4
+  expected_rca_root_cause: "PostgreSQL inventory 테이블에 장시간 점유된 SELECT FOR UPDATE lock\
+    \ 이 존재해\n동시 주문 트랜잭션이 lock wait 에 걸려 cascade 장애 발생.\n결정적 시그널:\n  - DPM lock count\
+    \ / lock wait time 메트릭이 평소의 N배 증가\n  - APM 트레이스에 inventory-service 의 SQL span\
+    \ 이 수초간 대기 후 timeout\n  - DPM 의 active session 중 long-running query (statement_start_time\
+    \ 오래된 트랜잭션) 1건\nRCA 보고서 합격 기준: \"inventory 테이블 lock contention 으로 인한 cascade\"\
+    \ 까지 짚으면 통과.\n어떤 코드가 lock 을 잡았는지 (소스 inspect) 까지 요구하지 않음.\n"
+- id: scenario-02
+  file: scenario-02-payment-timeout.sh
+  title: External PG API Timeout
+  description: pg-mock 중단 + TCP black-hole 로 payment read-timeout 유발 → order 캐스케이드
+    장애
+  root_cause: 외부 PG API 무응답 (TCP 연결은 되지만 HTTP 응답 없음, 10초 대기)
+  propagation: payment read-timeout → order thread starvation → 502 응답
+  estimated_duration_sec: 300
+  expected_alarms:
+  - APM payment 평균응답시간 초과 (3~5s, 외부 PG 대기)
+  - APM order 평균응답시간 초과 (10s+, payment 대기 누적)
+  - APM order 서비스 에러율 급증 (최대 100%)
+  - DPM 트랜잭션 시간 초과 (≥5s)
+  - DPM DB Lock 수 급증 (≥40 Lock)
+  difficulty: 5
+  expected_rca_root_cause: "payment-service 가 외부 PG API (http://192.168.200.109:8190)\
+    \ 호출 시 TCP 연결은\n되지만 HTTP 응답이 오지 않아 read-timeout (10s) 까지 thread 가 점유됨.\n결정적 시그널:\n\
+    \  - APM 트레이스의 payment span 안에 외부 HTTP call 자식 span 이 ~10s read-timeout 으로 종료\n\
+    \  - 같은 trace_id 의 order span 이 payment 응답을 기다리다 누적 timeout (10s+)\n  - payment-service\
+    \ 의 thread pool 사용량 100% (외부 호출 대기로 thread 점유)\nRCA 보고서 합격 기준: \"외부 PG API 응답\
+    \ 없음 (192.168.200.109:8190) 으로 인한 cascade timeout\" 명시.\n"
+- id: scenario-03
+  file: scenario-03-db-cpu-throttle.sh
+  title: PostgreSQL Pod CPU Throttle
+  description: postgres pod CPU limit 500m → 10m 축소로 전 서비스 쿼리 지연
+  root_cause: K8s CPU limit 10m 로 조정 → 극심한 CPU throttling
+  propagation: DB slow query → POST /api/orders 평균 3.23s (최대 6.11s), 서비스 에러율 급증
+  estimated_duration_sec: 300
+  expected_alarms:
+  - APM 평균응답시간 초과 (inventory/payment/order/product 모두 12~16s, >5s 임계치)
+  - APM 서비스 에러율 급증 (payment 최고 66.7%, inventory/order 33.3%, product 25%)
+  - KCM postgres Pod CPU throttling (K3s metrics-server 설치된 경우에만 발동)
+  side_effects:
+  - cleanup 중 postgres pod 가 재기동되면서 KCM 의 postgres 개별 알람 설정이 disable 될 수 있음
+  - 재기동 후 KCM 콘솔에서 개별 알람 룰을 다시 활성화해야 함
+  - K3s 에 metrics-server 미설치 시 kubectl top / KCM Pod CPU 알람 안 뜸 (시나리오 실행엔 영향 없음)
+  difficulty: 4
+  expected_rca_root_cause: "postgres pod 가 K8s CPU limit 축소 (500m → 10m) 로 CPU throttling\
+    \ 에 걸려 모든\n서비스의 DB 쿼리가 동반 지연.\n결정적 시그널:\n  - KCM 의 postgres pod CPU throttling\
+    \ % 가 ~100% (metrics-server 설치 가정)\n  - 모든 서비스 (order/inventory/payment/product)\
+    \ 의 DB span latency 가 동시에 폭증\n  - DPM transaction duration 평균이 평소의 수십 배\n  - 단일\
+    \ 서비스가 아닌 *모든 서비스가 같은 시점에 함께 느려짐* — 공통 의존성 (DB) 문제 신호\nRCA 보고서 합격 기준: \"postgres\
+    \ pod 의 K8s CPU limit/throttling 으로 인한 DB 지연\" 명시.\n"
+- id: scenario-04
+  file: scenario-04-traffic-flood.sh
+  title: Black Friday Traffic Flood
+  description: 동시 주문 요청 폭주로 order-service thread pool 포화 + DB 커넥션/락 경합
+  root_cause: 4단계 점진적 트래픽 폭주 (5 → 50 → 200 → 500 concurrent)
+  propagation: order thread pool 포화 → 하위 서비스 cascading 5xx → DB 세션/Lock 급증
+  estimated_duration_sec: 300
+  expected_alarms:
+  - APM 평균응답시간 초과 (order/inventory/payment/product)
+  - DPM DB 연결 수 폭증 (≥55 세션)
+  - DPM DB Lock 수 급증 (≥40 Lock)
+  - DPM 트랜잭션 시간 초과
+  side_effects:
+  - cleanup 시 애플리케이션 서비스가 rolling restart 되어 WPM 에이전트가 재등록됨
+  - 기존 에이전트는 disabled 상태로 남고, 에이전트 총 개수가 실행할 때마다 증가
+  - disabled 에이전트를 삭제하면 해당 에이전트가 수집한 WPM 데이터 전부 함께 삭제됨 — 주의해서 관리
+  - 재등록 후 polestar collector 가 TCP 인식하는 데 1~5h 지연 발생 가능. 그 동안 WPM UI 가 status=DOWN
+    표시되지만 정상 — 시나리오 즉시 연달아 돌리지 말 것
+  - 외부 사용자 폭주를 모사하기 위해 호스트에서 500 동시 curl 을 fork. multi-testbed 가 같이 떠있는 호스트(예 109)에선
+    호스트의 process slot / sshd 인증 슬롯이 일시적으로 고갈될 수 있음 — 시나리오 실행 중 SSH/KCM 메트릭이 잠시 sparse
+    해질 수 있으나 시나리오 종료 후 자동 회복. 의도된 동작이며 RCA agent 가 sparse 관측 환경에서도 root cause 짚을 수
+    있는지 평가하는 부가 가치
+  difficulty: 4
+  expected_rca_root_cause: "order-service 의 throughput 이 평소 100배 (5 → 500 concurrent)\
+    \ 로 spike 하여\napplication thread pool 포화 + DB connection pool 고갈 + 하위 서비스 cascade.\n\
+    결정적 시그널:\n  - APM order 의 throughput 메트릭이 평소의 N배 spike\n  - order-service thread\
+    \ pool active 100% / queue saturated\n  - DPM 의 DB session 수가 평소의 수배 (≥55 세션)\
+    \ 로 폭증\n  - 트레이스 span tree 에 order → product/inventory/payment cascade 호출\n  -\
+    \ 단일 의존성 문제가 아니라 *상위 서비스 (order) 의 인입 트래픽 폭증이 시작점*\nRCA 보고서 합격 기준: \"order-service\
+    \ 인입 트래픽 폭증으로 인한 thread pool / DB connection 고갈\" 명시.\n"
+- id: scenario-05
+  file: scenario-05-downstream-timeout-surface-negative.sh
+  title: Downstream Timeout Surface Negative
+  description: order burst로 APM latency/error surface를 만들지만 upstream external edge,
+    DPM lock, KCM impact root proof는 만들지 않는 negative guardrail.
+  root_cause: 검증된 root 없음. burst-induced APM surface만 존재.
+  propagation: APM latency/error surface → no upstream root proof → RCA should preserve
+    uncertainty
+  estimated_duration_sec: 180
+  expected_alarms:
+  - APM order/product latency or weak error surface
+  - No external edge timeout proof
+  - No current DPM lock/wait proof
+  difficulty: 3
+  expected_rca_root_cause: '정답은 단일 root 확정이 아니라 증거 부족/불확실성 보존이다.
 
-  - id: scenario-02
-    file: scenario-02-payment-timeout.sh
-    title: External PG API Timeout
-    description: pg-mock 중단 + TCP black-hole 로 payment read-timeout 유발 → order 캐스케이드 장애
-    root_cause: 외부 PG API 무응답 (TCP 연결은 되지만 HTTP 응답 없음, 10초 대기)
-    propagation: payment read-timeout → order thread starvation → 502 응답
-    estimated_duration_sec: 300
-    expected_alarms:
-      - APM payment 평균응답시간 초과 (3~5s, 외부 PG 대기)
-      - APM order 평균응답시간 초과 (10s+, payment 대기 누적)
-      - APM order 서비스 에러율 급증 (최대 100%)
-      - DPM 트랜잭션 시간 초과 (≥5s)
-      - DPM DB Lock 수 급증 (≥40 Lock)
-    difficulty: 5
-    expected_rca_root_cause: |
-      payment-service 가 외부 PG API (http://192.168.200.109:8190) 호출 시 TCP 연결은
-      되지만 HTTP 응답이 오지 않아 read-timeout (10s) 까지 thread 가 점유됨.
-      결정적 시그널:
-        - APM 트레이스의 payment span 안에 외부 HTTP call 자식 span 이 ~10s read-timeout 으로 종료
-        - 같은 trace_id 의 order span 이 payment 응답을 기다리다 누적 timeout (10s+)
-        - payment-service 의 thread pool 사용량 100% (외부 호출 대기로 thread 점유)
-      RCA 보고서 합격 기준: "외부 PG API 응답 없음 (192.168.200.109:8190) 으로 인한 cascade timeout" 명시.
+    downstream timeout-like symptom만으로 external dependency, DB lock, KCM root를 확정하면
+    실패.
 
-  - id: scenario-03
-    file: scenario-03-db-cpu-throttle.sh
-    title: PostgreSQL Pod CPU Throttle
-    description: postgres pod CPU limit 500m → 10m 축소로 전 서비스 쿼리 지연
-    root_cause: K8s CPU limit 10m 로 조정 → 극심한 CPU throttling
-    propagation: DB slow query → POST /api/orders 평균 3.23s (최대 6.11s), 서비스 에러율 급증
-    estimated_duration_sec: 300
-    expected_alarms:
-      - APM 평균응답시간 초과 (inventory/payment/order/product 모두 12~16s, >5s 임계치)
-      - APM 서비스 에러율 급증 (payment 최고 66.7%, inventory/order 33.3%, product 25%)
-      - KCM postgres Pod CPU throttling (K3s metrics-server 설치된 경우에만 발동)
-    side_effects:
-      - cleanup 중 postgres pod 가 재기동되면서 KCM 의 postgres 개별 알람 설정이 disable 될 수 있음
-      - 재기동 후 KCM 콘솔에서 개별 알람 룰을 다시 활성화해야 함
-      - K3s 에 metrics-server 미설치 시 kubectl top / KCM Pod CPU 알람 안 뜸 (시나리오 실행엔 영향 없음)
-    difficulty: 4
-    expected_rca_root_cause: |
-      postgres pod 가 K8s CPU limit 축소 (500m → 10m) 로 CPU throttling 에 걸려 모든
-      서비스의 DB 쿼리가 동반 지연.
-      결정적 시그널:
-        - KCM 의 postgres pod CPU throttling % 가 ~100% (metrics-server 설치 가정)
-        - 모든 서비스 (order/inventory/payment/product) 의 DB span latency 가 동시에 폭증
-        - DPM transaction duration 평균이 평소의 수십 배
-        - 단일 서비스가 아닌 *모든 서비스가 같은 시점에 함께 느려짐* — 공통 의존성 (DB) 문제 신호
-      RCA 보고서 합격 기준: "postgres pod 의 K8s CPU limit/throttling 으로 인한 DB 지연" 명시.
+    '
+- id: scenario-06
+  file: scenario-06-payment-log-lock-measured.sh
+  title: Payment Log Row Lock Measured
+  description: payment_schema.payment_logs 또는 payments 계열에 장시간 lock을 잡고 결제/주문 부하를
+    발생시켜 measured DPM lock positive case를 만든다.
+  root_cause: PostgreSQL payment persistence path row-level lock contention
+  propagation: payment table/log lock wait → payment latency/error → order latency/error
+  estimated_duration_sec: 300
+  expected_alarms:
+  - DPM lock/wait or transaction duration signal
+  - APM payment/order latency or error propagation
+  - External PG 정상 negative evidence
+  difficulty: 4
+  expected_rca_root_cause: 'current DPM lock/wait/session proof와 payment/order propagation이
+    모두 있어야 DB lock으로 결론 가능하다.
 
-  - id: scenario-04
-    file: scenario-04-traffic-flood.sh
-    title: Black Friday Traffic Flood
-    description: 동시 주문 요청 폭주로 order-service thread pool 포화 + DB 커넥션/락 경합
-    root_cause: 4단계 점진적 트래픽 폭주 (5 → 50 → 200 → 500 concurrent)
-    propagation: order thread pool 포화 → 하위 서비스 cascading 5xx → DB 세션/Lock 급증
-    estimated_duration_sec: 300
-    expected_alarms:
-      - APM 평균응답시간 초과 (order/inventory/payment/product)
-      - DPM DB 연결 수 폭증 (≥55 세션)
-      - DPM DB Lock 수 급증 (≥40 Lock)
-      - DPM 트랜잭션 시간 초과
-    side_effects:
-      - cleanup 시 애플리케이션 서비스가 rolling restart 되어 WPM 에이전트가 재등록됨
-      - 기존 에이전트는 disabled 상태로 남고, 에이전트 총 개수가 실행할 때마다 증가
-      - disabled 에이전트를 삭제하면 해당 에이전트가 수집한 WPM 데이터 전부 함께 삭제됨 — 주의해서 관리
-      - 재등록 후 polestar collector 가 TCP 인식하는 데 1~5h 지연 발생 가능. 그 동안 WPM UI 가 status=DOWN 표시되지만 정상 — 시나리오 즉시 연달아 돌리지 말 것
-      - 외부 사용자 폭주를 모사하기 위해 호스트에서 500 동시 curl 을 fork. multi-testbed 가 같이 떠있는 호스트(예 109)에선 호스트의 process slot / sshd 인증 슬롯이 일시적으로 고갈될 수 있음 — 시나리오 실행 중 SSH/KCM 메트릭이 잠시 sparse 해질 수 있으나 시나리오 종료 후 자동 회복. 의도된 동작이며 RCA agent 가 sparse 관측 환경에서도 root cause 짚을 수 있는지 평가하는 부가 가치
-    difficulty: 4
-    expected_rca_root_cause: |
-      order-service 의 throughput 이 평소 100배 (5 → 500 concurrent) 로 spike 하여
-      application thread pool 포화 + DB connection pool 고갈 + 하위 서비스 cascade.
-      결정적 시그널:
-        - APM order 의 throughput 메트릭이 평소의 N배 spike
-        - order-service thread pool active 100% / queue saturated
-        - DPM 의 DB session 수가 평소의 수배 (≥55 세션) 로 폭증
-        - 트레이스 span tree 에 order → product/inventory/payment cascade 호출
-        - 단일 의존성 문제가 아니라 *상위 서비스 (order) 의 인입 트래픽 폭증이 시작점*
-      RCA 보고서 합격 기준: "order-service 인입 트래픽 폭증으로 인한 thread pool / DB connection 고갈" 명시.
+    '
+- id: scenario-07
+  file: scenario-07-dpm-bootstrap-only-negative.sh
+  title: DPM Bootstrap Only Negative
+  description: DB 주변 약한 surface 또는 과거/초기 anomaly만 남기고 current lock proof 없이 service
+    symptom을 만들어 bootstrap-only DPM false-conclusive를 검출한다.
+  root_cause: 검증된 DPM root 없음. bootstrap-only 또는 weak DPM surface.
+  propagation: weak DPM surface + downstream symptoms → RCA should not conclude DB
+    lock
+  estimated_duration_sec: 180
+  expected_alarms:
+  - Weak or stale DPM-like surface
+  - No current lock/wait/session proof
+  - Downstream symptoms may exist
+  difficulty: 4
+  expected_rca_root_cause: 'DB lock은 가능한 가설로만 남아야 하며, bootstrap-only evidence로 CONCLUSIVE가
+    되면 실패.
+
+    '
+- id: scenario-08
+  file: scenario-08-deploy-change-precedes.sh
+  title: Deployment Change Precedes Symptom
+  description: payment deployment scale-down을 증상 전에 만들고 이후 order burst로 service impact를
+    유발해 change timeline positive case를 만든다.
+  root_cause: timestamped payment deployment availability change before symptom
+  propagation: payment deployment unavailable → payment/order latency/error → downstream
+    user impact
+  estimated_duration_sec: 300
+  expected_alarms:
+  - KCM/config/resource history change before symptom
+  - APM service impact after change
+  - DB/external root weaker or absent
+  difficulty: 5
+  expected_rca_root_cause: 'timestamped change evidence가 symptom보다 선행하고 affected service
+    impact와 연결될 때만 change root 후보로 인정한다.
+
+    '
+- id: scenario-09
+  file: scenario-09-deploy-change-after-symptom.sh
+  title: Deployment Change After Symptom Negative
+  description: payment symptom을 먼저 만든 뒤 unrelated notification rollout을 나중에 발생시켜 시간역전
+    negative case를 만든다.
+  root_cause: later notification deployment/config change is after symptom and unrelated
+  propagation: payment/order symptom first → later notification change → RCA should
+    reject notification change as root
+  estimated_duration_sec: 240
+  expected_alarms:
+  - Service symptom precedes change event
+  - Change event after symptom or unrelated entity
+  difficulty: 4
+  expected_rca_root_cause: 'after-the-fact change를 root로 확정하면 실패. 시간선행이 맞지 않으면 uncertainty
+    또는 다른 가설로 남겨야 한다.
+
+    '
+- id: scenario-10
+  file: scenario-10-noisy-neighbor-cpu.sh
+  title: Noisy-Neighbor Host CPU Saturation
+  description: 서비스와 무관한 프로세스(stress-ng, 대안 VLLM python)가 109 호스트 CPU를 점유해 같은 호스트 plopvape 전 서비스가 공통 슬로우다운되는 process-level positive.
+  root_cause: 비-서비스 프로세스의 호스트 CPU 포화(noisy neighbor)
+  propagation: noisy 프로세스 CPU 점유 → 호스트 CPU 포화 → java 서비스 스케줄링 지연 → plopvape 전 서비스 RT 동시 상승
+  estimated_duration_sec: 240
+  expected_alarms:
+  - SMS 호스트 CPU_usage 포화
+  - 비-서비스 프로세스 CPU%(server.Process) 급증
+  - APM 다수 서비스 RT 동시 상승(common-mode)
+  difficulty: 4
+  expected_rca_root_cause: 공통 원인은 호스트/프로세스 레벨 CPU 점유다. 동시 영향을 받은 단일 서비스나 DB lock으로 확정하면 실패. 프로세스 채널 통합 전에는 호스트 CPU 포화까지만 관측되어 INCONCLUSIVE 가능(채널 미구현, 데이터 결함 아님).
+- id: scenario-11
+  file: scenario-11-process-memory-leak.sh
+  title: Service Process Memory Leak
+  description: order-service(java)가 캐시를 무한 적재해 heap/RSS가 단조 증가, GC↑→RT↑→OOMKilled까지 가는 process-level positive.
+  root_cause: order-service 프로세스 메모리 누수(단조 증가)
+  propagation: 캐시 무한 적재 → java MEM%/Heap↑ → GcTime↑ → order RT↑ → OOMKilled → Pod restart
+  estimated_duration_sec: 300
+  expected_alarms:
+  - 프로세스 java MEM%/RSS 단조 증가(server.Process)
+  - APM HeapUsage/GcTime 악화
+  - KCM Pod restart/OOMKilled lifecycle
+  difficulty: 4
+  expected_rca_root_cause: 메모리 단조 증가와 시간선행, restart 동반이 있어야 누수로 결론한다. 단순 트래픽 증가나 DB로 도피하면 실패.
+- id: scenario-13
+  file: scenario-13-process-spike-no-impact.sh
+  title: Process CPU Spike Without Service Impact
+  description: 짧은(기본 20s) 프로세스 CPU spike만 만들고 서비스 영향은 만들지 않는 negative guardrail. P-1~P-3 false positive 검출 쌍.
+  root_cause: 검증된 user-facing impact 없음. 짧은 프로세스 CPU spike만 존재.
+  propagation: 짧은 프로세스 CPU spike → 정렬된 서비스 RT/error floor 없음 → RCA should preserve uncertainty
+  estimated_duration_sec: 60
+  expected_alarms:
+  - 짧은 프로세스/호스트 CPU spike
+  - 정렬된 APM 서비스 impact floor 없음
+  difficulty: 3
+  expected_rca_root_cause: 프로세스/호스트 CPU spike만 보고 CONCLUSIVE root로 확정하면 실패. impact floor가 없으면 INCONCLUSIVE/NEEDS_MORE_EVIDENCE를 유지해야 한다.
+- id: scenario-14
+  file: scenario-14-db-connection-exhaustion.sh
+  title: PostgreSQL Connection Pool Exhaustion
+  description: psql long-running connection으로 postgres max_connections를 소진해 order-service가 새 DB connection을 못 얻어 전 서비스 5xx가 되는 non-lock DB 원인.
+  root_cause: postgres connection 자원 고갈(lock 아님)
+  propagation: connection 점유 → max_connections 도달 → 앱 새 connection 거부 → 전 plopvape 서비스 5xx
+  estimated_duration_sec: 360
+  expected_alarms:
+  - DPM session count(active_count) 급증
+  - APM 전 서비스 error rate
+  - lock_time 정상(non-lock 검증)
+  difficulty: 4
+  expected_rca_root_cause: connection 고갈이 원인. DB lock으로 확정하면 실패(lock_time 정상). dpm session 수 급증 + 전 서비스 공통 에러가 근거.
