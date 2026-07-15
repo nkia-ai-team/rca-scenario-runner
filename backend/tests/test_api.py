@@ -10,19 +10,19 @@ async def test_healthz(client: AsyncClient) -> None:
     assert resp.json() == {"status": "ok", "version": "0.1.0"}
 
 
-async def test_list_scenarios_returns_plopvape_four(client: AsyncClient) -> None:
+async def test_list_scenarios_returns_plopvape_catalog(client: AsyncClient) -> None:
+    # 개수 하드코딩 금지 — 시나리오는 계속 늘어난다. 원조 4개 포함 여부만 고정.
     resp = await client.get("/api/scenarios")
     assert resp.status_code == 200
     data = resp.json()
     plopvape = [s for s in data if s["domain"] == "plopvape-shop"]
-    assert len(plopvape) == 4
-    assert {s["short_id"] for s in plopvape} == {"01", "02", "03", "04"}
-    assert {s["id"] for s in plopvape} == {
+    ids = {s["id"] for s in plopvape}
+    assert {
         "plopvape-shop:01",
         "plopvape-shop:02",
         "plopvape-shop:03",
         "plopvape-shop:04",
-    }
+    } <= ids
 
 
 async def test_get_single_scenario(client: AsyncClient) -> None:
@@ -42,14 +42,14 @@ async def test_list_domains(client: AsyncClient) -> None:
     slugs = {d["slug"] for d in data}
     assert "plopvape-shop" in slugs
     plopvape = next(d for d in data if d["slug"] == "plopvape-shop")
-    assert plopvape["scenario_count"] == 4
+    assert plopvape["scenario_count"] >= 4
 
 
 async def test_plopvape_scenarios_have_rca_ground_truth(client: AsyncClient) -> None:
-    """plopvape 4 시나리오 모두 difficulty + expected_rca_root_cause 채워져 RCA 채점 가능해야 한다."""
+    """plopvape 시나리오 전부 difficulty + expected_rca_root_cause 채워져 RCA 채점 가능해야 한다."""
     resp = await client.get("/api/scenarios")
     plopvape = [s for s in resp.json() if s["domain"] == "plopvape-shop"]
-    assert len(plopvape) == 4
+    assert len(plopvape) >= 4
     for s in plopvape:
         assert isinstance(s["difficulty"], int) and 1 <= s["difficulty"] <= 5, (
             f"{s['id']} difficulty missing or out of range"

@@ -27,6 +27,17 @@ class Scenario(BaseModel):
     # 반드시 수집 가능한 시그널 (트레이스 span / 메트릭 / 로그) 기반으로만 기술.
     # 보이지 않는 것 (코드 어노테이션, 런타임 설정값) 채점 기준 금지.
     expected_rca_root_cause: Optional[str] = None
+    # --- 구조화 스키마 (testbed-services spec-scenario-design §4 / load §3) ---
+    # 레거시 항목은 root_cause/propagation 이 문자열이라 위의 cause/propagation 으로
+    # 그대로 들어오고, 구조화 항목은 로더가 표시용 문자열로 정규화한 뒤 원본을
+    # 아래 필드에 보존한다. (둘 다 없으면 None)
+    cause_domain: Optional[str] = None                    # APM|DPM|SMS|NMS|KCM|WPM
+    expected_depth: Optional[str] = None                  # entity|dimension
+    root_cause_detail: Optional[dict] = None              # target_kind/mechanism 등 원본
+    propagation_steps: Optional[list[str]] = None         # 단계 리스트 원본
+    injection: Optional[dict] = None                      # script/parameters 원본
+    expected_anomalies: Optional[list[dict]] = None       # 이상감지 기대값 (load §3)
+    signals: Optional[dict] = None                        # must_support/must_rule_out
 
 
 class Domain(BaseModel):
