@@ -530,3 +530,34 @@ async def test_preflight_probe_failure_pauses_the_queue(tmp_path: Path) -> None:
     assert state.phase == "paused"
     assert "preflight probe failed" in (state.reason or "")
     assert runner.started == []
+
+
+def test_normal_segment_marker_is_fail_open_and_points_at_todays_kst_segment(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+
+    from app.live_queue import LiveScenarioQueue as LiveQueue
+
+    runs = tmp_path / "runs"
+    segment_root = tmp_path / "normal-segments"
+    # 2026-07-20T16:30Z = 2026-07-21 01:30 KST — the KST date must win.
+    clock = SimpleNamespace(now=lambda: datetime(2026, 7, 20, 16, 30, tzinfo=timezone.utc))
+    stub = SimpleNamespace(
+        clock=clock,
+        runner=SimpleNamespace(artifact_store=SimpleNamespace(root=runs)),
+    )
+
+    monkeypatch.delenv("NORMAL_SEGMENT_ROOT", raising=False)
+    LiveQueue._write_normal_segment_marker(stub, "run-1")
+    assert not (runs / "run-1" / "normal-segment.path").exists()
+
+    monkeypatch.setenv("NORMAL_SEGMENT_ROOT", str(segment_root))
+    LiveQueue._write_normal_segment_marker(stub, "run-1")
+    assert not (runs / "run-1" / "normal-segment.path").exists()
+
+    segment = segment_root / "commerce" / "2026-07-21"
+    segment.mkdir(parents=True)
+    (segment / "meta.json").write_text("{}", encoding="utf-8")
+    LiveQueue._write_normal_segment_marker(stub, "run-1")
+    marker = runs / "run-1" / "normal-segment.path"
+    assert marker.read_text(encoding="utf-8").strip() == str(segment)

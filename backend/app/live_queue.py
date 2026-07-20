@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -376,6 +377,7 @@ class LiveScenarioQueue:
                 return self._pause(state, f"start failed for {scenario_id}: {error}")
             if verdict is not None:
                 self._write_preflight(run.run_id, verdict)
+            self._write_normal_segment_marker(run.run_id)
             state = state.model_copy(
                 update={
                     "current_scenario_id": scenario_id,
@@ -621,6 +623,26 @@ class LiveScenarioQueue:
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(raw)
+
+    def _write_normal_segment_marker(self, run_id: str) -> None:
+        """Point capture at today's shared daily normal segment (contract v2).
+
+        The daily 00:00-02:00 KST dump is produced out-of-band (host cron on
+        109); this only records where today's segment lives so the capture
+        invoker forwards it as --normal-segment and builds assembled/.
+        Fail-open: no dump for today means no marker and no assembled/.
+        """
+        root = os.environ.get("NORMAL_SEGMENT_ROOT")
+        if not root:
+            return
+        domain = os.environ.get("NORMAL_SEGMENT_DOMAIN", "commerce")
+        date_kst = self.clock.now().astimezone(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+        segment = Path(root) / domain / date_kst
+        if not (segment / "meta.json").is_file():
+            return
+        path = self.runner.artifact_store.root / run_id / "normal-segment.path"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{segment}\n", encoding="utf-8")
 
     def _controller_evidence_error(self, run_id: str) -> str | None:
         state_path = self.runner.artifact_store.root / run_id / "state.json"
