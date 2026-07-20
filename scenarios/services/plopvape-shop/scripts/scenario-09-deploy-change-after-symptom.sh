@@ -8,7 +8,7 @@
 
 set -uo pipefail
 
-export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 TARGET_DEPLOY="${TARGET_DEPLOY:-testbed-notification}"
 SYMPTOM_DEPLOY="${SYMPTOM_DEPLOY:-testbed-payment}"

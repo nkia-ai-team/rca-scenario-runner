@@ -36,12 +36,48 @@ def test_commerce_structured_scenario_loads_from_per_scenario_file(real_catalog)
     assert s.propagation_steps and len(s.propagation_steps) == 4
     assert s.cause_domain == "APM"
     assert s.expected_depth == "entity"
-    assert s.injection["parameters"]["load"]["intensity_multiplier"] == 8
+    load = s.injection["parameters"]["load"]
+    assert load["target_rps"] == 80
+    assert load["measured_baseline_rps"] == 8
+    assert load["intensity_multiplier"] == 10
+    assert load["capacity_reference"]["measured_upper_rps"] == 80
+    assert load["achieved_rps"] == "runtime"
     assert len(s.expected_anomalies) == 3
     assert s.signals["must_rule_out"]
     # expected_alarms derived from expected_anomalies for the UI
     assert len(s.expected_alarms) == 3
     assert s.script_filename == "scenario-01-blackfriday-surge.sh"
+    assert s.execution.orchestrator.transport == "local"
+    assert s.execution.orchestrator.location == "scenario-runner@192.168.200.109"
+    point = s.execution.injection_points[0]
+    assert point.kind == "north_south"
+    assert point.transport == "ssh"
+    assert point.location == "tb-runner@192.168.122.206"
+
+
+def test_cross_domain_boundary_contract_is_preserved(real_catalog):
+    s = real_catalog["cross-domain:f15-t2"]
+    assert s.injection["parameters"]["expected_case_boundary"] == "split"
+    assert s.expected_clusters == {
+        "relation": "split",
+        "count": 2,
+        "must_not_share_root": True,
+    }
+    assert s.expected_incidents == {
+        "count": 2,
+        "relation": "independent",
+        "allow_time_overlap": True,
+    }
+    assert s.execution.orchestrator.transport == "local"
+    assert s.execution.orchestrator.location == "scenario-runner@192.168.200.109"
+    assert {point.kind for point in s.execution.injection_points} == {
+        "database",
+        "external_mock",
+    }
+    food_point = next(
+        point for point in s.execution.injection_points if point.id == "food-external-pg-429"
+    )
+    assert food_point.feasibility == "prerequisite"
 
 
 def test_legacy_flat_entries_still_load(real_catalog):

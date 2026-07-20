@@ -1,0 +1,646 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from app.adaptive import ControllerPhase
+from app.adaptive_runtime import ApplyRequest, CleanupRequest, EligibilityRequest
+from app.capture_orchestration import CaptureRequest, CaptureScheduler, ScenarioMetadata
+from app.live_probes import INDEX_PRESENT_CONTRACT, INDEX_PRESENT_SQL
+from app.observations import ApprovedQueryRegistry
+from app.production_runtime import (
+    ProductionCaptureInvoker,
+    RunArtifactStore,
+    TrustedDispatcherApplier,
+    _configured_live_probes,
+    file_sha256,
+)
+from app.runner import ScenarioRunner
+
+
+NOW = datetime(2026, 7, 16, 11, 5, tzinfo=timezone.utc)
+
+
+class Clock:
+    def now(self) -> datetime:
+        return NOW
+
+
+def scenario_metadata() -> ScenarioMetadata:
+    return ScenarioMetadata(
+        title="North-south surge",
+        description="A bounded user traffic surge exercises the checkout path.",
+        cause="North-south traffic surge",
+        injection_summary="Inject approved k6 traffic through the public NodePort.",
+        user_impact="Checkout latency and errors increase.",
+        distinguishing_evidence="Ingress and internal call volume rise proportionally.",
+    )
+
+
+class PlainTextResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self) -> bytes:
+        return b"OK"
+
+
+def _completed(document: dict) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], 0, json.dumps(document), "")
+
+
+def test_plain_text_health_response_is_accepted(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: PlainTextResponse())
+    probes = _configured_live_probes(
+        run_id="run-health",
+        scenario_id="F01-R",
+        clock=Clock(),
+        process_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    probes.paths = probes.paths.__class__(
+        coordinator=tmp_path / "coordinator.json",
+        runs=tmp_path / "runs",
+        baseline_status=tmp_path / "baseline.json",
+        loadgen_summary=tmp_path / "loadgen.json",
+        capture_root=tmp_path / "runs",
+    )
+    evidence = probes.inspect(
+        EligibilityRequest(
+            run_id="run-health",
+            scenario_id="F01-R",
+            checks=["target-health"],
+            clean_window_sec=7200,
+            requested_at=NOW,
+        )
+    )
+    assert evidence.check_results["target-health"] is True
+
+
+def test_production_index_probe_executes_only_fixed_parameterized_contract(monkeypatch) -> None:
+    calls: list[tuple[list[str], dict]] = []
+
+    def process(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 0, "1\n", "")
+
+    monkeypatch.setenv("COMMERCE_DB_PASSWORD", "secret")
+    probes = _configured_live_probes(
+        run_id="run-index",
+        scenario_id="F02-R",
+        clock=Clock(),
+        process_runner=process,
+    )
+    query = ApprovedQueryRegistry.from_path().bind(
+        {"query_id": "database.index_present", "parameters": INDEX_PRESENT_CONTRACT}
+    )
+
+    observed = probes.observe(query)
+
+    assert observed["quality"] == "good" and observed["value"] is True
+    argv, kwargs = calls[0]
+    assert argv == ["psql", "-At", "-c", INDEX_PRESENT_SQL]
+    assert kwargs["env"]["PGHOST"] == "192.168.122.77"
+    assert kwargs["env"]["PGPORT"] == "30432"
+    assert kwargs["env"]["PGOPTIONS"] == (
+        "-c lucida.index_schema=product_schema "
+        "-c lucida.index_table=products "
+        "-c lucida.index_name=idx_products_name"
+    )
+
+
+def test_profile_control_uses_scenario_id_confirmation_and_composite_order(tmp_path) -> None:
+    profile_control = tmp_path / "profile-control.py"
+    profile_control.write_text("trusted boundary", encoding="utf-8")
+    calls: list[list[str]] = []
+    plan = {
+        "live_allowed": True,
+        "scenario": {"id": "F08-H", "slug": "f08-h-composite-overlap"},
+        "plan_digest": "a" * 64,
+        "profile_instances": [
+            {"profile_id": "mock.expectation", "parameters": {"status": 429}},
+            {
+                "profile_id": "load.north_south",
+                "parameters": {"target_rps": 80},
+                "approved_levels": [
+                    {"level_id": "low", "parameters": {"target_rps": 60}}
+                ],
+            },
+        ],
+    }
+
+    def process(argv, **_kwargs):
+        calls.append(argv)
+        if "--plan" in argv:
+            return _completed({"normalized_plan": plan})
+        if argv[argv.index("--action") + 1] == "apply":
+            profile = argv[argv.index("--profile") + 1]
+            return _completed(
+                {
+                    "applied_at": (
+                        "2026-07-16T11:04:59Z"
+                        if profile == "mock.expectation"
+                        else "2026-07-16T11:05:00Z"
+                    )
+                }
+            )
+        return _completed(
+            {
+                "succeeded": True,
+                "effect_ended_at": "2026-07-16T11:05:00Z",
+                "reason": None,
+            }
+        )
+
+    applier = TrustedDispatcherApplier(
+        "f08-h-composite-overlap",
+        primary_profile="load.north_south",
+        companion_profiles=["mock.expectation"],
+        dispatcher=tmp_path / "run-scenario.sh",
+        profile_control=profile_control,
+        process_runner=process,
+        clock=Clock(),
+    )
+    applied = applier.apply(
+        ApplyRequest(
+            run_id="run-1",
+            scenario_id="F08-H",
+            fencing_token=7,
+            profile_id="load.north_south",
+            level_index=0,
+            level_id="low",
+            parameters={"target_rps": 60},
+            idempotency_key="apply-key",
+            requested_at=NOW,
+        )
+    )
+    assert applied.applied_at == datetime(2026, 7, 16, 11, 4, 59, tzinfo=timezone.utc)
+    apply_calls = [call for call in calls if "apply" in call]
+    assert [call[call.index("--profile") + 1] for call in apply_calls] == [
+        "mock.expectation",
+        "load.north_south",
+    ]
+    assert "--level-index" not in apply_calls[0]
+    assert "--parameters-json" not in apply_calls[0]
+    assert apply_calls[0][apply_calls[0].index("--idempotency-key") + 1].endswith(
+        ":0:mock.expectation"
+    )
+    assert apply_calls[1][apply_calls[1].index("--level-id") + 1] == "low"
+    for call in apply_calls:
+        assert call[call.index("--confirm") + 1] == f"LIVE:F08-H:{'a' * 64}"
+
+    cleaned = applier.cleanup(
+        CleanupRequest(
+            run_id="run-1",
+            scenario_id="F08-H",
+            fencing_token=7,
+            profile_id="load.north_south",
+            idempotency_key="cleanup-key",
+            requested_at=NOW,
+        )
+    )
+    assert cleaned.succeeded
+    cleanup_calls = [call for call in calls if "cleanup" in call]
+    assert [call[call.index("--profile") + 1] for call in cleanup_calls] == [
+        "load.north_south",
+        "mock.expectation",
+    ]
+
+
+def test_profile_control_absence_fails_before_live_effect(tmp_path) -> None:
+    calls = []
+    plan = {
+        "live_allowed": True,
+        "scenario": {"id": "F07-H", "slug": "f07-h-north-south-surge"},
+        "plan_digest": "a" * 64,
+        "profile_instances": [
+            {"profile_id": "load.north_south", "parameters": {"target_rps": 80}}
+        ],
+    }
+
+    def process(argv, **_kwargs):
+        calls.append(argv)
+        return _completed({"normalized_plan": plan})
+
+    applier = TrustedDispatcherApplier(
+        "f07-h-north-south-surge",
+        primary_profile="load.north_south",
+        dispatcher=tmp_path / "run-scenario.sh",
+        profile_control=tmp_path / "missing.py",
+        process_runner=process,
+    )
+    with pytest.raises(RuntimeError, match="per-profile control API"):
+        applier.apply(
+            ApplyRequest(
+                run_id="run-1",
+                scenario_id="F07-H",
+                fencing_token=1,
+                profile_id="load.north_south",
+                level_index=0,
+                level_id="fixed",
+                parameters={"target_rps": 80},
+                idempotency_key="key",
+                requested_at=NOW,
+            )
+        )
+    assert len(calls) == 1 and "--plan" in calls[0]
+
+
+def test_trusted_run_artifacts_are_atomic_restricted_and_hashable(tmp_path) -> None:
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir = store.create("run-001", {"scenario_id": "F07-H", "controller": {}})
+    store.persist_session(
+        run_dir,
+        {
+            "controller_state": {"phase": "succeeded"},
+            "level_changes": [],
+            "cleanup": {"succeeded": True},
+            "recovery": {"status": "succeeded"},
+        },
+    )
+    result = store.write_result(run_dir, {"mode": "calibration", "dirty": False})
+
+    assert (os.stat(run_dir).st_mode & 0o777) == 0o750
+    for path in run_dir.iterdir():
+        assert (os.stat(path).st_mode & 0o022) == 0
+    assert len(file_sha256(run_dir / "plan.json")) == 64
+    assert json.loads(result.read_text())["dirty"] is False
+
+
+def _capsule_contract(tmp_path, plan):
+    root = tmp_path / "contracts"
+    root.mkdir()
+    dispatcher = root / "run-scenario.sh"
+    dispatcher.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '" + json.dumps({"normalized_plan": plan}) + "'\n",
+        encoding="utf-8",
+    )
+    dispatcher.chmod(0o755)
+    control = root / "profile-control.py"
+    control.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    control.chmod(0o755)
+    executor = root / "profiles" / "load.py"
+    executor.parent.mkdir()
+    executor.write_text("#!/bin/sh\n", encoding="utf-8")
+    executor.chmod(0o755)
+    return root
+
+
+def test_recovery_capsule_is_contained_hashed_mode_locked_and_tamper_evident(tmp_path) -> None:
+    plan = {
+        "scenario": {"id": "F07-H", "slug": "adaptive"},
+        "live_allowed": True,
+        "plan_digest": "a" * 64,
+        "profile_instances": [],
+    }
+    contract = _capsule_contract(tmp_path, plan)
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir, compiled = store.prepare_capsule(
+        "run-capsule",
+        contract_root=contract,
+        scenario_slug="adaptive",
+        binding={
+            "catalog_slug": "adaptive", "primary_profile": "load.north_south",
+            "logical_profile_id": "load.north_south", "companion_profiles": [],
+        },
+    )
+    assert compiled == plan and store.verify_capsule(run_dir)["scenario_slug"] == "adaptive"
+    assert (run_dir / "capsule" / "contracts" / "run-scenario.sh").stat().st_mode & 0o777 == 0o750
+    (run_dir / "capsule" / "contracts" / "profiles" / "load.py").write_text("tampered")
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        store.verify_capsule(run_dir)
+
+    outside = tmp_path / "outside"
+    outside.write_text("secret")
+    (contract / "escape").symlink_to(outside)
+    with pytest.raises(RuntimeError, match="link or special"):
+        store.prepare_capsule(
+            "run-link", contract_root=contract, scenario_slug="adaptive", binding={}
+        )
+
+
+def test_capsule_survives_source_contract_drift_and_wal_records_apply_crash(tmp_path) -> None:
+    plan = {
+        "scenario": {"id": "F07-H", "slug": "adaptive"},
+        "live_allowed": True,
+        "plan_digest": "a" * 64,
+        "profile_instances": [
+            {
+                "profile_id": "load.north_south", "parameters": {"target_rps": 60},
+                "approved_levels": [{"level_id": "low", "parameters": {"target_rps": 60}}],
+            }
+        ],
+    }
+    contract = _capsule_contract(tmp_path, plan)
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir, _ = store.prepare_capsule(
+        "run-wal", contract_root=contract, scenario_slug="adaptive",
+        binding={
+            "catalog_slug": "adaptive", "primary_profile": "load.north_south",
+            "logical_profile_id": "load.north_south", "companion_profiles": [],
+        },
+    )
+    contract.joinpath("run-scenario.sh").write_text("drifted", encoding="utf-8")
+    capsule_dispatcher = run_dir / "capsule" / "contracts" / "run-scenario.sh"
+    capsule_control = run_dir / "capsule" / "contracts" / "profile-control.py"
+
+    def crash_after_intent(argv, **kwargs):
+        if argv[0] == str(capsule_dispatcher):
+            return subprocess.run(argv, **kwargs)
+        raise RuntimeError("simulated process death after fsynced intent")
+
+    applier = TrustedDispatcherApplier(
+        "adaptive", primary_profile="load.north_south",
+        dispatcher=capsule_dispatcher, profile_control=capsule_control,
+        process_runner=crash_after_intent, run_dir=run_dir,
+    )
+    with pytest.raises(RuntimeError, match="simulated process death"):
+        applier.apply(
+            ApplyRequest(
+                run_id="run-wal", scenario_id="F07-H", fencing_token=3,
+                profile_id="load.north_south", level_index=0, level_id="low",
+                parameters={"target_rps": 60}, idempotency_key="apply:0", requested_at=NOW,
+            )
+        )
+    operations = json.loads((run_dir / "mutations.json").read_text())["operations"]
+    assert operations == [
+        {
+            "action": "apply", "complete_at": None, "idempotency_key": "apply:0",
+            "intent_at": operations[0]["intent_at"], "profile_id": "load.north_south",
+        }
+    ]
+
+    control_calls = []
+
+    def recover(argv, **kwargs):
+        if argv[0] == str(capsule_dispatcher):
+            return subprocess.run(argv, **kwargs)
+        control_calls.append(argv)
+        return _completed(
+            {"succeeded": True, "effect_ended_at": "2026-07-16T11:05:00Z", "reason": None}
+        )
+
+    recovered = TrustedDispatcherApplier(
+        "adaptive", primary_profile="load.north_south",
+        dispatcher=capsule_dispatcher, profile_control=capsule_control,
+        process_runner=recover, run_dir=run_dir,
+    ).cleanup(
+        CleanupRequest(
+            run_id="run-wal", scenario_id="F07-H", fencing_token=3,
+            profile_id="load.north_south", idempotency_key="watchdog-cleanup",
+            requested_at=NOW,
+        )
+    )
+    assert recovered.succeeded
+    assert control_calls[0][control_calls[0].index("--profile") + 1] == "load.north_south"
+
+
+def test_capture_invoker_checkpoints_model_before_store_process_and_no_golden(tmp_path) -> None:
+    model = tmp_path / "model.json"
+    model.write_text('{"version": 1}\n', encoding="utf-8")
+    script = tmp_path / "capture-eval-case.sh"
+    script.write_text("trusted", encoding="utf-8")
+    runs = tmp_path / "runs"
+    (runs / "run-001").mkdir(parents=True)
+    process_calls = []
+
+    def process(argv, **kwargs):
+        process_calls.append((argv, kwargs))
+        checkpoint = Path(kwargs["env"]["MODEL_SOURCE"])
+        assert checkpoint.is_file()
+        assert (checkpoint.parent / "model-checkpoint.json").is_file()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    invoker = ProductionCaptureInvoker(
+        runs_root=runs,
+        capture_script=script,
+        output_root=tmp_path / "cases",
+        model_source=model,
+        process_runner=process,
+    )
+    scheduler = CaptureScheduler(tmp_path / "capture-state.json", clock=Clock(), invoker=invoker)
+    scheduler.schedule(
+        CaptureRequest(
+            run_id="run-001",
+            case_id="case-f07-h",
+            scenario_id="F07-H",
+            scenario_metadata=scenario_metadata(),
+            mode="calibration",
+            t1="2026-07-16T08:00:00Z",
+            t2="2026-07-16T10:20:00Z",
+        )
+    )
+    completed = scheduler.tick("run-001")
+
+    assert completed.capture_start == "2026-07-16T07:50:00Z"
+    assert completed.capture_end == "2026-07-16T10:40:00Z"
+    assert completed.golden_anomaly_file is False
+    assert completed.status == "completed"
+    assert len(process_calls) == 1
+    assert not (tmp_path / "cases" / "case-f07-h" / "golden.anomaly.json").exists()
+
+
+def test_capture_invoker_forwards_preflight_and_normal_segment(tmp_path) -> None:
+    model = tmp_path / "model.json"
+    model.write_text('{"version": 1}\n', encoding="utf-8")
+    script = tmp_path / "capture-eval-case.sh"
+    script.write_text("trusted", encoding="utf-8")
+    runs = tmp_path / "runs"
+    run_dir = runs / "run-002"
+    run_dir.mkdir(parents=True)
+    # The queue drops these next to the run before capture (spec §2.1).
+    (run_dir / "preflight.json").write_text('{"verdict": "clean"}\n', encoding="utf-8")
+    normal_dir = tmp_path / "normal-segments" / "commerce" / "2026-07-16"
+    normal_dir.mkdir(parents=True)
+    (run_dir / "normal-segment.path").write_text(str(normal_dir) + "\n", encoding="utf-8")
+    process_calls = []
+
+    def process(argv, **kwargs):
+        process_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    invoker = ProductionCaptureInvoker(
+        runs_root=runs,
+        capture_script=script,
+        output_root=tmp_path / "cases",
+        model_source=model,
+        process_runner=process,
+    )
+    scheduler = CaptureScheduler(tmp_path / "capture-state.json", clock=Clock(), invoker=invoker)
+    scheduler.schedule(
+        CaptureRequest(
+            run_id="run-002",
+            case_id="case-f07-h",
+            scenario_id="F07-H",
+            scenario_metadata=scenario_metadata(),
+            mode="calibration",
+            t1="2026-07-16T08:00:00Z",
+            t2="2026-07-16T10:20:00Z",
+        )
+    )
+    scheduler.tick("run-002")
+
+    argv = process_calls[0]
+    assert argv[argv.index("--preflight-json") + 1] == str(run_dir / "preflight.json")
+    assert argv[argv.index("--normal-segment") + 1] == str(normal_dir)
+
+
+def test_capture_invoker_can_stream_model_from_fixed_remote_observer(tmp_path) -> None:
+    runs = tmp_path / "runs"
+    (runs / "run-remote").mkdir(parents=True)
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(argv)
+        assert argv[:3] == ["ssh", "-i", "/root/.ssh/tb_key"]
+        assert argv[-5:] == [
+            "docker", "exec", "lucida-ai-observer", "cat",
+            "/var/lib/lucida/ai-models/stream-anomaly/global/v1/model.json",
+        ]
+        return subprocess.CompletedProcess(argv, 0, '{"version": 2}\n', "")
+
+    invoker = ProductionCaptureInvoker(
+        runs_root=runs,
+        model_source=tmp_path / "missing-model.json",
+        model_ssh_target="root@192.168.230.104",
+        process_runner=process,
+    )
+    job = SimpleNamespace(run_id="run-remote")
+
+    invoker.snapshot_model(job, idempotency_key="remote-model")
+
+    assert json.loads((runs / "run-remote" / "model.json").read_text())["version"] == 2
+    assert len(calls) == 1
+
+
+async def test_capture_worker_isolates_one_failed_job_and_completes_another(tmp_path) -> None:
+    jobs = {
+        "failed": SimpleNamespace(run_id="failed", status="pending"),
+        "healthy": SimpleNamespace(run_id="healthy", status="pending"),
+    }
+
+    class Scheduler:
+        def snapshot(self):
+            return SimpleNamespace(jobs=jobs)
+
+        def tick(self, run_id):
+            jobs[run_id].status = "failed" if run_id == "failed" else "completed"
+            if run_id == "failed":
+                raise RuntimeError("isolated failure")
+            return jobs[run_id]
+
+    async def no_wait(_seconds):
+        return None
+
+    runner = ScenarioRunner(
+        tmp_path,
+        tmp_path / "logs",
+        capture_scheduler=Scheduler(),  # type: ignore[arg-type]
+        artifact_store=RunArtifactStore(tmp_path / "runs"),
+        sleeper=no_wait,
+    )
+    await runner._capture_loop()
+
+    assert jobs["failed"].status == "failed"
+    assert jobs["healthy"].status == "completed"
+    assert "isolated failure" in "\n".join(runner._log_buffer)
+
+
+async def test_aborted_evaluation_is_not_published_as_an_eval_case(tmp_path) -> None:
+    class Invoker:
+        def snapshot_model(self, job, *, idempotency_key):
+            return None
+
+        def dump_stores(self, job, *, idempotency_key):
+            return None
+
+    dispatcher = tmp_path / "run-scenario.sh"
+    catalog = tmp_path / "catalog.json"
+    dispatcher.write_text("trusted", encoding="utf-8")
+    catalog.write_text("{}", encoding="utf-8")
+    metadata_path = tmp_path / "scenario-metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "scenarios": {"F07-E": scenario_metadata().model_dump(mode="json")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    scheduler = CaptureScheduler(
+        tmp_path / "capture.json", clock=Clock(), invoker=Invoker()
+    )
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir = store.create("run-aborted", {"controller": {}})
+    runner = ScenarioRunner(
+        tmp_path,
+        tmp_path / "logs",
+        artifact_store=store,
+        capture_scheduler=scheduler,
+        dispatcher_path=dispatcher,
+        catalog_path=catalog,
+        scenario_metadata_path=metadata_path,
+    )
+    session = SimpleNamespace(
+        run_id="run-aborted",
+        scenario_id="F07-E",
+        profile_id="load.north_south",
+        approved_profile_id="load.north_south",
+        t1=datetime(2026, 7, 16, 10, 0, tzinfo=timezone.utc),
+        t2=datetime(2026, 7, 16, 10, 20, tzinfo=timezone.utc),
+        controller_state=SimpleNamespace(phase=ControllerPhase.ABORTED),
+        spec=SimpleNamespace(
+            capture=SimpleNamespace(enabled=True),
+            adaptive=SimpleNamespace(mode=SimpleNamespace(value="evaluation")),
+        ),
+        trusted_evidence=lambda: {
+            "mode": "evaluation",
+            "outcome": "aborted",
+            "dirty": False,
+            "t1": "2026-07-16T10:00:00Z",
+            "t2": "2026-07-16T10:20:00Z",
+            "profile": {"kind": "fixed", "id": "load.north_south"},
+            "approved_profile_id": "load.north_south",
+            "cleanup": {"status": "succeeded"},
+            "recovery": {"status": "succeeded"},
+        },
+    )
+    runner._schedule_capture(session, run_dir)
+    await runner.stop_capture_worker()
+
+    assert scheduler.snapshot().jobs == {}
+    result = json.loads((run_dir / "result.json").read_text())
+    assert result["outcome"] == "aborted"
+    assert result["mode"] == "evaluation"
+    assert "case_id" not in result
+
+
+def test_append_tick_writes_jsonl_inside_trusted_root(tmp_path) -> None:
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+
+    store.append_tick(run_dir, {"at": "t0", "phase": "evaluating"})
+    store.append_tick(run_dir, {"at": "t1", "phase": "succeeded"})
+
+    lines = (run_dir / "ticks.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line) for line in lines] == [
+        {"at": "t0", "phase": "evaluating"},
+        {"at": "t1", "phase": "succeeded"},
+    ]
+
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    with pytest.raises(RuntimeError):
+        store.append_tick(outside, {"at": "t2"})

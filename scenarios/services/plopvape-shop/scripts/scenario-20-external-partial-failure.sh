@@ -22,7 +22,7 @@
 set -uo pipefail
 # k3d: 호스트 NodePort/노드 IP(172.x) 미노출·취약 → 앱 API 는 클러스터 내부 nginx 를 앱 파드 exec 로 호출.
 # (pg-mock 은 호스트 docker 컨테이너 + 호스트 python mock 이므로 그쪽 작업은 호스트 그대로 유지)
-export KUBECONFIG="${KUBECONFIG:-/home/nkia/.kube/plopvape.yaml}"
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 API_BASE="${API_BASE:-http://testbed-nginx-external}"
 APP_POD_LABEL="${APP_POD_LABEL:-app=testbed-order}"

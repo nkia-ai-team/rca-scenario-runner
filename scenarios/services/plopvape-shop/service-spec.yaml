@@ -13,7 +13,7 @@ target:
   ssh_user: <host-user>
   arch: <arch>
   namespace: rca-testbed-plopvape
-  kubeconfig: /home/nkia/.kube/plopvape.yaml
+  kubeconfig: /root/tb-kubeconfig
   api_base: http://127.0.0.1:30080
 scenarios:
 - id: scenario-01

@@ -24,7 +24,7 @@
 set -uo pipefail
 
 # k3d 도메인별 클러스터: plopvape 전용 kubeconfig (공유 config 의 current-context 드리프트 무관)
-export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 TARGET_DEPLOY="${TARGET_DEPLOY:-testbed-order}"
 # k3d 는 호스트로 NodePort 를 publish 하지 않으므로, API 호출은 클러스터 내부에서

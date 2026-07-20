@@ -28,7 +28,7 @@
 
 set -uo pipefail
 
-export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 REDIS_DEPLOY="${REDIS_DEPLOY:-testbed-redis}"
 # redis 헬스에 의존해 fault 중 CrashLoop 에 빠지는 서비스(cleanup 시 rollout 재시작 대상).

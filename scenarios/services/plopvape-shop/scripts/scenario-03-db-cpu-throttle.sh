@@ -19,7 +19,7 @@ set -uo pipefail
 
 # --- 설정 ---
 # k3d 도메인별 클러스터: plopvape 전용 kubeconfig (공유 config 의 current-context 드리프트 무관)
-export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 PG_STATEFULSET="testbed-postgres"
 PG_POD="${PG_POD:-testbed-postgres-0}"

@@ -17,7 +17,7 @@
 set -uo pipefail
 
 # k3d 도메인별 클러스터: social 전용 kubeconfig (공유 config 의 current-context 드리프트 무관)
-export KUBECONFIG=/home/nkia/.kube/social.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="rca-testbed-social"
 DB_POD="testbed-mysql-0"
 DB_USER="socialfeed"

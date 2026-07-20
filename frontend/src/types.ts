@@ -9,6 +9,41 @@ export type DisplayStatus = "idle" | "running" | "succeeded" | "failed";
 
 export type ScenarioMode = "run" | "cleanup";
 
+export interface ExecutionSpec {
+  transport: "local" | "ssh" | "docker" | "kubectl" | "api";
+  location: string;
+  timeout_sec: number;
+  host: string | null;
+  user: string | null;
+  port: number;
+  identity_file: string | null;
+  container: string | null;
+  namespace: string | null;
+  resource: string | null;
+  url: string | null;
+  cleanup_url: string | null;
+  header_env: Record<string, string>;
+}
+
+export interface InjectionPoint extends ExecutionSpec {
+  id: string;
+  kind: "north_south" | "east_west" | "database" | "node_resource" |
+    "container_resource" | "external_mock" | "network_path" | "change" |
+    "business_fault" | "composite_control";
+  target: string;
+  entry_path: string;
+  cleanup_location: string;
+  rationale: string;
+  feasibility: "ready" | "calibrate" | "prerequisite" | "defer";
+  managed_by: "runner" | "orchestrator";
+  script: string | null;
+}
+
+export interface ExecutionPlan {
+  orchestrator: ExecutionSpec;
+  injection_points: InjectionPoint[];
+}
+
 export interface ApiScenario {
   id: string;            // composite "<domain>:<short_id>"
   short_id: string;      // within-domain id, e.g. "01"
@@ -21,12 +56,15 @@ export interface ApiScenario {
   expected_alarms: string[];
   estimated_duration_sec: number;
   script_filename: string;
+  execution: ExecutionPlan;
   warnings: string[];
   // RCA ground-truth (optional; populated from service-spec.yaml)
   // 1~5 — 5 = 결정적, 1 = 추정만 가능
   difficulty: number | null;
   // 관측 가능한 시그널 기반 채점 기준. UI 의 "RCA 채점 기준" 섹션에 표시.
   expected_rca_root_cause: string | null;
+  expected_clusters: Record<string, unknown> | null;
+  expected_incidents: Record<string, unknown> | null;
 }
 
 export interface Domain {

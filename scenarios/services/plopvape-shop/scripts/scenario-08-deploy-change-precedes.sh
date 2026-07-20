@@ -8,7 +8,7 @@
 
 set -uo pipefail
 
-export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 TARGET_DEPLOY="${TARGET_DEPLOY:-testbed-payment}"
 # k3d 는 호스트로 NodePort 를 publish 하지 않으므로, API 호출은 클러스터 내부에서

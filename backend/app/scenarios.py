@@ -15,7 +15,9 @@ from pathlib import Path
 
 import yaml
 
-from app.models import Domain, Scenario
+from app.execution_policy import validate_execution_plan
+from app.controller import parse_controller
+from app.models import Domain, ExecutionPlan, Scenario
 
 # scenarios.py lives at <repo>/backend/app/scenarios.py — go up 3 to reach repo root.
 _DEFAULT_SCENARIOS_ROOT = (
@@ -117,6 +119,19 @@ def _spec_entry_to_scenario(domain: str, domain_label: str, entry: dict) -> Scen
     anomalies = entry.get("expected_anomalies")
     if not isinstance(anomalies, list):
         anomalies = None
+    execution_raw = entry.get("execution")
+    if execution_raw is None:
+        execution_raw = {
+            "transport": "local",
+            "location": "scenario-runner",
+            "timeout_sec": 600,
+        }
+    if not isinstance(execution_raw, dict):
+        raise ValueError(f"scenario {domain}:{short_id} execution must be a mapping")
+    if "orchestrator" not in execution_raw:
+        execution_raw = {"orchestrator": execution_raw, "injection_points": []}
+    execution = ExecutionPlan.model_validate(execution_raw)
+    validate_execution_plan(execution.injection_points)
     return Scenario(
         id=_composite_id(domain, short_id),
         short_id=short_id,
@@ -129,6 +144,7 @@ def _spec_entry_to_scenario(domain: str, domain_label: str, entry: dict) -> Scen
         expected_alarms=_derive_expected_alarms(entry, anomalies),
         estimated_duration_sec=entry["estimated_duration_sec"],
         script_filename=entry.get("file") or entry.get("injection", {}).get("script"),
+        execution=execution,
         warnings=entry.get("side_effects", []),
         difficulty=difficulty,
         expected_rca_root_cause=expected,
@@ -139,6 +155,17 @@ def _spec_entry_to_scenario(domain: str, domain_label: str, entry: dict) -> Scen
         injection=entry.get("injection") if isinstance(entry.get("injection"), dict) else None,
         expected_anomalies=anomalies,
         signals=entry.get("signals") if isinstance(entry.get("signals"), dict) else None,
+        expected_clusters=(
+            entry.get("expected_clusters")
+            if isinstance(entry.get("expected_clusters"), dict)
+            else None
+        ),
+        expected_incidents=(
+            entry.get("expected_incidents")
+            if isinstance(entry.get("expected_incidents"), dict)
+            else None
+        ),
+        controller=parse_controller(entry.get("controller")),
     )
 
 

@@ -8,7 +8,7 @@
 
 set -uo pipefail
 
-export KUBECONFIG=/home/nkia/.kube/food-delivery.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="rca-testbed-food"
 ORDER_POD_LABEL="app=testbed-order"
 RESULT_LOG="/tmp/g9-food-trace-latency-fanout.log"

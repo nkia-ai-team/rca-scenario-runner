@@ -16,7 +16,7 @@
 #   ./scenario-19-data-state-4xx-flood.sh cleanup   # 원상복구(재고 복원)
 # =============================================================================
 set -uo pipefail
-export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 PG_POD="${PG_POD:-testbed-postgres-0}"
 # k3d: 호스트 NodePort/노드 IP(172.x) 미노출·취약 → 클러스터 내부 nginx 를 앱 파드 exec 로 호출.
