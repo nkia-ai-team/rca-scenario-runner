@@ -5,11 +5,12 @@ import asyncio
 import hashlib
 import json
 import os
+import shlex
 import stat
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
@@ -28,6 +29,9 @@ from app.preflight import (
     evaluate_preflight,
 )
 from app.runner import ScenarioRunner, get_runner
+
+
+ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 LIVE_SCENARIO_ORDER = (
@@ -185,6 +189,10 @@ class LiveScenarioQueue:
         preflight_probe: "PreflightProbe | None" = None,
         preflight_ai_judge: AiJudge | None = None,
         functional_readiness_enabled: bool = False,
+        golden_reset_enabled: bool = False,
+        golden_store_root: Path | None = None,
+        restore_script: Path | None = None,
+        restore_runner: "ProcessRunner | None" = None,
     ) -> None:
         self.runner = runner
         self.state_path = state_path
@@ -196,6 +204,14 @@ class LiveScenarioQueue:
         # Opt-in (production only): live end-to-end dependency proof at queue
         # start — unit tests keep the cheap path.
         self.functional_readiness_enabled = functional_readiness_enabled
+        self.golden_reset_enabled = golden_reset_enabled
+        self.golden_store_root = golden_store_root or Path(
+            os.environ.get("GOLDEN_STORE_ROOT", "/data/eval-cases/goldens")
+        )
+        self.restore_script = restore_script or Path(
+            os.environ.get("RESTORE_SCRIPT", "/opt/lucida/restore-golden-state.sh")
+        )
+        self._restore_runner = restore_runner or subprocess.run
         self.required_paths = required_paths or {
             "kubeconfig": Path("/root/tb-kubeconfig"),
             "ssh_key": Path("/root/.ssh/tb_key"),
@@ -445,6 +461,10 @@ class LiveScenarioQueue:
             if short_circuit is not None:
                 return short_circuit
             try:
+                self._restore_golden(scenario_id)
+            except Exception as error:
+                return self._pause(state, f"golden restore failed for {scenario_id}: {error}")
+            try:
                 run = await self.runner.start(scenario_id=scenario_id, mode="run")
             except Exception as error:
                 return self._pause(state, f"start failed for {scenario_id}: {error}")
@@ -533,6 +553,7 @@ class LiveScenarioQueue:
             return state
         if not (self.runner.artifact_store.root / state.current_run_id / "capture-complete.json").is_file():
             return self._pause(state, f"capture completion evidence missing: {state.current_run_id}")
+        self._thaw_trainer()
         completed = [*state.completed_run_ids, state.current_run_id]
         next_index = state.next_index + 1
         first_gate = state.first_gate_passed or state.next_index == 0
@@ -705,6 +726,37 @@ class LiveScenarioQueue:
             return True
         except Exception:
             return False
+
+    def _run_restore(self, args: list[str], *, timeout: int = 900) -> None:
+        target = os.environ.get("MODEL_SNAPSHOT_SSH_TARGET")
+        if not target:
+            raise RuntimeError("MODEL_SNAPSHOT_SSH_TARGET is required for golden reset")
+        ssh_key = self.required_paths["ssh_key"]
+        creds = []
+        for name in ("PG_PASSWORD", "PG_USER", "CH_PASSWORD", "LUCIDA_LOGIN_USER", "LUCIDA_LOGIN_PASSWORD"):
+            value = os.environ.get(name)
+            if value:
+                creds.append(f"{name}={shlex.quote(value)}")
+        remote = " ".join([*creds, "bash", shlex.quote(str(self.restore_script)), *(shlex.quote(a) for a in args)])
+        self._restore_runner(
+            ["ssh", "-i", str(ssh_key), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+             "-o", "ConnectTimeout=10", target, remote],
+            check=True, capture_output=True, text=True, timeout=timeout,
+        )
+
+    def _restore_golden(self, scenario_id: str) -> None:
+        """Freeze trainer + reset AI DB state + restart observer to a clean golden
+        before injecting scenario_id. No-op unless golden reset is enabled."""
+        if not self.golden_reset_enabled:
+            return
+        self._run_restore(["--golden-root", str(self.golden_store_root), "--for-time", "now"])
+
+    def _thaw_trainer(self) -> None:
+        """Un-freeze the trainer. Fail-open: never block the queue on thaw."""
+        if not self.golden_reset_enabled:
+            return
+        with suppress(Exception):
+            self._run_restore(["--thaw"], timeout=60)
 
     def _write_preflight(self, run_id: str, verdict: PreflightVerdict) -> None:
         """Drop the verdict where ProductionCaptureInvoker forwards it to capture."""
@@ -913,6 +965,7 @@ class LiveScenarioQueue:
         self._task = None
 
     def _pause(self, state: LiveQueueState, reason: str) -> LiveQueueState:
+        self._thaw_trainer()
         state = state.model_copy(
             update={"phase": "paused", "reason": reason, "updated_at": self._format(self.clock.now())}
         )
@@ -920,6 +973,7 @@ class LiveScenarioQueue:
         return state
 
     def _complete(self, state: LiveQueueState) -> LiveQueueState:
+        self._thaw_trainer()
         state = state.model_copy(
             update={
                 "phase": "completed",
@@ -985,5 +1039,7 @@ def get_live_queue() -> LiveScenarioQueue:
             manifest_root=manifest_root,
             preflight_probe=preflight_probe,
             functional_readiness_enabled=True,
+            golden_reset_enabled=os.environ.get("GOLDEN_RESET_ENABLED", "").lower()
+            in {"1", "true", "yes", "on"},
         )
     return _queue

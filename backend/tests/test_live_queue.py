@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -636,3 +637,114 @@ def test_lingering_incident_sweep_only_fires_when_incidents_are_the_sole_blocker
     all_pass = SimpleNamespace(checks=[check("open_incidents", "pass")])
     assert LiveScenarioQueue._sweep_lingering_incidents(stub, all_pass) is False
     assert closed == [True]
+
+
+class FakeRestoreRunner:
+    """Capture golden-restore invocations and record injection ordering."""
+
+    def __init__(self, runner: Runner, *, fail: bool = False) -> None:
+        self._runner = runner
+        self.fail = fail
+        self.calls: list[list[str]] = []
+        self.started_len_at_call: list[int] = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        self.started_len_at_call.append(len(self._runner.started))
+        if self.fail:
+            raise subprocess.CalledProcessError(1, cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    @property
+    def remotes(self) -> list[str]:
+        return [cmd[-1] for cmd in self.calls]
+
+
+def _enable_golden(queue: LiveScenarioQueue, runner: Runner, *, fail: bool = False):
+    restore = FakeRestoreRunner(runner, fail=fail)
+    ssh_key = queue.state_path.parent / "ssh_key"
+    ssh_key.write_text("key", encoding="utf-8")
+    queue.golden_reset_enabled = True
+    queue._restore_runner = restore  # type: ignore[assignment]
+    queue.required_paths["ssh_key"] = ssh_key
+    return restore
+
+
+async def _drive_to_capture_complete(queue, runner, scheduler, clock):
+    await queue.start()
+    state = await queue.tick()
+    run_id = state.current_run_id
+    runner.current = runner.current.model_copy(
+        update={"status": "succeeded", "finished_at": clock.now(), "exit_code": 0}
+    )
+    scheduler.jobs[run_id] = SimpleNamespace(
+        status="pending", t2="2026-07-16T08:10:00Z", failure=None
+    )
+    state = await queue.tick()
+    assert state.phase == "waiting_capture"
+    scheduler.jobs[run_id].status = "completed"
+    capture = runner.artifact_store.root / run_id / "capture-complete.json"
+    capture.parent.mkdir(parents=True, exist_ok=True)
+    capture.write_text("{}\n", encoding="utf-8")
+    runner.current = None
+    return await queue.tick()
+
+
+@pytest.mark.asyncio
+async def test_golden_restore_runs_before_injection_when_enabled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("MODEL_SNAPSHOT_SSH_TARGET", "ydkim@192.168.230.119")
+    queue, runner, _, _, _ = make_queue(tmp_path)
+    restore = _enable_golden(queue, runner)
+    await queue.start()
+    await queue.tick()
+
+    assert runner.started == [("F01-R", "run")]
+    assert restore.calls, "golden restore was not invoked"
+    remote = restore.remotes[0]
+    assert "--golden-root" in remote
+    assert "--for-time" in remote
+    assert "now" in remote
+    # restore ran before runner.start appended the injection
+    assert restore.started_len_at_call[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_golden_restore_noop_when_disabled(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_SNAPSHOT_SSH_TARGET", "ydkim@192.168.230.119")
+    queue, runner, _, _, _ = make_queue(tmp_path)
+    restore = FakeRestoreRunner(runner)
+    queue._restore_runner = restore  # type: ignore[assignment]
+    # golden_reset_enabled stays default False
+    await queue.start()
+    await queue.tick()
+
+    assert runner.started == [("F01-R", "run")]
+    assert restore.calls == []
+
+
+@pytest.mark.asyncio
+async def test_thaw_runs_at_capture_complete_when_enabled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("MODEL_SNAPSHOT_SSH_TARGET", "ydkim@192.168.230.119")
+    queue, runner, _, scheduler, clock = make_queue(tmp_path)
+    restore = _enable_golden(queue, runner)
+    state = await _drive_to_capture_complete(queue, runner, scheduler, clock)
+
+    assert state.phase == "waiting_clean_window"
+    assert any("--thaw" in remote for remote in restore.remotes)
+
+
+@pytest.mark.asyncio
+async def test_restore_failure_pauses_queue(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_SNAPSHOT_SSH_TARGET", "ydkim@192.168.230.119")
+    queue, runner, _, _, _ = make_queue(tmp_path)
+    _enable_golden(queue, runner, fail=True)
+    await queue.start()
+    state = await queue.tick()
+
+    assert state.phase == "paused"
+    assert "golden restore failed" in state.reason
+    assert runner.started == []
