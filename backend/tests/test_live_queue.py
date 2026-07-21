@@ -561,3 +561,53 @@ def test_normal_segment_marker_is_fail_open_and_points_at_todays_kst_segment(tmp
     LiveQueue._write_normal_segment_marker(stub, "run-1")
     marker = runs / "run-1" / "normal-segment.path"
     assert marker.read_text(encoding="utf-8").strip() == str(segment)
+
+
+def test_protection_window_defers_injection_starts_around_kst_midnight():
+    from datetime import datetime, timezone
+
+    from app.live_queue import LiveScenarioQueue
+
+    def at_kst(hour, minute):
+        # KST = UTC+9
+        return datetime(2026, 7, 20, (hour - 9) % 24, minute, tzinfo=timezone.utc)
+
+    assert LiveScenarioQueue._protection_window_reason(at_kst(12, 0)) is None
+    assert LiveScenarioQueue._protection_window_reason(at_kst(23, 19)) is None
+    for hour, minute in ((23, 20), (0, 0), (1, 30), (2, 29)):
+        assert LiveScenarioQueue._protection_window_reason(at_kst(hour, minute)) is not None
+    assert LiveScenarioQueue._protection_window_reason(at_kst(2, 30)) is None
+
+
+def test_functional_readiness_is_opt_in_and_gates_on_capture_self_check(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from app.live_queue import LiveScenarioQueue
+
+    script = tmp_path / "capture.sh"
+    script.write_text("#!/usr/bin/env bash\nexit 1\n")
+    script.chmod(0o755)
+    stub = SimpleNamespace(
+        functional_readiness_enabled=False,
+        clock=SimpleNamespace(now=lambda: datetime.now(timezone.utc)),
+        required_paths={"capture_script": script},
+        preflight_probe=None,
+        _functional_cache=None,
+    )
+    assert LiveScenarioQueue._functional_readiness(stub) == {}
+
+    stub.functional_readiness_enabled = True
+    monkeypatch.setenv("LUCIDA_LOGIN_USER", "")
+    checks = LiveScenarioQueue._functional_readiness(stub)
+    assert checks["capture_self_check"] is False
+    assert checks["lucida_incident_api"] is False
+
+    script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    stub._functional_cache = None
+    monkeypatch.setattr(
+        "app.incident_close.open_incident_count", lambda **kwargs: 0
+    )
+    checks = LiveScenarioQueue._functional_readiness(stub)
+    assert checks["capture_self_check"] is True
+    assert checks["lucida_incident_api"] is True

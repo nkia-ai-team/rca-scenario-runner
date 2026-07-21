@@ -6,11 +6,12 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import tempfile
 import uuid
 from collections.abc import Mapping
 from contextlib import suppress
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Literal, Protocol
@@ -40,6 +41,18 @@ LIVE_SCENARIO_ORDER = (
     "F11-G",
 )
 QUEUE_POLL_INTERVAL_SEC = 5
+# Daily normal-segment protection (spec §2.1): the 00:00-02:00 KST window is
+# the shared clean prefix for every case captured that day, and the host cron
+# dumps it at 02:20 KST. Injections must neither run inside the window nor
+# start late enough that injection+recovery bleeds across midnight, so starts
+# are deferred from 23:20 KST (max injection 30m + recovery margin) until the
+# dump has landed at 02:30 KST.
+PROTECTION_WINDOW_START_KST = dt_time(23, 20)
+PROTECTION_WINDOW_END_KST = dt_time(2, 30)
+# Functional readiness (capture self-check, lucida login, preflight signals)
+# proves live connectivity, so a green result is trusted for a short TTL; any
+# failure is re-probed on the next call for fast recovery.
+FUNCTIONAL_READINESS_TTL_SEC = 300
 # R6 preflight gate (spec-scenario-load R6, 2026-07-20): before injecting, the
 # leading [t1-10m, t1] window must be clean. A dirty verdict re-checks every 5m;
 # after PREFLIGHT_MAX_ATTEMPTS the scenario is skipped and the queue continues.
@@ -171,6 +184,7 @@ class LiveScenarioQueue:
         manifest_root: Path | None = None,
         preflight_probe: "PreflightProbe | None" = None,
         preflight_ai_judge: AiJudge | None = None,
+        functional_readiness_enabled: bool = False,
     ) -> None:
         self.runner = runner
         self.state_path = state_path
@@ -179,6 +193,9 @@ class LiveScenarioQueue:
         # When no probe is wired the R6 preflight gate is inert (older callers).
         self.preflight_probe = preflight_probe
         self.preflight_ai_judge = preflight_ai_judge
+        # Opt-in (production only): live end-to-end dependency proof at queue
+        # start — unit tests keep the cheap path.
+        self.functional_readiness_enabled = functional_readiness_enabled
         self.required_paths = required_paths or {
             "kubeconfig": Path("/root/tb-kubeconfig"),
             "ssh_key": Path("/root/.ssh/tb_key"),
@@ -193,6 +210,7 @@ class LiveScenarioQueue:
         self.manifest_root = manifest_root
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
+        self._functional_cache: tuple[datetime, dict[str, bool]] | None = None
 
     def snapshot(self) -> LiveQueueState:
         if not self.state_path.is_file():
@@ -218,8 +236,52 @@ class LiveScenarioQueue:
             coordinator.active_lease is None and coordinator.dirty_run is None
         )
         checks["runner_idle"] = not self.runner.is_busy
+        checks.update(self._functional_readiness())
         missing = sorted(name for name, passed in checks.items() if not passed)
         return OperationalReadiness(ready=not missing, checks=checks, missing=missing)
+
+    def _functional_readiness(self) -> dict[str, bool]:
+        """Prove — not assume — the full pipeline before any scenario is spent.
+
+        Root fix for the capture-time surprise lineage (inert preflight.json,
+        missing QUERY_API_PASSWORD, 2026-07-21): every dependency any later
+        stage needs is exercised live at queue start. Green results are cached
+        for FUNCTIONAL_READINESS_TTL_SEC; any failure re-probes on next call.
+        """
+        if not self.functional_readiness_enabled:
+            return {}
+        now = self.clock.now()
+        if self._functional_cache is not None:
+            checked_at, cached = self._functional_cache
+            fresh = (now - checked_at).total_seconds() < FUNCTIONAL_READINESS_TTL_SEC
+            if fresh and all(cached.values()):
+                return dict(cached)
+        checks: dict[str, bool] = {}
+        script = self.required_paths["capture_script"]
+        try:
+            result = subprocess.run(
+                [str(script), "--self-check"],
+                capture_output=True, text=True, timeout=120,
+            )
+            checks["capture_self_check"] = result.returncode == 0
+        except Exception:
+            checks["capture_self_check"] = False
+        try:
+            from app.incident_close import open_incident_count
+
+            open_incident_count()
+            checks["lucida_incident_api"] = True
+        except Exception:
+            checks["lucida_incident_api"] = False
+        if self.preflight_probe is not None:
+            try:
+                observations = self.preflight_probe.collect(now=now)
+                build_preflight_checks(observations)
+                checks["preflight_signals"] = True
+            except Exception:
+                checks["preflight_signals"] = False
+        self._functional_cache = (now, dict(checks))
+        return checks
 
     async def start(self) -> LiveQueueState:
         async with self._lock:
@@ -367,6 +429,17 @@ class LiveScenarioQueue:
             if self.runner.is_busy or self.runner.coordinator.snapshot().active_lease is not None:
                 return state
             scenario_id = state.scenario_ids[state.next_index]
+            # Daily normal-segment protection: never let an injection start
+            # inside — or bleed into — the 00:00-02:00 KST clean window.
+            deferral = self._protection_window_reason(self.clock.now())
+            if deferral is not None:
+                if state.reason == deferral:
+                    return state
+                deferred = state.model_copy(
+                    update={"reason": deferral, "updated_at": self._format(self.clock.now())}
+                )
+                self._write(deferred)
+                return deferred
             # R6 preflight gate: prove [t1-10m, t1] is clean before injecting.
             short_circuit, verdict = self._preflight_gate(state, scenario_id)
             if short_circuit is not None:
@@ -624,6 +697,22 @@ class LiveScenarioQueue:
             with suppress(FileNotFoundError):
                 os.unlink(raw)
 
+    @staticmethod
+    def _protection_window_reason(now: datetime) -> str | None:
+        """Defer injection starts around the daily 00:00-02:00 KST clean window.
+
+        Starts are blocked from 23:20 KST (worst-case injection 30m + recovery
+        would cross midnight and poison the day's shared normal prefix) until
+        02:30 KST (the 02:20 host cron has landed the dump by then).
+        """
+        kst = now.astimezone(ZoneInfo("Asia/Seoul")).time()
+        if kst >= PROTECTION_WINDOW_START_KST or kst < PROTECTION_WINDOW_END_KST:
+            return (
+                "daily normal-segment protection window (23:20-02:30 KST): "
+                "injection start deferred"
+            )
+        return None
+
     def _write_normal_segment_marker(self, run_id: str) -> None:
         """Point capture at today's shared daily normal segment (contract v2).
 
@@ -870,5 +959,6 @@ def get_live_queue() -> LiveScenarioQueue:
             scenario_registry_path=registry_path,
             manifest_root=manifest_root,
             preflight_probe=preflight_probe,
+            functional_readiness_enabled=True,
         )
     return _queue
