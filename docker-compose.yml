@@ -84,6 +84,10 @@ services:
       - PG_PASSWORD=${PG_PASSWORD:-}
       - CH_PASSWORD=${CH_PASSWORD:-}
       - MODEL_SNAPSHOT_SSH_TARGET=${MODEL_SNAPSHOT_SSH_TARGET:-}
+      # 신계약 캡처의 토폴로지 스냅샷용 query API 로그인
+      - QUERY_API_URL=${QUERY_API_URL:-http://192.168.230.119:18080}
+      - QUERY_API_USER=${QUERY_API_USER:-manager}
+      - QUERY_API_PASSWORD=${QUERY_API_PASSWORD:-}
       # 캡처 종료 시 열린 인시던트 자동 종결(clean-slate 정책, 2026-07-21)
       - LUCIDA_QUERY_URL=${LUCIDA_QUERY_URL:-http://192.168.230.119:18080}
       - LUCIDA_OBSERVER_URL=${LUCIDA_OBSERVER_URL:-http://192.168.230.119:18087}
