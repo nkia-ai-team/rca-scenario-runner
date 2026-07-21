@@ -124,6 +124,9 @@ class ObservedValue(StrictModel):
     source: str = Field(min_length=1)
     freshness: Literal["fresh", "stale"]
     quality: Literal["good", "error"]
+    # Failure detail (exit code + stderr tail) for quality="error" signals;
+    # absent on healthy observations.
+    error: str | None = None
 
     @property
     def usable(self) -> bool:

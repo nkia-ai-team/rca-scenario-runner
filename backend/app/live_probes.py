@@ -328,11 +328,21 @@ class LiveProbeSet:
                 "quality": "good",
             }
         except Exception as error:
+            # Persist the failure detail (exit code + stderr tail for subprocess
+            # errors) — without it, probe-burst aborts are undiagnosable from
+            # tick records (observed 2026-07-21/22 across F12-H·F06-G·F05-H).
+            detail = str(error)
+            if isinstance(error, subprocess.CalledProcessError):
+                stderr = (error.stderr or "").strip() if isinstance(error.stderr, str) else ""
+                detail = f"exit {error.returncode}: {stderr[-200:] or 'no stderr'}"
+            elif isinstance(error, subprocess.TimeoutExpired):
+                detail = f"timeout after {error.timeout}s"
             return {
                 "value": None,
                 "observed_at": _format_utc(now),
                 "source": f"live-probes:{query.query_id}:{type(error).__name__}",
                 "quality": "error",
+                "error": detail[:300],
             }
 
     def _kubectl(self, *args: str) -> subprocess.CompletedProcess[str]:
