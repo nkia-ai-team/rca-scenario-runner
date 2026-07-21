@@ -99,7 +99,10 @@ def close_open_incidents(
         if not incident_id:
             continue
         close = urllib.request.Request(
-            f"{observer_url}/api/v1/incidents/{incident_id}/close", data=b"", method="POST"
+            f"{observer_url}/api/v1/incidents/{incident_id}/close",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
         with opener.open(close, timeout=_TIMEOUT_SEC) as response:
             if response.status >= 300:
