@@ -761,7 +761,7 @@ class LiveProbeSet:
             failed = any(
                 status.get("name") == container
                 and status.get("state", {}).get("waiting", {}).get("reason")
-                in {"ErrImagePull", "ImagePullBackOff"}
+                in {"ErrImagePull", "ImagePullBackOff", "ErrImageNeverPull"}
                 for item in items
                 for status in item.get("status", {}).get("containerStatuses", [])
             )

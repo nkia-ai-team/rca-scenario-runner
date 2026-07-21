@@ -763,6 +763,41 @@ def test_image_pull_probe_requires_exact_payment_target_and_waiting_reason(tmp_p
     assert observed["value"] is True
 
 
+def test_image_pull_probe_detects_err_image_never_pull(tmp_path) -> None:
+    # ctr-imported local images run with pull policy Never, so a missing tag
+    # surfaces as ErrImageNeverPull instead of ImagePullBackOff (F05-G).
+    fakes = Fakes()
+    inner = fakes.process
+
+    def process(argv, **kwargs):
+        result = inner(argv, **kwargs)
+        if "pods" in list(argv):
+            result = subprocess.CompletedProcess(
+                result.args, 0,
+                result.stdout.replace("ImagePullBackOff", "ErrImageNeverPull"),
+                "",
+            )
+        return result
+
+    fakes.process = process
+    probes = _probes(tmp_path, fakes)
+    query = ApprovedQueryRegistry.from_path().bind(
+        {
+            "query_id": "kubernetes.image_pull_failure",
+            "parameters": {
+                "namespace": "rca-testbed-commerce",
+                "resource": "testbed-payment",
+                "container": "payment-service",
+            },
+        }
+    )
+
+    observed = probes.observe(query)
+
+    assert observed["quality"] == "good"
+    assert observed["value"] is True
+
+
 def test_readable_no_effect_attempt_does_not_poison_clean_window(tmp_path) -> None:
     fakes = Fakes()
     probes = _probes(tmp_path, fakes)
