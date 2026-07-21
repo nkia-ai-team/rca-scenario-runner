@@ -851,6 +851,36 @@ class ProductionCaptureInvoker:
                 "observed_at": datetime.now(timezone.utc).isoformat(),
             },
         )
+        self._close_open_incidents(job)
+
+    def _close_open_incidents(self, job: CaptureJob) -> None:
+        """Clean-slate policy (2026-07-21): close open incidents at capture end.
+
+        Runs after the capture window is fully exported so the incident's
+        in-window lifecycle is untouched; before the next scenario so the
+        judge cannot merge its anomalies into a stale incident. Fail-open —
+        never fails the capture; the outcome (or error) lands next to the run.
+        """
+        from app.incident_close import close_open_incidents
+
+        record = self.runs_root / job.run_id / "incidents-closed.json"
+        try:
+            closed = close_open_incidents()
+            atomic_json(
+                record,
+                {
+                    "closed": closed,
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as error:
+            atomic_json(
+                record,
+                {
+                    "error": f"{type(error).__name__}: {error}",
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
 
 
 def _trusted_environment() -> dict[str, str]:

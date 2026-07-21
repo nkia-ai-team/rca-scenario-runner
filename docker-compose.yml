@@ -84,6 +84,11 @@ services:
       - PG_PASSWORD=${PG_PASSWORD:-}
       - CH_PASSWORD=${CH_PASSWORD:-}
       - MODEL_SNAPSHOT_SSH_TARGET=${MODEL_SNAPSHOT_SSH_TARGET:-}
+      # 캡처 종료 시 열린 인시던트 자동 종결(clean-slate 정책, 2026-07-21)
+      - LUCIDA_QUERY_URL=${LUCIDA_QUERY_URL:-http://192.168.230.119:18080}
+      - LUCIDA_OBSERVER_URL=${LUCIDA_OBSERVER_URL:-http://192.168.230.119:18087}
+      - LUCIDA_LOGIN_USER=${LUCIDA_LOGIN_USER:-}
+      - LUCIDA_LOGIN_PASSWORD=${LUCIDA_LOGIN_PASSWORD:-}
       - DEFAULT_DOMAIN=${DEFAULT_DOMAIN:-plopvape-shop}
       - LOG_DIR=/app/logs
       - STATIC_DIR=/app/static
