@@ -58,3 +58,21 @@ def test_missing_credentials_raise(monkeypatch):
     monkeypatch.delenv("LUCIDA_LOGIN_PASSWORD", raising=False)
     with pytest.raises(RuntimeError, match="not configured"):
         close_open_incidents(query_url="http://q", observer_url="http://o")
+
+
+def test_open_incident_count_counts_only_non_closed():
+    opener = FakeOpener(
+        [
+            {"incident_id": "a1", "status": "active"},
+            {"incident_id": "b2", "status": "closed"},
+            {"incident_id": "c3", "status": "waiting"},
+        ]
+    )
+    from app.incident_close import open_incident_count
+
+    count = open_incident_count(
+        query_url="http://q", observer_url="http://o",
+        username="u", password="p", opener_factory=lambda: opener,
+    )
+    assert count == 2
+    assert all("/close" not in url for _method, url in opener.requests)

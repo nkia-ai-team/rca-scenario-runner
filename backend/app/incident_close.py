@@ -23,15 +23,24 @@ _TIMEOUT_SEC = 10
 _CLOSED_STATES = {"closed", "resolved"}
 
 
-def close_open_incidents(
+def open_incident_count(
     *,
     query_url: str | None = None,
     observer_url: str | None = None,
     username: str | None = None,
     password: str | None = None,
     opener_factory=None,
-) -> list[dict[str, str]]:
-    """Close every non-closed incident; return [{id, status, title}] handled."""
+) -> int:
+    """Count non-closed incidents (R6 preflight `open_incidents` signal)."""
+    opener, observer_url = _session(
+        query_url=query_url, observer_url=observer_url,
+        username=username, password=password, opener_factory=opener_factory,
+    )
+    return sum(1 for item in _incidents(opener, observer_url)
+               if str(item.get("status", "")) not in _CLOSED_STATES)
+
+
+def _session(*, query_url, observer_url, username, password, opener_factory):
     query_url = (query_url or os.environ.get("LUCIDA_QUERY_URL") or DEFAULT_QUERY_URL).rstrip("/")
     observer_url = (
         observer_url or os.environ.get("LUCIDA_OBSERVER_URL") or DEFAULT_OBSERVER_URL
@@ -40,12 +49,10 @@ def close_open_incidents(
     password = password or os.environ.get("LUCIDA_LOGIN_PASSWORD")
     if not username or not password:
         raise RuntimeError("LUCIDA_LOGIN_USER/LUCIDA_LOGIN_PASSWORD are not configured")
-
     if opener_factory is None:
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
     else:
         opener = opener_factory()
-
     login = urllib.request.Request(
         f"{query_url}/api/v1/login",
         data=json.dumps({"username": username, "password": password}).encode(),
@@ -55,14 +62,33 @@ def close_open_incidents(
     with opener.open(login, timeout=_TIMEOUT_SEC) as response:
         if response.status != 200:
             raise RuntimeError(f"lucida login failed: HTTP {response.status}")
+    return opener, observer_url
 
+
+def _incidents(opener, observer_url: str) -> list:
     with opener.open(
         urllib.request.Request(f"{observer_url}/api/v1/incidents"), timeout=_TIMEOUT_SEC
     ) as response:
         document = json.loads(response.read())
-    items = document if isinstance(document, list) else (
+    return document if isinstance(document, list) else (
         document.get("incidents") or document.get("items") or []
     )
+
+
+def close_open_incidents(
+    *,
+    query_url: str | None = None,
+    observer_url: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    opener_factory=None,
+) -> list[dict[str, str]]:
+    """Close every non-closed incident; return [{id, status, title}] handled."""
+    opener, observer_url = _session(
+        query_url=query_url, observer_url=observer_url,
+        username=username, password=password, opener_factory=opener_factory,
+    )
+    items = _incidents(opener, observer_url)
 
     closed: list[dict[str, str]] = []
     for item in items:

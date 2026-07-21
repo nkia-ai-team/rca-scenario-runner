@@ -859,10 +859,16 @@ def get_live_queue() -> LiveScenarioQueue:
         manifest_root = Path(
             os.environ.get("SCENARIO_MANIFEST_ROOT", "/app/scenario-manifests")
         )
+        preflight_probe = None
+        if os.environ.get("PREFLIGHT_PROBE", "on").lower() not in {"off", "0", "disabled"}:
+            from app.preflight_probe import ProductionPreflightProbe
+
+            preflight_probe = ProductionPreflightProbe()
         _queue = LiveScenarioQueue(
             runner,
             state_path,
             scenario_registry_path=registry_path,
             manifest_root=manifest_root,
+            preflight_probe=preflight_probe,
         )
     return _queue
