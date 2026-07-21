@@ -636,6 +636,19 @@ class LiveScenarioQueue:
             return self._pause(state, f"preflight probe failed for {scenario_id}: {error}"), None
         if verdict.is_clean:
             return None, verdict
+        # Clean-slate sweep (2026-07-21 policy): when lingering incident
+        # objects are the ONLY hard failure, closing them IS the R6 remedy —
+        # capture-end auto-close cannot reach incidents left by failed runs or
+        # opened organically between scenarios, and without this sweep they
+        # starve the gate into a 30-scenario skip cascade. Any other failing
+        # signal (5xx, p95, dead loadgen, firing alarms) still blocks.
+        if self._sweep_lingering_incidents(verdict):
+            try:
+                verdict = self._evaluate_preflight(now, waited_sec)
+            except Exception as error:
+                return self._pause(state, f"preflight probe failed for {scenario_id}: {error}"), None
+            if verdict.is_clean:
+                return None, verdict
 
         attempts = state.preflight_attempts + 1
         if attempts >= PREFLIGHT_MAX_ATTEMPTS:
@@ -680,6 +693,18 @@ class LiveScenarioQueue:
             waited_sec=waited_sec,
             ai_judge=self.preflight_ai_judge,
         )
+
+    def _sweep_lingering_incidents(self, verdict: PreflightVerdict) -> bool:
+        failed = [check for check in verdict.checks if check.status == "fail"]
+        if not failed or any(check.name != "open_incidents" for check in failed):
+            return False
+        try:
+            from app.incident_close import close_open_incidents
+
+            close_open_incidents()
+            return True
+        except Exception:
+            return False
 
     def _write_preflight(self, run_id: str, verdict: PreflightVerdict) -> None:
         """Drop the verdict where ProductionCaptureInvoker forwards it to capture."""

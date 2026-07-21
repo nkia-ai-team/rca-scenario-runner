@@ -611,3 +611,28 @@ def test_functional_readiness_is_opt_in_and_gates_on_capture_self_check(tmp_path
     checks = LiveScenarioQueue._functional_readiness(stub)
     assert checks["capture_self_check"] is True
     assert checks["lucida_incident_api"] is True
+
+
+def test_lingering_incident_sweep_only_fires_when_incidents_are_the_sole_blocker(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.live_queue import LiveScenarioQueue
+
+    def check(name, status):
+        return SimpleNamespace(name=name, status=status)
+
+    closed = []
+    monkeypatch.setattr(
+        "app.incident_close.close_open_incidents", lambda **kwargs: closed.append(True) or []
+    )
+    stub = SimpleNamespace()
+
+    only_incidents = SimpleNamespace(checks=[check("open_incidents", "fail"), check("user_5xx_rate", "pass")])
+    assert LiveScenarioQueue._sweep_lingering_incidents(stub, only_incidents) is True
+    assert closed == [True]
+
+    mixed = SimpleNamespace(checks=[check("open_incidents", "fail"), check("user_5xx_rate", "fail")])
+    assert LiveScenarioQueue._sweep_lingering_incidents(stub, mixed) is False
+    all_pass = SimpleNamespace(checks=[check("open_incidents", "pass")])
+    assert LiveScenarioQueue._sweep_lingering_incidents(stub, all_pass) is False
+    assert closed == [True]
