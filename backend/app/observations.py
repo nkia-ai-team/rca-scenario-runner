@@ -273,12 +273,14 @@ def _normalize(raw: Mapping[str, Any], *, query: ApprovedQuery, now: datetime) -
             if -CLOCK_SKEW_TOLERANCE_SEC <= age_sec <= query.freshness_sec
             else "stale"
         )
+        error_detail = raw.get("error")
         return ObservedValue(
             value=value if quality == "good" else None,
             observed_at=observed_at,
             source=source,
             freshness=freshness,
             quality=quality,
+            error=error_detail if quality == "error" and isinstance(error_detail, str) else None,
         )
     except (KeyError, TypeError, ValueError):
         return _error_value(query, now)
