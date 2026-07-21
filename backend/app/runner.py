@@ -451,12 +451,21 @@ class ScenarioRunner:
                     requested_at=self.clock.now(),
                 ),
             )
+            # A successful cleanup must bound the run's effect window: without
+            # effect_ended_at the clean-window probe treats the dirty run as
+            # overlapping forever and the queue can never restart the scenario.
+            effect_ended_at = getattr(result, "effect_ended_at", None)
+            if result.succeeded and effect_ended_at is None:
+                effect_ended_at = self.clock.now()
             atomic_json(
                 self.artifact_store.root / dirty_run_id / "cleanup.json",
                 {
                     "schema_version": 1,
                     "source": "manual-dirty-cleanup",
                     "succeeded": result.succeeded,
+                    "effect_ended_at": (
+                        effect_ended_at.isoformat() if effect_ended_at else None
+                    ),
                     "reason": result.reason,
                 },
             )
