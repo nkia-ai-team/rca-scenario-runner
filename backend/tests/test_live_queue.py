@@ -665,6 +665,7 @@ def _enable_golden(queue: LiveScenarioQueue, runner: Runner, *, fail: bool = Fal
     ssh_key = queue.state_path.parent / "ssh_key"
     ssh_key.write_text("key", encoding="utf-8")
     queue.golden_reset_enabled = True
+    queue.restore_retry_delay_sec = 0
     queue._restore_runner = restore  # type: ignore[assignment]
     queue.required_paths["ssh_key"] = ssh_key
     return restore

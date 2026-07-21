@@ -9,6 +9,7 @@ import shlex
 import stat
 import subprocess
 import tempfile
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -212,6 +213,9 @@ class LiveScenarioQueue:
             os.environ.get("RESTORE_SCRIPT", "/opt/lucida/restore-golden-state.sh")
         )
         self._restore_runner = restore_runner or subprocess.run
+        # Settle delay before the single golden-restore retry; injected runners
+        # (tests) get no artificial wait.
+        self.restore_retry_delay_sec = 30 if restore_runner is None else 0
         self.required_paths = required_paths or {
             "kubeconfig": Path("/root/tb-kubeconfig"),
             "ssh_key": Path("/root/.ssh/tb_key"),
@@ -738,18 +742,34 @@ class LiveScenarioQueue:
             if value:
                 creds.append(f"{name}={shlex.quote(value)}")
         remote = " ".join([*creds, "bash", shlex.quote(str(self.restore_script)), *(shlex.quote(a) for a in args)])
-        self._restore_runner(
-            ["ssh", "-i", str(ssh_key), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-             "-o", "ConnectTimeout=10", target, remote],
-            check=True, capture_output=True, text=True, timeout=timeout,
-        )
+        try:
+            self._restore_runner(
+                ["ssh", "-i", str(ssh_key), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                 "-o", "ConnectTimeout=10", target, remote],
+                check=True, capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.CalledProcessError as error:
+            # capture_output swallows the script's diagnostics; without this the
+            # pause reason only says "exit status 1" and the failure cannot be
+            # diagnosed after the fact (observed 2026-07-21, twice).
+            tail = "\n".join(str(error.stderr or error.stdout or "").splitlines()[-8:])
+            raise RuntimeError(
+                f"restore script exit {error.returncode}: {tail.strip() or 'no output captured'}"
+            ) from error
 
     def _restore_golden(self, scenario_id: str) -> None:
         """Freeze trainer + reset AI DB state + restart observer to a clean golden
         before injecting scenario_id. No-op unless golden reset is enabled."""
         if not self.golden_reset_enabled:
             return
-        self._run_restore(["--golden-root", str(self.golden_store_root), "--for-time", "now"])
+        try:
+            self._run_restore(["--golden-root", str(self.golden_store_root), "--for-time", "now"])
+        except Exception:
+            # Transient failures right at capture-end transitions (observer
+            # connections still draining) have twice resolved on immediate
+            # retry; give it one settle-and-retry before pausing the queue.
+            time.sleep(self.restore_retry_delay_sec)
+            self._run_restore(["--golden-root", str(self.golden_store_root), "--for-time", "now"])
 
     def _thaw_trainer(self) -> None:
         """Un-freeze the trainer. Fail-open: never block the queue on thaw."""
