@@ -286,3 +286,35 @@ async def test_external_dirty_cleanup_clears_only_after_profile_recovery(
 
     assert (coordinator.snapshot().dirty_run is None) is cleanup_succeeds
     assert runner.get_current().dirty is (not cleanup_succeeds)
+
+
+def test_every_live_controller_observation_binds_against_the_runner_registry():
+    """Cross-repo contract: testbed-services controllers may only reference
+    observation queries this runner can actually serve. This is the permanent
+    form of the 2026-07-21 audit that caught 7 latent per-scenario mines
+    (F09-R/F05-R/F05-H/F05-P) which would each have burned a live run."""
+    import json
+    from pathlib import Path
+
+    from app.observations import ApprovedQueryRegistry
+
+    controllers_path = Path(__file__).resolve().parents[2].parent / (
+        "testbed-services/scripts/scenarios/registry/controllers.json"
+    )
+    if not controllers_path.is_file():
+        import pytest
+
+        pytest.skip("external controllers registry is not checked out")
+    controllers = json.loads(controllers_path.read_text())
+    registry = ApprovedQueryRegistry.from_path()
+    problems = []
+    for scenario_id, controller in controllers["controllers"].items():
+        for observation in controller["observations"]:
+            spec = {"query_id": observation["query_id"]}
+            if observation.get("parameters"):
+                spec["parameters"] = observation["parameters"]
+            try:
+                registry.bind(spec)
+            except Exception as error:
+                problems.append(f"{scenario_id}/{observation['id']}: {error}")
+    assert not problems, "\n".join(problems)

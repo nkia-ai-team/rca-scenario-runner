@@ -56,6 +56,11 @@ PROMETHEUS_TEMPLATES = {
     "kcm-node-cpu-utilization-v1": (
         'max without(grade) (kcm.node.cpu_utilization{node="%s"})'
     ),
+    # 실측(2026-07-21): 메트릭명은 mem_utilization(memory_ 아님), 단위 퍼센트,
+    # grade 라벨 중복은 max로 붕괴.
+    "kcm-node-memory-utilization-v1": (
+        'max without(grade) (kcm.node.mem_utilization{node="%s"})'
+    ),
     "http-server-duration-p95-v1": (
         'histogram_quantile(0.95, sum by (le) '
         '(rate(http_server_request_duration_seconds_bucket{service_name=~"%s"}[2m])))'
@@ -81,7 +86,7 @@ APPROVED_SERVICES = frozenset({"commerce-gateway", "commerce-order", "commerce-p
 APPROVED_APM_SERVICES = frozenset(
     {"commerce-gateway", "commerce-product", "commerce-order", "commerce-pricing"}
 )
-APPROVED_NODE_TARGETS = frozenset({"tb-w3"})
+APPROVED_NODE_TARGETS = frozenset({"tb-w1", "tb-w2", "tb-w3"})
 APPROVED_BUSINESS_KEYS = frozenset({"checkout", "order-1"})
 APPROVED_K8S_TARGETS = {
     ("rca-testbed-commerce", "api-gateway"): "app=testbed-gateway",
@@ -476,9 +481,11 @@ class LiveProbeSet:
             if dict(query.parameters) != expected:
                 raise LiveProbeError("network error target is not allowlisted")
             promql = PROMETHEUS_TEMPLATES[query.template_id]
-        elif query.query_id == "prometheus.node_cpu_utilization":
+        elif query.query_id in {
+            "prometheus.node_cpu_utilization", "prometheus.node_memory_utilization"
+        }:
             if set(query.parameters) != {"node"}:
-                raise LiveProbeError("node CPU query requires the fixed node parameter")
+                raise LiveProbeError("node utilization query requires the fixed node parameter")
             node = query.parameters["node"]
             if node not in APPROVED_NODE_TARGETS:
                 raise LiveProbeError("node is not allowlisted")
@@ -519,6 +526,10 @@ class LiveProbeSet:
             "kubernetes.container_liveness_probe_match",
             "kubernetes.container_memory_current_bytes",
             "kubernetes.container_memory_limit_bytes",
+            # 외부 레지스트리(testbed-services queries.json)의 정본 id — 위
+            # container_* 쌍과 동일 의미론의 별칭(F05-R/F05-H 컨트롤러가 참조).
+            "kubernetes.deployment_resources_match_baseline",
+            "kubernetes.deployment_liveness_probe_matches_baseline",
         }
         if query.query_id in f05_query_ids:
             parameters = dict(query.parameters)
@@ -539,6 +550,8 @@ class LiveProbeSet:
             if query.query_id in {
                 "kubernetes.container_resources_match",
                 "kubernetes.container_liveness_probe_match",
+                "kubernetes.deployment_resources_match_baseline",
+                "kubernetes.deployment_liveness_probe_matches_baseline",
             }:
                 result = self._kubectl(
                     "get", "deployment", deployment, "--namespace", namespace, "-o", "json",
@@ -550,14 +563,18 @@ class LiveProbeSet:
                 matches = [item for item in containers if item.get("name") == container]
                 if len(matches) != 1:
                     raise LiveProbeError("payment deployment container is missing or ambiguous")
+                is_resources = query.query_id in {
+                    "kubernetes.container_resources_match",
+                    "kubernetes.deployment_resources_match_baseline",
+                }
                 expected = (
                     F05_PAYMENT_BASELINE_RESOURCES
-                    if query.query_id == "kubernetes.container_resources_match"
+                    if is_resources
                     else F05_PAYMENT_BASELINE_LIVENESS
                 )
                 actual = (
                     matches[0].get("resources", {})
-                    if query.query_id == "kubernetes.container_resources_match"
+                    if is_resources
                     else matches[0].get("livenessProbe")
                 )
                 return actual == expected, _aware(self.clock()), (
@@ -613,6 +630,19 @@ class LiveProbeSet:
                 else limit
             )
             return value, _aware(self.clock()), f"kubernetes:payment:{query.query_id}"
+        if query.query_id == "kubernetes.node_ready":
+            if set(query.parameters) != {"node"}:
+                raise LiveProbeError("node readiness query requires the fixed node parameter")
+            node = str(query.parameters["node"])
+            if node not in APPROVED_NODE_TARGETS:
+                raise LiveProbeError("node is not allowlisted")
+            result = self._kubectl("get", "node", node, "-o", "json")
+            document = json.loads(result.stdout)
+            ready = any(
+                condition.get("type") == "Ready" and condition.get("status") == "True"
+                for condition in document.get("status", {}).get("conditions", [])
+            )
+            return ready, _aware(self.clock()), f"kubernetes:node:{node}:ready"
         if query.query_id == "kubernetes.deployment_container_memory_limit":
             if dict(query.parameters) not in (F05_PAYMENT_TARGET, F15_FOOD_PAYMENT_TARGET):
                 raise LiveProbeError("container memory limit target is not allowlisted")
