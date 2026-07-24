@@ -829,6 +829,12 @@ class ProductionCaptureInvoker:
             normal_dir = normal_marker.read_text(encoding="utf-8").strip()
             if normal_dir:
                 args.extend(["--normal-segment", normal_dir])
+        # Capture contract v3 (spec §2.2): in cycle mode the queue drops the
+        # continuous-cycle phase log next to the run; forward it so meta.json
+        # gets phases[] and the capture window is [cycle_start, t2+30m].
+        phases_file = self.runs_root / job.run_id / "phases.json"
+        if phases_file.is_file():
+            args.extend(["--phases-json", str(phases_file)])
         environment = _trusted_environment()
         environment["MODEL_SOURCE"] = str(checkpoint)
         try:

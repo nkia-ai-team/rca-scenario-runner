@@ -82,6 +82,34 @@ TRANSIENT_AUTO_RETRY_REASONS = frozenset(
 # 2333e298 paused overnight-capable queue on a one-shot kubectl conflict (2026-07-20).
 TRANSIENT_AUTO_RETRY_PREFIXES = ("profile_apply_failed:",)
 
+# Continuous-cycle capture contract v3 (spec-eval-data-capture §2.2, 2026-07-24).
+# A case == one cycle on a real continuous time axis:
+#   cycle_reset -> cycle_normal(2h) -> cycle_buffer(10m) -> running[t1,t2]
+#     -> cycle_cooldown(30m) -> waiting_capture([cycle_start, t2+30m]).
+# Enabled only when CYCLE_MODE=1; otherwise the v2 daily-segment queue above is
+# preserved unchanged. The 13 re-capture scenarios are the first v3 subjects.
+CYCLE_SCENARIO_ORDER = (
+    "F01-G",
+    "F01-H",
+    "F01-R",
+    "F02-R",
+    "F03-G",
+    "F04-R",
+    "F05-G",
+    "F06-R",
+    "F07-H",
+    "F08-H",
+    "F09-P",
+    "F11-G",
+    "F11-R",
+)
+CYCLE_NORMAL_DURATION = timedelta(hours=2)
+CYCLE_BUFFER_DURATION = timedelta(minutes=10)
+CYCLE_COOLDOWN_DURATION = timedelta(minutes=30)
+# Same-scenario cycle restarts are bounded to break infinite loops: two
+# consecutive restarts are allowed, the third pauses (spec §2.2 resume table).
+MAX_CYCLE_RESTARTS = 2
+
 QueuePhase = Literal[
     "idle",
     "running",
@@ -89,7 +117,25 @@ QueuePhase = Literal[
     "waiting_clean_window",
     "paused",
     "completed",
+    # v3 continuous-cycle phases (CYCLE_MODE only).
+    "cycle_reset",
+    "cycle_normal",
+    "cycle_buffer",
+    "cycle_cooldown",
 ]
+
+# Phases in which the background worker loop must keep ticking.
+ACTIVE_PHASES = frozenset(
+    {
+        "running",
+        "waiting_capture",
+        "waiting_clean_window",
+        "cycle_reset",
+        "cycle_normal",
+        "cycle_buffer",
+        "cycle_cooldown",
+    }
+)
 
 
 class StrictModel(BaseModel):
@@ -118,15 +164,34 @@ class LiveQueueState(StrictModel):
     reason: str | None = None
     started_at: str | None = None
     updated_at: str | None = None
+    # --- v3 continuous-cycle state (CYCLE_MODE only; all default to the v2 no-op) ---
+    cycle_mode: bool = False
+    cycle_started_at: str | None = None
+    cycle_buffer_started_at: str | None = None
+    phase_started_at: str | None = None
+    # Scheduled end of the current timed phase; monitoring uses this for stall
+    # detection. None while injection runs (the controller watchdog owns that).
+    expected_transition_at: str | None = None
+    cycle_restart_counts: dict[str, int] = Field(default_factory=dict)
+    cycle_golden_id: str | None = None
+    cycle_golden_sha256: str | None = None
 
     @model_validator(mode="after")
     def fixed_sequence(self) -> "LiveQueueState":
         if set(self.skipped_scenario_ids) - set(self.scenario_ids):
             raise ValueError("skipped scenarios must reference queued scenarios")
-        if self.scenario_ids[: len(LIVE_SCENARIO_ORDER)] != list(LIVE_SCENARIO_ORDER):
+        # The frozen eight-scenario prefix is a v2-queue invariant. The v3 cycle
+        # queue runs its own (13-scenario) re-capture list, so the prefix check
+        # is scoped to non-cycle queues.
+        if (
+            not self.cycle_mode
+            and self.scenario_ids[: len(LIVE_SCENARIO_ORDER)] != list(LIVE_SCENARIO_ORDER)
+        ):
             raise ValueError("live queue must preserve the approved eight-scenario prefix")
         if len(self.scenario_ids) != len(set(self.scenario_ids)):
             raise ValueError("live queue scenario ids must be unique")
+        if set(self.cycle_restart_counts) - set(self.scenario_ids):
+            raise ValueError("cycle restart counts must reference queued scenarios")
         if len(self.completed_run_ids) > self.next_index:
             raise ValueError("completed runs cannot exceed the queue cursor")
         if set(self.auto_retry_counts) - set(self.scenario_ids):
@@ -194,8 +259,17 @@ class LiveScenarioQueue:
         golden_store_root: Path | None = None,
         restore_script: Path | None = None,
         restore_runner: "ProcessRunner | None" = None,
+        cycle_mode: bool = False,
+        cycle_scenario_ids: tuple[str, ...] = CYCLE_SCENARIO_ORDER,
+        cycle_health_probe: "Callable[[], str | None] | None" = None,
     ) -> None:
         self.runner = runner
+        # v3 continuous-cycle mode (off by default; v2 behaviour preserved).
+        self.cycle_mode = cycle_mode
+        self.cycle_scenario_ids = cycle_scenario_ids
+        # Returns an error string when the AI stack / stores are unhealthy during
+        # the normal lead-in, else None. Default: always healthy (unit tests).
+        self.cycle_health_probe = cycle_health_probe
         self.state_path = state_path
         self.clock = clock or SystemClock()
         self.poll_interval_sec = poll_interval_sec
@@ -306,7 +380,7 @@ class LiveScenarioQueue:
     async def start(self) -> LiveQueueState:
         async with self._lock:
             current = self.snapshot()
-            if current.phase in {"running", "waiting_capture", "waiting_clean_window"}:
+            if current.phase in ACTIVE_PHASES:
                 raise RuntimeError("live queue is already active")
             if current.phase == "paused":
                 raise RuntimeError("live queue is paused; fix the blocker and use resume")
@@ -314,15 +388,29 @@ class LiveScenarioQueue:
             if not readiness.ready:
                 raise RuntimeError(f"live queue readiness failed: {', '.join(readiness.missing)}")
             now = self._format(self.clock.now())
-            scenario_ids, snapshot_sha256 = self._queue_contract()
-            state = LiveQueueState(
-                queue_id=f"live-{len(scenario_ids)}-{uuid.uuid4().hex[:8]}",
-                scenario_ids=scenario_ids,
-                catalog_snapshot_sha256=snapshot_sha256,
-                phase="running",
-                started_at=now,
-                updated_at=now,
-            )
+            if self.cycle_mode:
+                scenario_ids, snapshot_sha256 = self._cycle_contract()
+                state = LiveQueueState(
+                    queue_id=f"cycle-{len(scenario_ids)}-{uuid.uuid4().hex[:8]}",
+                    scenario_ids=scenario_ids,
+                    catalog_snapshot_sha256=snapshot_sha256,
+                    cycle_mode=True,
+                    phase="cycle_reset",
+                    phase_started_at=now,
+                    expected_transition_at=now,
+                    started_at=now,
+                    updated_at=now,
+                )
+            else:
+                scenario_ids, snapshot_sha256 = self._queue_contract()
+                state = LiveQueueState(
+                    queue_id=f"live-{len(scenario_ids)}-{uuid.uuid4().hex[:8]}",
+                    scenario_ids=scenario_ids,
+                    catalog_snapshot_sha256=snapshot_sha256,
+                    phase="running",
+                    started_at=now,
+                    updated_at=now,
+                )
             self._write(state)
         self.ensure_worker()
         return self.snapshot()
@@ -335,6 +423,30 @@ class LiveScenarioQueue:
             readiness = self.readiness()
             if not readiness.ready:
                 raise RuntimeError(f"live queue readiness failed: {', '.join(readiness.missing)}")
+            if state.cycle_mode:
+                # Operator resume of a paused cycle re-enters at the safe point:
+                # restart the current scenario's cycle from trainer_reset. Timed
+                # phases resume on their own (expected_transition_at persists), so
+                # only the paused case reaches here.
+                now = self._format(self.clock.now())
+                state = state.model_copy(
+                    update={
+                        "phase": "cycle_reset",
+                        "current_scenario_id": None,
+                        "current_run_id": None,
+                        "cycle_started_at": None,
+                        "cycle_buffer_started_at": None,
+                        "cycle_golden_id": None,
+                        "cycle_golden_sha256": None,
+                        "phase_started_at": now,
+                        "expected_transition_at": now,
+                        "reason": None,
+                        "updated_at": now,
+                    }
+                )
+                self._write(state)
+                self.ensure_worker()
+                return self.snapshot()
             current_run_id = state.current_run_id
             capture_job = self._capture_job(current_run_id) if current_run_id else None
             previous_t2 = self._previous_t2(current_run_id)
@@ -408,9 +520,11 @@ class LiveScenarioQueue:
             state = self.snapshot()
             if state.phase in {"idle", "paused", "completed"}:
                 return state
-            state = self._append_promoted_if_available(state)
             if self.runner.coordinator.snapshot().dirty_run is not None:
                 return self._pause(state, "DIRTY coordinator state blocks the live queue")
+            if state.cycle_mode:
+                return await self._tick_cycle(state)
+            state = self._append_promoted_if_available(state)
             if state.phase == "running":
                 return await self._tick_running(state)
             if state.phase == "waiting_capture":
@@ -635,6 +749,367 @@ class LiveScenarioQueue:
         self._write(state)
         return state
 
+    # ------------------------------------------------------------------
+    # v3 continuous-cycle state machine (CYCLE_MODE only)
+    # ------------------------------------------------------------------
+    async def _tick_cycle(self, state: LiveQueueState) -> LiveQueueState:
+        if state.phase == "cycle_reset":
+            return self._tick_cycle_reset(state)
+        if state.phase == "cycle_normal":
+            return self._tick_cycle_normal(state)
+        if state.phase == "cycle_buffer":
+            return await self._tick_cycle_buffer(state)
+        if state.phase == "running":
+            return await self._tick_cycle_running(state)
+        if state.phase == "cycle_cooldown":
+            return self._tick_cycle_cooldown(state)
+        if state.phase == "waiting_capture":
+            return self._tick_cycle_capture(state)
+        return self._pause(state, f"unknown cycle phase: {state.phase}")
+
+    def _tick_cycle_reset(self, state: LiveQueueState) -> LiveQueueState:
+        """Start a cycle: restore golden, then resume trainer for the 2h lead-in.
+
+        Golden restore itself freezes the trainer (docker stop); we thaw straight
+        after so the trainer learns on the clean normal-only window (spec §2.2 /
+        spec-trainer-reset §5). Restore already retries once internally, so a
+        raised failure is terminal -> pause (resume table: reset failure).
+        """
+        if state.next_index >= len(state.scenario_ids):
+            return self._complete(state)
+        if self.runner.is_busy or self.runner.coordinator.snapshot().active_lease is not None:
+            return state
+        scenario_id = state.scenario_ids[state.next_index]
+        try:
+            golden = self._restore_golden(scenario_id)
+        except Exception as error:
+            return self._pause(state, f"golden reset failed for {scenario_id}: {error}")
+        self._thaw_trainer()
+        now = self.clock.now()
+        state = state.model_copy(
+            update={
+                "phase": "cycle_normal",
+                "current_scenario_id": scenario_id,
+                "current_run_id": None,
+                "cycle_started_at": self._format(now),
+                "cycle_buffer_started_at": None,
+                "phase_started_at": self._format(now),
+                "expected_transition_at": self._format(now + CYCLE_NORMAL_DURATION),
+                "cycle_golden_id": (golden or {}).get("id"),
+                "cycle_golden_sha256": (golden or {}).get("sha256"),
+                "reason": None,
+                "updated_at": self._format(now),
+            }
+        )
+        self._write(state)
+        return state
+
+    def _tick_cycle_normal(self, state: LiveQueueState) -> LiveQueueState:
+        """Hold the 2h clean lead-in. Baseline load is supplied out-of-band by
+        the tb-runner systemd loadgen, so the queue only waits and health-checks;
+        any health failure restarts the whole cycle (resume table: normal)."""
+        health_error = self._cycle_health_error()
+        if health_error is not None:
+            return self._restart_cycle(state, f"normal-phase health failed: {health_error}")
+        if not self._transition_due(state):
+            return state
+        return self._enter_cycle_buffer(state)
+
+    def _enter_cycle_buffer(self, state: LiveQueueState) -> LiveQueueState:
+        """Freeze the trainer at buffer start (=t1-10m) and open the 10m gate."""
+        try:
+            self._freeze_trainer()
+        except Exception as error:
+            return self._pause(state, f"trainer freeze failed at buffer: {error}")
+        now = self.clock.now()
+        state = state.model_copy(
+            update={
+                "phase": "cycle_buffer",
+                "cycle_buffer_started_at": self._format(now),
+                "phase_started_at": self._format(now),
+                "expected_transition_at": self._format(now + CYCLE_BUFFER_DURATION),
+                "preflight_attempts": 0,
+                "preflight_retry_not_before": None,
+                "reason": None,
+                "updated_at": self._format(now),
+            }
+        )
+        self._write(state)
+        return state
+
+    async def _tick_cycle_buffer(self, state: LiveQueueState) -> LiveQueueState:
+        """Hold the 10m buffer, then run the R6 preflight gate over that same
+        window and inject. A dirty buffer restarts the cycle rather than skipping
+        (resume table: buffer -> cleanup-guaranteed cycle restart)."""
+        if self.runner.is_busy or self.runner.coordinator.snapshot().active_lease is not None:
+            return state
+        if not self._transition_due(state):
+            return state
+        scenario_id = state.scenario_ids[state.next_index]
+        verdict = None
+        if self.preflight_probe is not None:
+            now = self.clock.now().astimezone(timezone.utc)
+            try:
+                verdict = self._evaluate_preflight(now, waited_sec=0)
+                if not verdict.is_clean and self._sweep_lingering_incidents(verdict):
+                    verdict = self._evaluate_preflight(now, waited_sec=0)
+            except Exception as error:
+                return self._pause(state, f"preflight probe failed for {scenario_id}: {error}")
+            if not verdict.is_clean:
+                return self._restart_cycle(
+                    state, f"preflight not clean at buffer end ({verdict.verdict})"
+                )
+        try:
+            run = await self.runner.start(scenario_id=scenario_id, mode="run")
+        except Exception as error:
+            return self._restart_cycle(state, f"injection start failed for {scenario_id}: {error}")
+        if verdict is not None:
+            self._write_preflight(run.run_id, verdict)
+        now = self.clock.now()
+        state = state.model_copy(
+            update={
+                "phase": "running",
+                "current_run_id": run.run_id,
+                "phase_started_at": self._format(now),
+                "expected_transition_at": None,
+                "reason": None,
+                "updated_at": self._format(now),
+            }
+        )
+        self._write(state)
+        return state
+
+    async def _tick_cycle_running(self, state: LiveQueueState) -> LiveQueueState:
+        """Watch the injection; on clean success enter cooldown, on a dirty run
+        pause (cleanup not guaranteed), on any other failure restart the cycle."""
+        current = self.runner.get_current()
+        if current is not None and current.run_id == state.current_run_id:
+            if current.status in {"running", "cleanup_running"}:
+                return state
+            if current.dirty:
+                return self._pause(state, f"DIRTY run: {current.run_id}")
+            if current.status != "succeeded":
+                return self._restart_cycle(state, f"scenario evidence failed: {current.run_id}")
+        elif self.runner.coordinator.snapshot().active_lease is not None:
+            return state
+        evidence_error = self._controller_evidence_error(state.current_run_id)
+        if evidence_error is not None:
+            if "did not recover cleanly" in evidence_error:
+                return self._pause(state, evidence_error)
+            return self._restart_cycle(state, evidence_error)
+        job = self._capture_job(state.current_run_id)
+        if job is None:
+            return self._pause(state, f"capture was not scheduled: {state.current_run_id}")
+        t2 = parse_utc(job.t2, field="t2")
+        now = self.clock.now()
+        state = state.model_copy(
+            update={
+                "phase": "cycle_cooldown",
+                "phase_started_at": self._format(now),
+                "expected_transition_at": self._format(t2 + CYCLE_COOLDOWN_DURATION),
+                "reason": None,
+                "updated_at": self._format(now),
+            }
+        )
+        self._write(state)
+        return state
+
+    def _tick_cycle_cooldown(self, state: LiveQueueState) -> LiveQueueState:
+        """Hold the 30m recovery/settle window, then write phases.json and hand
+        off to capture. Data already lives in the stores, so a runner restart
+        just re-enters here and waits out the remaining time."""
+        if not self._transition_due(state):
+            return state
+        self._write_cycle_phases(state)
+        now = self.clock.now()
+        state = state.model_copy(
+            update={
+                "phase": "waiting_capture",
+                "phase_started_at": self._format(now),
+                "expected_transition_at": None,
+                "updated_at": self._format(now),
+            }
+        )
+        self._write(state)
+        return state
+
+    def _tick_cycle_capture(self, state: LiveQueueState) -> LiveQueueState:
+        """Wait for capture completion, thaw the trainer, then start the next
+        cycle. Capture retries are owned by the scheduler; a terminal failure
+        pauses (resume table: capture -> retry capture only)."""
+        assert state.current_run_id is not None
+        job = self._capture_job(state.current_run_id)
+        if job is None:
+            return self._pause(state, f"capture job disappeared: {state.current_run_id}")
+        if job.status == "failed":
+            return self._pause(state, f"capture failed: {state.current_run_id}: {job.failure}")
+        if job.status != "completed":
+            return state
+        if not (
+            self.runner.artifact_store.root / state.current_run_id / "capture-complete.json"
+        ).is_file():
+            return self._pause(state, f"capture completion evidence missing: {state.current_run_id}")
+        self._thaw_trainer()
+        completed = [*state.completed_run_ids, state.current_run_id]
+        next_index = state.next_index + 1
+        first_gate = state.first_gate_passed or state.next_index == 0
+        now = self.clock.now()
+        base = {
+            "completed_run_ids": completed,
+            "next_index": next_index,
+            "first_gate_passed": first_gate,
+        }
+        if next_index >= len(state.scenario_ids):
+            return self._complete(state.model_copy(update=base))
+        state = state.model_copy(
+            update={
+                **base,
+                "phase": "cycle_reset",
+                "current_scenario_id": None,
+                "current_run_id": None,
+                "cycle_started_at": None,
+                "cycle_buffer_started_at": None,
+                "cycle_golden_id": None,
+                "cycle_golden_sha256": None,
+                "phase_started_at": self._format(now),
+                "expected_transition_at": self._format(now),
+                "reason": None,
+                "updated_at": self._format(now),
+            }
+        )
+        self._write(state)
+        return state
+
+    def _restart_cycle(self, state: LiveQueueState, reason: str) -> LiveQueueState:
+        """Restart the current scenario's cycle from trainer_reset. Two
+        consecutive restarts are allowed; the third pauses (spec §2.2)."""
+        scenario_id = state.current_scenario_id or state.scenario_ids[state.next_index]
+        count = state.cycle_restart_counts.get(scenario_id, 0) + 1
+        if count > MAX_CYCLE_RESTARTS:
+            return self._pause(
+                state, f"cycle restart budget exhausted for {scenario_id}: {reason}"
+            )
+        now = self.clock.now()
+        state = state.model_copy(
+            update={
+                "phase": "cycle_reset",
+                "current_scenario_id": None,
+                "current_run_id": None,
+                "cycle_started_at": None,
+                "cycle_buffer_started_at": None,
+                "cycle_golden_id": None,
+                "cycle_golden_sha256": None,
+                "cycle_restart_counts": {**state.cycle_restart_counts, scenario_id: count},
+                "phase_started_at": self._format(now),
+                "expected_transition_at": self._format(now),
+                "reason": f"cycle restart {count}/{MAX_CYCLE_RESTARTS}: {reason}",
+                "updated_at": self._format(now),
+            }
+        )
+        self._write(state)
+        return state
+
+    def _transition_due(self, state: LiveQueueState) -> bool:
+        if state.expected_transition_at is None:
+            return True
+        now = self.clock.now().astimezone(timezone.utc)
+        return now >= parse_utc(state.expected_transition_at, field="expected_transition_at")
+
+    def _cycle_health_error(self) -> str | None:
+        if self.cycle_health_probe is None:
+            return None
+        return self.cycle_health_probe()
+
+    def _freeze_trainer(self) -> None:
+        """Freeze the trainer at buffer start. No-op unless golden reset is on."""
+        if not self.golden_reset_enabled:
+            return
+        self._run_restore(["--freeze"], timeout=60)
+
+    @staticmethod
+    def _parse_golden_result(
+        result: "subprocess.CompletedProcess[str] | None",
+    ) -> dict[str, str | None] | None:
+        """Best-effort golden identity from the restore script's JSON stdout.
+
+        The script emits golden_dir but not the dump sha256, so golden_sha256 is
+        left null. TODO(spec §2.2): thread the golden meta pg_ai_state.sha256
+        through the restore output so phases.json can carry it.
+        """
+        if result is None:
+            return None
+        try:
+            payload = json.loads((result.stdout or "").strip() or "{}")
+        except Exception:
+            return None
+        golden_dir = payload.get("golden_dir")
+        return {
+            "id": Path(golden_dir).name if isinstance(golden_dir, str) and golden_dir else None,
+            "sha256": None,
+        }
+
+    def _write_cycle_phases(self, state: LiveQueueState) -> None:
+        """Write <run-id>/phases.json (spec §2.2 phases[]) so the capture invoker
+        forwards it as --phases-json. Boundaries are the actual recorded cycle
+        times; injection/cooldown derive from the capture job's t1/t2."""
+        run_id = state.current_run_id
+        if run_id is None or state.cycle_started_at is None:
+            return
+        job = self._capture_job(run_id)
+        if job is None:
+            return
+        t1, t2 = job.t1, job.t2
+        cycle_start = state.cycle_started_at
+        buffer_start = state.cycle_buffer_started_at or cycle_start
+        cooldown_end = self._format(
+            parse_utc(t2, field="t2") + CYCLE_COOLDOWN_DURATION
+        )
+        document = {
+            "schema_version": "2.0",
+            "timeline": "continuous",
+            "run_id": run_id,
+            "scenario_id": state.current_scenario_id,
+            "capture_start": cycle_start,
+            "capture_end": cooldown_end,
+            "phases": [
+                {
+                    "phase": "trainer_reset",
+                    "at": cycle_start,
+                    "golden_id": state.cycle_golden_id,
+                    "golden_sha256": state.cycle_golden_sha256,
+                },
+                {"phase": "normal", "start": cycle_start, "end": buffer_start},
+                {"phase": "buffer", "start": buffer_start, "end": t1},
+                {"phase": "injection", "start": t1, "end": t2},
+                {"phase": "cooldown", "start": t2, "end": cooldown_end},
+            ],
+        }
+        path = self.runner.artifact_store.root / run_id / "phases.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(document, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(raw, path)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(raw)
+
+    def _cycle_contract(self) -> tuple[list[str], str]:
+        """Freeze the v3 re-capture scenario list and its digest."""
+        ids = list(self.cycle_scenario_ids)
+        if not ids:
+            raise RuntimeError("cycle queue has no scenario list")
+        if len(ids) != len(set(ids)):
+            raise RuntimeError("cycle queue scenario ids must be unique")
+        for scenario_id in ids:
+            load_scenario_metadata(self.runner.scenario_metadata_path, scenario_id)
+        encoded = json.dumps(ids, separators=(",", ":")).encode()
+        return ids, hashlib.sha256(encoded).hexdigest()
+
     def _preflight_gate(
         self, state: LiveQueueState, scenario_id: str
     ) -> tuple[LiveQueueState | None, PreflightVerdict | None]:
@@ -731,7 +1206,9 @@ class LiveScenarioQueue:
         except Exception:
             return False
 
-    def _run_restore(self, args: list[str], *, timeout: int = 900) -> None:
+    def _run_restore(
+        self, args: list[str], *, timeout: int = 900
+    ) -> "subprocess.CompletedProcess[str] | None":
         target = os.environ.get("MODEL_SNAPSHOT_SSH_TARGET")
         if not target:
             raise RuntimeError("MODEL_SNAPSHOT_SSH_TARGET is required for golden reset")
@@ -743,7 +1220,7 @@ class LiveScenarioQueue:
                 creds.append(f"{name}={shlex.quote(value)}")
         remote = " ".join([*creds, "bash", shlex.quote(str(self.restore_script)), *(shlex.quote(a) for a in args)])
         try:
-            self._restore_runner(
+            return self._restore_runner(
                 ["ssh", "-i", str(ssh_key), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
                  "-o", "ConnectTimeout=10", target, remote],
                 check=True, capture_output=True, text=True, timeout=timeout,
@@ -757,19 +1234,24 @@ class LiveScenarioQueue:
                 f"restore script exit {error.returncode}: {tail.strip() or 'no output captured'}"
             ) from error
 
-    def _restore_golden(self, scenario_id: str) -> None:
-        """Freeze trainer + reset AI DB state + restart observer to a clean golden
-        before injecting scenario_id. No-op unless golden reset is enabled."""
+    def _restore_golden(self, scenario_id: str) -> dict[str, str | None] | None:
+        """Freeze trainer + reset AI DB state + restart observer to a clean golden.
+
+        In v2 this runs just before injection; in v3 it runs at cycle start.
+        Returns the restored golden's identity (id/sha256) when available, else
+        None. No-op unless golden reset is enabled."""
         if not self.golden_reset_enabled:
-            return
+            return None
+        args = ["--golden-root", str(self.golden_store_root), "--for-time", "now"]
         try:
-            self._run_restore(["--golden-root", str(self.golden_store_root), "--for-time", "now"])
+            result = self._run_restore(args)
         except Exception:
             # Transient failures right at capture-end transitions (observer
             # connections still draining) have twice resolved on immediate
             # retry; give it one settle-and-retry before pausing the queue.
             time.sleep(self.restore_retry_delay_sec)
-            self._run_restore(["--golden-root", str(self.golden_store_root), "--for-time", "now"])
+            result = self._run_restore(args)
+        return self._parse_golden_result(result)
 
     def _thaw_trainer(self) -> None:
         """Un-freeze the trainer. Fail-open: never block the queue on thaw."""
@@ -962,13 +1444,11 @@ class LiveScenarioQueue:
 
     def ensure_worker(self) -> None:
         state = self.snapshot()
-        if state.phase in {"running", "waiting_capture", "waiting_clean_window"} and (
-            self._task is None or self._task.done()
-        ):
+        if state.phase in ACTIVE_PHASES and (self._task is None or self._task.done()):
             self._task = asyncio.create_task(self._loop())
 
     async def _loop(self) -> None:
-        while self.snapshot().phase in {"running", "waiting_capture", "waiting_clean_window"}:
+        while self.snapshot().phase in ACTIVE_PHASES:
             try:
                 await self.tick()
             except Exception as error:
@@ -1061,5 +1541,6 @@ def get_live_queue() -> LiveScenarioQueue:
             functional_readiness_enabled=True,
             golden_reset_enabled=os.environ.get("GOLDEN_RESET_ENABLED", "").lower()
             in {"1", "true", "yes", "on"},
+            cycle_mode=os.environ.get("CYCLE_MODE", "").lower() in {"1", "true", "yes", "on"},
         )
     return _queue
