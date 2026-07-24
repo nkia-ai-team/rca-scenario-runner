@@ -71,6 +71,9 @@ PROMETHEUS_TEMPLATES = {
     "apm-agent-error-rate-v1": (
         'max without(grade) (apm.agent.otel.java.error_rate{service_name="%s"})'
     ),
+    "otel-hikari-pending-v1": (
+        'sum(db.client.connections.pending_requests{service_name="%s"})'
+    ),
     "kcm-pod-cpu-throttled-time-v1": (
         'max without(grade) (kcm.pod.cpu_throttled_time{namespace="rca-testbed-commerce",'
         'pod=~"testbed-product-.*"})'
@@ -84,8 +87,12 @@ PROMETHEUS_TEMPLATES = {
 }
 APPROVED_SERVICES = frozenset({"commerce-gateway", "commerce-order", "commerce-payment"})
 APPROVED_APM_SERVICES = frozenset(
-    {"commerce-gateway", "commerce-product", "commerce-order", "commerce-pricing"}
+    {"commerce-gateway", "commerce-product", "commerce-order", "commerce-pricing",
+     "commerce-payment", "food-delivery-payment"}
 )
+# F19-P: Hikari pending gauge (OTel semconv db.client.connections.pending_requests,
+# live-verified 2026-07-24 on VictoriaMetrics 119:18428).
+APPROVED_HIKARI_SERVICES = frozenset({"food-delivery-order"})
 APPROVED_NODE_TARGETS = frozenset({"tb-w1", "tb-w2", "tb-w3"})
 APPROVED_BUSINESS_KEYS = frozenset({"checkout", "order-1"})
 APPROVED_K8S_TARGETS = {
@@ -107,6 +114,8 @@ APPROVED_K8S_TARGETS = {
     # F17-R watches the banking transfer pod dropping NotReady under its
     # readinessProbe fault while commerce checkout degrades cross-domain.
     ("rca-testbed-banking", "testbed-transfer"): "app=testbed-transfer",
+    # F19-P/S watch the food order pod while its Hikari pool saturates.
+    ("rca-testbed-food", "testbed-order"): "app=testbed-order",
 }
 F12_PRODUCT_TARGET = {
     "namespace": "rca-testbed-commerce",
@@ -505,6 +514,13 @@ class LiveProbeSet:
             service = query.parameters["service_name"]
             if service not in APPROVED_APM_SERVICES:
                 raise LiveProbeError("APM service_name is not allowlisted")
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % service
+        elif query.query_id == "prometheus.hikari_pending_connections":
+            if set(query.parameters) != {"service_name"}:
+                raise LiveProbeError("Hikari pending query requires the fixed service parameter")
+            service = query.parameters["service_name"]
+            if service not in APPROVED_HIKARI_SERVICES:
+                raise LiveProbeError("Hikari service_name is not allowlisted")
             promql = PROMETHEUS_TEMPLATES[query.template_id] % service
         elif query.query_id == "prometheus.container_cpu_throttled_time":
             if dict(query.parameters) != F12_PRODUCT_TARGET:
