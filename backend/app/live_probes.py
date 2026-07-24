@@ -116,6 +116,9 @@ APPROVED_K8S_TARGETS = {
     ("rca-testbed-banking", "testbed-transfer"): "app=testbed-transfer",
     # F19-P/S watch the food order pod while its Hikari pool saturates.
     ("rca-testbed-food", "testbed-order"): "app=testbed-order",
+    # F16-H watches the user pod dropping NotReady under its readinessProbe
+    # fault while the gateway fail-closes every write route with 401.
+    ("rca-testbed-commerce", "testbed-user"): "app=testbed-user",
 }
 F12_PRODUCT_TARGET = {
     "namespace": "rca-testbed-commerce",
@@ -186,6 +189,7 @@ APPROVED_DEPLOYMENT_REPLICA_TARGETS = frozenset(
         ("rca-testbed-commerce", "testbed-payment"),
         ("rca-testbed-commerce", "testbed-product"),
         ("rca-testbed-banking", "testbed-transfer"),
+        ("rca-testbed-commerce", "testbed-user"),
     }
 )
 F05_PAYMENT_TARGET = {
