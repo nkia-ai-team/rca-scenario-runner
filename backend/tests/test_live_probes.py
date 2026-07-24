@@ -16,6 +16,10 @@ from app.live_probes import (
     F12_PRODUCT_TARGET,
     INDEX_PRESENT_CONTRACT,
     INDEX_PRESENT_SQL,
+    INVENTORY_STOCK_CONTRACT,
+    INVENTORY_ZERO_STOCK_SQL,
+    RESTOCK_MOVEMENT_CONTRACT,
+    RESTOCK_MOVEMENT_SQL,
     KAFKA_LAG_CONTRACT,
     PAYMENT_DUPLICATE_SINCE_T1_SQL,
     KUBECONFIG,
@@ -159,6 +163,8 @@ class Fakes:
                 "shipping-service shipping-events 1 20 23 3 consumer-2\n",
                 "",
             )
+        if "testbed-oracle-0" in argv and any("banking.transfers" in item for item in argv):
+            return subprocess.CompletedProcess(argv, 0, "2\n", "")
         if argv[0] == "ssh":
             if argv[-2:] == ["--", "/tmp/rca-scenario-F07-H-live.json"]:
                 return subprocess.CompletedProcess(
@@ -197,6 +203,10 @@ class Fakes:
             return {"index_present": False, "observed_at": NOW.isoformat()}
         if sql == PAYMENT_DUPLICATE_SINCE_T1_SQL:
             return {"duplicate_count": 0, "observed_at": NOW.isoformat()}
+        if sql == INVENTORY_ZERO_STOCK_SQL:
+            return {"zero_stock_count": 2, "observed_at": NOW.isoformat()}
+        if sql == RESTOCK_MOVEMENT_SQL:
+            return {"restock_count": 0, "observed_at": NOW.isoformat()}
         return {"tagged_count": 3, "observed_at": NOW.isoformat()}
 
 
@@ -441,6 +451,56 @@ def test_f02r_index_probe_is_fixed_and_parameterized(tmp_path) -> None:
     rejected = probes.observe(
         ApprovedQueryRegistry.from_path().bind(
             {"query_id": "database.index_present", "parameters": tampered}
+        )
+    )
+    assert rejected["quality"] == "error" and rejected["value"] is None
+
+
+def test_f23r_inventory_stock_and_restock_probes_are_fixed_and_parameterized(tmp_path) -> None:
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+
+    stock = probes.observe(
+        registry.bind({"query_id": "database.inventory_stock_level", "parameters": INVENTORY_STOCK_CONTRACT})
+    )
+    assert stock["quality"] == "good" and stock["value"] == 2
+    sql, parameters, _ = fakes.database_calls[0]
+    assert sql == INVENTORY_ZERO_STOCK_SQL and parameters == ()
+
+    restock = probes.observe(
+        registry.bind({"query_id": "database.restock_movement_rate", "parameters": RESTOCK_MOVEMENT_CONTRACT})
+    )
+    assert restock["quality"] == "good" and restock["value"] == 0
+    sql, parameters, _ = fakes.database_calls[1]
+    assert sql == RESTOCK_MOVEMENT_SQL and parameters == ()
+
+    tampered = dict(INVENTORY_STOCK_CONTRACT)
+    tampered["table"] = "products"
+    rejected = probes.observe(
+        registry.bind({"query_id": "database.inventory_stock_level", "parameters": tampered})
+    )
+    assert rejected["quality"] == "error" and rejected["value"] is None
+
+
+def test_f17p_integrity_violation_probe_requires_a_valid_since_timestamp(tmp_path) -> None:
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+
+    observed = probes.observe(
+        registry.bind({"query_id": "database.integrity_violation_count", "parameters": {"since": "2026-07-24 09:00:00"}})
+    )
+    assert observed["quality"] == "good" and observed["value"] == 2
+    exec_argv = fakes.process_calls[-1][0]
+    assert "testbed-oracle-0" in exec_argv and "--namespace" in exec_argv and "rca-testbed-banking" in exec_argv
+
+    rejected = probes.observe(
+        registry.bind(
+            {
+                "query_id": "database.integrity_violation_count",
+                "parameters": {"since": "2026-07-24T09:00:00Z; drop table transfers;"},
+            }
         )
     )
     assert rejected["quality"] == "error" and rejected["value"] is None
@@ -709,6 +769,26 @@ def test_loadgen_probe_rejects_legacy_summary_shape_without_live_rate(tmp_path) 
 
     assert observed["quality"] == "error"
     assert observed["value"] is None
+
+
+def test_new_loadgen_rate_queries_map_to_the_expected_summary_fields(tmp_path) -> None:
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    document = json.loads(probes.paths.loadgen_summary.read_text())
+    document.update({"business_409_rate": 0.4, "business_2xx_rate": 0.6, "read_nonok_rate": 0.9})
+    _write(probes.paths.loadgen_summary, document)
+
+    checkout_409 = probes.observe(registry.bind({"query_id": "loadgen.checkout_409_rate"}))
+    frozen_completed = probes.observe(registry.bind({"query_id": "loadgen.frozen_bypass_completed_rate"}))
+    normal_reject = probes.observe(registry.bind({"query_id": "loadgen.normal_path_reject_rate"}))
+
+    assert checkout_409["quality"] == "good" and checkout_409["value"] == 0.4
+    assert frozen_completed["quality"] == "good" and frozen_completed["value"] == 0.6
+    assert normal_reject["quality"] == "good" and normal_reject["value"] == 0.9
+
+    with pytest.raises(ObservationContractError):
+        registry.bind({"query_id": "loadgen.checkout_409_rate", "parameters": {"step": "checkout"}})
 
 
 @pytest.mark.parametrize(

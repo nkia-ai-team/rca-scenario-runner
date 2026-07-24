@@ -201,6 +201,37 @@ INDEX_PRESENT_CONTRACT = {
     "table": "products",
     "index": "idx_products_name",
 }
+# F23-R decisive evidence: number of commerce products at zero stock. Normal
+# consumption saws between 0 and non-zero as ReconciliationBatch restocks
+# every 10 minutes; a halted batch lets this climb and stay pinned.
+INVENTORY_STOCK_CONTRACT = {
+    "db_host": "192.168.122.77",
+    "db_port": 30432,
+    "db_name": "commerce",
+    "db_user": "commerce",
+    "schema": "inventory_schema",
+    "table": "inventory",
+}
+INVENTORY_ZERO_STOCK_SQL = (
+    "SELECT count(*) AS zero_stock_count FROM inventory_schema.inventory WHERE stock = 0"
+)
+# F23-R must_rule_out companion: RESTOCK movement rows in the last 12 minutes
+# (batch period 10m + margin) — zero rows means the reconciliation batch has
+# stopped running, not merely that stock hasn't hit zero yet.
+RESTOCK_MOVEMENT_CONTRACT = {
+    "db_host": "192.168.122.77",
+    "db_port": 30432,
+    "db_name": "commerce",
+    "db_user": "commerce",
+    "schema": "inventory_schema",
+    "table": "inventory_movements",
+    "movement_type": "RESTOCK",
+    "window_minutes": 12,
+}
+RESTOCK_MOVEMENT_SQL = (
+    "SELECT count(*) AS restock_count FROM inventory_schema.inventory_movements "
+    "WHERE movement_type = 'RESTOCK' AND created_at >= now() - interval '12 minutes'"
+)
 DEPLOYMENT_REPLICAS_CONTRACT = {
     "namespace": "rca-testbed-commerce",
     "deployment": "testbed-shipping",
@@ -242,6 +273,15 @@ F20_FOOD_ORDER_TARGET = {
     "namespace": "rca-testbed-food",
     "deployment": "testbed-order",
     "container": "order-service",
+}
+# F25-H watches the commerce PostgreSQL StatefulSet pod through the same OOM
+# observation set as F05/F15/F20 — pod label selector is kind-agnostic
+# (app=testbed-postgres, see APPROVED_K8S_TARGETS), so no new dispatch logic
+# is needed beyond this target allowlist entry.
+F25_H_POSTGRES_TARGET = {
+    "namespace": "rca-testbed-commerce",
+    "deployment": "testbed-postgres",
+    "container": "postgres",
 }
 F05_PAYMENT_BASELINE_RESOURCES = {
     "requests": {"cpu": "200m", "memory": "512Mi"},
@@ -496,6 +536,8 @@ class LiveProbeSet:
             "loadgen.achieved_rps", "loadgen.checkout_5xx_rate",
             "loadgen.write_step_status_rate", "loadgen.read_step_status_rate",
             "loadgen.food_create_status_rate", "loadgen.transfer_2xx_rate",
+            "loadgen.checkout_409_rate", "loadgen.frozen_bypass_completed_rate",
+            "loadgen.normal_path_reject_rate",
         }:
             raise LiveProbeError("unsupported loadgen query")
         document = self._loadgen_live_document()
@@ -506,6 +548,13 @@ class LiveProbeSet:
             "loadgen.read_step_status_rate": "read_nonok_rate",
             "loadgen.food_create_status_rate": "business_5xx_rate",
             "loadgen.transfer_2xx_rate": "business_2xx_rate",
+            # F23-R: business_409_rate is computed by the north-south monitor
+            # (business_step status==409 fraction) alongside business_5xx_rate.
+            "loadgen.checkout_409_rate": "business_409_rate",
+            # F17-P dual-arm reuse: direct arm 2xx rate / control arm reject
+            # rate, both already emitted per business_step/read_step tagging.
+            "loadgen.frozen_bypass_completed_rate": "business_2xx_rate",
+            "loadgen.normal_path_reject_rate": "read_nonok_rate",
         }[query.query_id]
         value = document.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
@@ -640,6 +689,14 @@ class LiveProbeSet:
                 "kubernetes.container_oom_killed",
             }:
                 target = F20_FOOD_ORDER_TARGET
+            elif parameters == F25_H_POSTGRES_TARGET and query.query_id in {
+                "kubernetes.container_memory_current_bytes",
+                "kubernetes.container_memory_limit_bytes",
+                "kubernetes.container_restart_count",
+                "kubernetes.container_last_termination_reason",
+                "kubernetes.container_oom_killed",
+            }:
+                target = F25_H_POSTGRES_TARGET
             else:
                 raise LiveProbeError("payment container target is not allowlisted")
             namespace = target["namespace"]
@@ -958,6 +1015,50 @@ class LiveProbeSet:
             if not isinstance(present, bool):
                 raise LiveProbeError("database index result is invalid")
             return present, _response_time(response, self.clock), "database:index-present"
+        if query.query_id == "database.inventory_stock_level":
+            if dict(query.parameters) != INVENTORY_STOCK_CONTRACT:
+                raise LiveProbeError("inventory stock target is not allowlisted")
+            response = self.database_client(
+                INVENTORY_ZERO_STOCK_SQL, (), credentials=self.database_credentials,
+            )
+            count = response.get("zero_stock_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise LiveProbeError("inventory zero-stock count is invalid")
+            return count, _response_time(response, self.clock), "database:inventory-zero-stock-count"
+        if query.query_id == "database.restock_movement_rate":
+            if dict(query.parameters) != RESTOCK_MOVEMENT_CONTRACT:
+                raise LiveProbeError("restock movement target is not allowlisted")
+            response = self.database_client(
+                RESTOCK_MOVEMENT_SQL, (), credentials=self.database_credentials,
+            )
+            count = response.get("restock_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise LiveProbeError("restock movement count is invalid")
+            return count, _response_time(response, self.clock), "database:restock-movement-count"
+        if query.query_id == "database.integrity_violation_count":
+            # F17-P decisive evidence: transfers that completed against a
+            # FROZEN/CLOSED account since the run's t1 — the dual-arm bypass
+            # signature. 'since' is bound by the caller to the run start time.
+            since = query.parameters.get("since")
+            if set(query.parameters) != {"since"} or not isinstance(since, str) or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", since
+            ):
+                raise LiveProbeError("integrity violation query requires a valid 'since' timestamp")
+            result = self._kubectl(
+                "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
+                "sh", "-lc",
+                "printf 'alter session set container=FREEPDB1;\\n"
+                "set pages 0 feedback off heading off\\n"
+                "select count(*) from banking.transfers t join banking.accounts a "
+                "on a.id in (t.from_account, t.to_account) "
+                "where a.status in (''FROZEN'',''CLOSED'') and t.status=''COMPLETED'' "
+                f"and t.created_at >= to_timestamp(''{since}'', ''YYYY-MM-DD HH24:MI:SS'');\\n"
+                "exit;\\n' | sqlplus -s / as sysdba",
+            )
+            raw = result.stdout.strip()
+            if not re.fullmatch(r"[0-9]+", raw):
+                raise LiveProbeError("integrity violation count is invalid")
+            return int(raw), _aware(self.clock()), "database:integrity-violation-count"
         if query.query_id == "business.order_duplicate_count_since_t1":
             # F15-R non-idempotency guard: a 429-retry that creates a second
             # payment row for one order is the duplicate signature that would
