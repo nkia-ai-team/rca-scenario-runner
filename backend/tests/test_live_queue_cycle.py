@@ -425,3 +425,72 @@ async def test_v2_path_never_writes_cycle_clean_window_excuse(tmp_path: Path) ->
 
     assert state.phase == "waiting_clean_window"
     assert not (runner.artifact_store.root / run_id / "clean-window-excused.json").is_file()
+
+
+class FakeTopologyCollector:
+    def __init__(self, bundle_dir: Path) -> None:
+        self.bundle_dir = Path(bundle_dir)
+        self.started = False
+        self.stopped = False
+        self.run_id = None
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def set_run_id(self, run_id: str) -> None:
+        self.run_id = run_id
+
+
+@pytest.mark.asyncio
+async def test_cycle_injection_writes_topology_bundle_marker(tmp_path: Path) -> None:
+    created: list[FakeTopologyCollector] = []
+
+    def factory(bundle_dir):
+        collector = FakeTopologyCollector(bundle_dir)
+        created.append(collector)
+        return collector
+
+    queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
+    queue.topology_collector_factory = factory
+
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+
+    # Collector started at cycle_reset, bound + marker written at injection.
+    assert created and created[0].started is True
+    assert "cycle-topology" in str(created[0].bundle_dir)
+    assert created[0].run_id == run_id
+    marker = runner.artifact_store.root / run_id / "topology-bundle.path"
+    assert marker.is_file()
+    assert marker.read_text().strip() == str(created[0].bundle_dir)
+
+    # Collector is stopped when the cycle's capture completes.
+    _complete_injection(runner, scheduler, clock, run_id,
+                        t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    state = await queue.tick()  # -> cooldown
+    clock.value = state_expected(state)
+    await queue.tick()  # -> waiting_capture
+    scheduler.jobs[run_id].status = "completed"
+    (runner.artifact_store.root / run_id / "capture-complete.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    await queue.tick()  # capture done
+    assert created[0].stopped is True
+
+
+@pytest.mark.asyncio
+async def test_v2_path_never_writes_topology_bundle_marker(tmp_path: Path) -> None:
+    from tests.test_live_queue import make_queue
+
+    queue, runner, _, scheduler, clock = make_queue(tmp_path)
+    # Even if a factory were present, the v2 path must never touch it.
+    queue.topology_collector_factory = lambda bundle_dir: FakeTopologyCollector(bundle_dir)
+    await queue.start()
+    state = await queue.tick()
+    run_id = state.current_run_id
+
+    assert not (runner.artifact_store.root / run_id / "topology-bundle.path").is_file()
+    assert queue._topology_collector is None

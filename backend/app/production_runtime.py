@@ -835,6 +835,14 @@ class ProductionCaptureInvoker:
         phases_file = self.runs_root / job.run_id / "phases.json"
         if phases_file.is_file():
             args.extend(["--phases-json", str(phases_file)])
+        # Cycle topology bundle (2026-07-24 EventCluster contract): the queue drops
+        # a marker with the per-cycle bundle dir of periodic topology snapshots;
+        # forward it so the case includes the raw topology graph + service tree.
+        topology_marker = self.runs_root / job.run_id / "topology-bundle.path"
+        if topology_marker.is_file():
+            topology_dir = topology_marker.read_text(encoding="utf-8").strip()
+            if topology_dir:
+                args.extend(["--topology-bundle", topology_dir])
         environment = _trusted_environment()
         environment["MODEL_SOURCE"] = str(checkpoint)
         try:

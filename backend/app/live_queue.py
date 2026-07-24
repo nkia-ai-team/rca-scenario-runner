@@ -281,6 +281,7 @@ class LiveScenarioQueue:
         cycle_mode: bool = False,
         cycle_scenario_ids: tuple[str, ...] = CYCLE_SCENARIO_ORDER,
         cycle_health_probe: "Callable[[], str | None] | None" = None,
+        topology_collector_factory: "Callable[[Path], object] | None" = None,
     ) -> None:
         self.runner = runner
         # v3 continuous-cycle mode (off by default; v2 behaviour preserved).
@@ -289,6 +290,10 @@ class LiveScenarioQueue:
         # Returns an error string when the AI stack / stores are unhealthy during
         # the normal lead-in, else None. Default: always healthy (unit tests).
         self.cycle_health_probe = cycle_health_probe
+        # Builds a per-cycle topology snapshot collector at a bundle dir. None
+        # disables periodic topology capture (default; unit tests without it).
+        self.topology_collector_factory = topology_collector_factory
+        self._topology_collector: object | None = None
         self.state_path = state_path
         self.clock = clock or SystemClock()
         self.poll_interval_sec = poll_interval_sec
@@ -827,6 +832,8 @@ class LiveScenarioQueue:
             }
         )
         self._write(state)
+        # Begin periodic topology capture for the whole cycle (normal .. capture).
+        self._start_cycle_topology(state)
         return state
 
     def _tick_cycle_normal(self, state: LiveQueueState) -> LiveQueueState:
@@ -890,6 +897,8 @@ class LiveScenarioQueue:
             return self._restart_cycle(state, f"injection start failed for {scenario_id}: {error}")
         if verdict is not None:
             self._write_preflight(run.run_id, verdict)
+        # Bind the topology bundle to this run so capture forwards --topology-bundle.
+        self._write_topology_bundle_marker(run.run_id)
         now = self.clock.now()
         state = state.model_copy(
             update={
@@ -981,6 +990,8 @@ class LiveScenarioQueue:
             state.current_scenario_id or state.scenario_ids[state.next_index],
             "cycle-complete",
         )
+        # Topology capture ends with the cycle (trainer thaw point).
+        self._stop_cycle_topology()
         self._thaw_trainer()
         completed = [*state.completed_run_ids, state.current_run_id]
         next_index = state.next_index + 1
@@ -1042,6 +1053,9 @@ class LiveScenarioQueue:
         """Restart the current scenario's cycle from trainer_reset. Two
         consecutive restarts are allowed; the third pauses (spec §2.2)."""
         scenario_id = state.current_scenario_id or state.scenario_ids[state.next_index]
+        # The abandoned cycle's topology collector stops now; the fresh cycle_reset
+        # starts a new one.
+        self._stop_cycle_topology()
         # A run that actually started must not linger in the next cycle's overlap
         # window; excuse it before rewinding (only when injection reached a run).
         if state.current_run_id is not None:
@@ -1161,6 +1175,49 @@ class LiveScenarioQueue:
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(raw)
+
+    def _cycle_topology_dir(self, state: LiveQueueState) -> Path:
+        return (
+            self.runner.artifact_store.root
+            / "cycle-topology"
+            / f"{state.queue_id}-{state.next_index}"
+        )
+
+    def _start_cycle_topology(self, state: LiveQueueState) -> None:
+        """Start the per-cycle topology snapshot collector. Fail-open: a factory
+        or start error must never block the cycle."""
+        if self.topology_collector_factory is None:
+            return
+        self._stop_cycle_topology()
+        try:
+            collector = self.topology_collector_factory(self._cycle_topology_dir(state))
+            collector.start()
+            self._topology_collector = collector
+        except Exception:
+            self._topology_collector = None
+
+    def _stop_cycle_topology(self) -> None:
+        collector = self._topology_collector
+        if collector is None:
+            return
+        with suppress(Exception):
+            collector.stop()
+        self._topology_collector = None
+
+    def _write_topology_bundle_marker(self, run_id: str) -> None:
+        """Point the capture invoker at this cycle's topology bundle (fail-open,
+        same pattern as preflight/phases markers). Cycle mode only."""
+        collector = self._topology_collector
+        if collector is None:
+            return
+        with suppress(Exception):
+            collector.set_run_id(run_id)
+        bundle_dir = getattr(collector, "bundle_dir", None)
+        if bundle_dir is None:
+            return
+        path = self.runner.artifact_store.root / run_id / "topology-bundle.path"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{bundle_dir}\n", encoding="utf-8")
 
     def _cycle_contract(self) -> tuple[list[str], str]:
         """Freeze the v3 re-capture scenario list and its digest."""
@@ -1529,6 +1586,7 @@ class LiveScenarioQueue:
         self._task = None
 
     def _pause(self, state: LiveQueueState, reason: str) -> LiveQueueState:
+        self._stop_cycle_topology()
         self._thaw_trainer()
         state = state.model_copy(
             update={"phase": "paused", "reason": reason, "updated_at": self._format(self.clock.now())}
@@ -1537,6 +1595,7 @@ class LiveScenarioQueue:
         return state
 
     def _complete(self, state: LiveQueueState) -> LiveQueueState:
+        self._stop_cycle_topology()
         self._thaw_trainer()
         state = state.model_copy(
             update={
@@ -1596,6 +1655,29 @@ def get_live_queue() -> LiveScenarioQueue:
             from app.preflight_probe import ProductionPreflightProbe
 
             preflight_probe = ProductionPreflightProbe()
+        cycle_mode = os.environ.get("CYCLE_MODE", "").lower() in {"1", "true", "yes", "on"}
+        topology_collector_factory = None
+        if cycle_mode and os.environ.get("TOPOLOGY_SNAPSHOT", "on").lower() not in {
+            "off", "0", "disabled"
+        }:
+            from app.topology_collector import (
+                DEFAULT_INTERVAL_SEC,
+                TopologyCollector,
+                build_query_fetch,
+            )
+
+            interval = int(os.environ.get("TOPOLOGY_SNAPSHOT_INTERVAL_SEC", DEFAULT_INTERVAL_SEC))
+            query_url = os.environ.get("LUCIDA_QUERY_URL", "http://192.168.230.119:18080")
+
+            def topology_collector_factory(bundle_dir: Path) -> TopologyCollector:
+                return TopologyCollector(
+                    bundle_dir=bundle_dir,
+                    fetch=build_query_fetch(query_url=query_url),
+                    clock=SystemClock(),
+                    interval_sec=interval,
+                    query_url=query_url,
+                )
+
         _queue = LiveScenarioQueue(
             runner,
             state_path,
@@ -1605,6 +1687,7 @@ def get_live_queue() -> LiveScenarioQueue:
             functional_readiness_enabled=True,
             golden_reset_enabled=os.environ.get("GOLDEN_RESET_ENABLED", "").lower()
             in {"1", "true", "yes", "on"},
-            cycle_mode=os.environ.get("CYCLE_MODE", "").lower() in {"1", "true", "yes", "on"},
+            cycle_mode=cycle_mode,
+            topology_collector_factory=topology_collector_factory,
         )
     return _queue
