@@ -452,6 +452,14 @@
         "service_name"
       ]
     },
+    "prometheus.jvm_nondaemon_thread_count": {
+      "adapter": "prometheus",
+      "template_id": "otel-jvm-nondaemon-thread-count-v1",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "service_name"
+      ]
+    },
     "database.inventory_stock_level": {
       "adapter": "database",
       "selector": "commerce.inventory.zero_stock_count",

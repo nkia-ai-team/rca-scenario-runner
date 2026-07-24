@@ -84,6 +84,15 @@ PROMETHEUS_TEMPLATES = {
         '(kcm.pod.network_tx_error{namespace="rca-testbed-commerce",'
         'pod=~"testbed-product-.*"})'
     ),
+    # F21-Q/P: no Tomcat-thread-pool metric exists in the APM pipeline —
+    # apm.agent.otel.java.jvm.thread.count (non-daemon sum) is the approved
+    # approximation (live-verified 2026-07-24, jvm_thread_state/host/pid labels
+    # collapsed via `sum without`).
+    "otel-jvm-nondaemon-thread-count-v1": (
+        'sum without(grade,target_id,host_name,process_pid,os_description,os_type,'
+        'host_arch,jvm_thread_state) (apm.agent.otel.java.jvm.thread.count'
+        '{service_name="%s",jvm_thread_daemon="false"})'
+    ),
 }
 APPROVED_SERVICES = frozenset({"commerce-gateway", "commerce-order", "commerce-payment"})
 APPROVED_APM_SERVICES = frozenset(
@@ -92,8 +101,15 @@ APPROVED_APM_SERVICES = frozenset(
      # F20-Q (food order heap pressure) + F20-P (banking transfer/account/api/
      # ledger chain observation).
      "food-delivery-order", "core-banking-transfer", "core-banking-account",
-     "core-banking-api", "core-banking-ledger"}
+     "core-banking-api", "core-banking-ledger",
+     # F02-P (live defect repair — restaurant_p95 was already dispatched by
+     # F02-P's controller but missing from this allowlist) + F24-Q: restaurant
+     # p95/error_rate is the root-cause discriminator signal.
+     "food-delivery-restaurant"}
 )
+# F21-Q/P: JVM non-daemon thread sum approximates the Tomcat 200-thread pool
+# (no Tomcat-specific metric exists in the pipeline — see PROMETHEUS_TEMPLATES).
+APPROVED_JVM_THREAD_SERVICES = frozenset({"food-delivery-order", "core-banking-api"})
 # F19-P: Hikari pending gauge (OTel semconv db.client.connections.pending_requests,
 # live-verified 2026-07-24 on VictoriaMetrics 119:18428).
 # F20-P: transfer's own Hikari pool occupied by the trunc() full-scan stats
@@ -125,6 +141,13 @@ APPROVED_K8S_TARGETS = {
     # F16-H watches the user pod dropping NotReady under its readinessProbe
     # fault while the gateway fail-closes every write route with 401.
     ("rca-testbed-commerce", "testbed-user"): "app=testbed-user",
+    # F21-P watches the banking api pod while its Tomcat 200 thread pool
+    # saturates (109 kubectl-verified 2026-07-24: app=testbed-api).
+    ("rca-testbed-banking", "testbed-api"): "app=testbed-api",
+    # F24-Q (+ F02-P live defect repair) watches the restaurant pod while its
+    # Hikari/Tomcat pool saturates under load.north_south flood on NodePort
+    # 30181 (109 k8s manifest-verified 2026-07-24: app=testbed-restaurant).
+    ("rca-testbed-food", "testbed-restaurant"): "app=testbed-restaurant",
 }
 F12_PRODUCT_TARGET = {
     "namespace": "rca-testbed-commerce",
@@ -605,6 +628,13 @@ class LiveProbeSet:
             service = query.parameters["service_name"]
             if service not in APPROVED_HIKARI_SERVICES:
                 raise LiveProbeError("Hikari service_name is not allowlisted")
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % service
+        elif query.query_id == "prometheus.jvm_nondaemon_thread_count":
+            if set(query.parameters) != {"service_name"}:
+                raise LiveProbeError("JVM thread query requires the fixed service parameter")
+            service = query.parameters["service_name"]
+            if service not in APPROVED_JVM_THREAD_SERVICES:
+                raise LiveProbeError("JVM thread service_name is not allowlisted")
             promql = PROMETHEUS_TEMPLATES[query.template_id] % service
         elif query.query_id == "prometheus.container_cpu_throttled_time":
             if dict(query.parameters) != F12_PRODUCT_TARGET:

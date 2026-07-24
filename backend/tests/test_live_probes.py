@@ -633,6 +633,71 @@ def test_gateway_apm_p95_is_an_approved_live_observation(tmp_path) -> None:
     )
 
 
+def test_restaurant_apm_p95_and_error_rate_are_approved_live_observations(tmp_path) -> None:
+    # F02-P (live defect repair) + F24-Q: food-delivery-restaurant was missing
+    # from APPROVED_APM_SERVICES even though F02-P's controller already
+    # dispatches restaurant_p95 — this closes that gap.
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    requests = [
+        {
+            "query_id": "prometheus.apm_service_p95",
+            "parameters": {"service_name": "food-delivery-restaurant"},
+        },
+        {
+            "query_id": "prometheus.apm_service_error_rate",
+            "parameters": {"service_name": "food-delivery-restaurant"},
+        },
+    ]
+
+    values = {item["query_id"]: probes.observe(registry.bind(item)) for item in requests}
+
+    assert all(item["quality"] == "good" for item in values.values())
+
+
+def test_jvm_nondaemon_thread_count_is_approved_for_f21_targets(tmp_path) -> None:
+    # F21-Q/P: no Tomcat-thread-pool metric exists — the JVM non-daemon thread
+    # sum is the approved approximation, allowlisted for order and api only.
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+
+    order = probes.observe(
+        registry.bind(
+            {
+                "query_id": "prometheus.jvm_nondaemon_thread_count",
+                "parameters": {"service_name": "food-delivery-order"},
+            }
+        )
+    )
+    api = probes.observe(
+        registry.bind(
+            {
+                "query_id": "prometheus.jvm_nondaemon_thread_count",
+                "parameters": {"service_name": "core-banking-api"},
+            }
+        )
+    )
+    rejected = probes.observe(
+        registry.bind(
+            {
+                "query_id": "prometheus.jvm_nondaemon_thread_count",
+                "parameters": {"service_name": "commerce-order"},
+            }
+        )
+    )
+
+    assert order["quality"] == "good" and api["quality"] == "good"
+    assert rejected["quality"] == "error" and rejected["value"] is None
+    rendered = parse_qs(fakes.http_calls[-1][2]["body"].decode())["query"][0]
+    assert rendered == (
+        "sum without(grade,target_id,host_name,process_pid,os_description,os_type,"
+        'host_arch,jvm_thread_state) (apm.agent.otel.java.jvm.thread.count'
+        '{service_name="core-banking-api",jvm_thread_daemon="false"})'
+    )
+
+
 def test_f06g_pulse_and_payment_duplicate_observations_are_run_scoped(tmp_path) -> None:
     fakes = Fakes()
     probes = _probes(tmp_path, fakes)
@@ -813,6 +878,34 @@ def test_kubernetes_probe_uses_the_allowlisted_scenario_target(
                 "namespace": "rca-testbed-commerce",
                 "resource": resource,
             },
+        }
+    )
+
+    observed = probes.observe(query)
+
+    assert observed["quality"] == "good"
+    argv = next(argv for argv, _ in fakes.process_calls if "pods" in argv)
+    assert argv[argv.index("--selector") + 1] == selector
+
+
+@pytest.mark.parametrize(
+    ("namespace", "resource", "selector"),
+    [
+        # F21-P watches the banking api pod (109 kubectl-verified label).
+        ("rca-testbed-banking", "testbed-api", "app=testbed-api"),
+        # F24-Q (+ F02-P live defect repair) watches the restaurant pod.
+        ("rca-testbed-food", "testbed-restaurant", "app=testbed-restaurant"),
+    ],
+)
+def test_kubernetes_probe_uses_the_allowlisted_cross_namespace_target(
+    tmp_path, namespace: str, resource: str, selector: str
+) -> None:
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    query = ApprovedQueryRegistry.from_path().bind(
+        {
+            "query_id": "kubernetes.pod_ready",
+            "parameters": {"namespace": namespace, "resource": resource},
         }
     )
 
