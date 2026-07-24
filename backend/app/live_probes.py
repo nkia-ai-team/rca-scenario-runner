@@ -104,6 +104,9 @@ APPROVED_K8S_TARGETS = {
     # F15-T1 watches the food payment pod readiness through its OOM ladder.
     ("rca-testbed-food", "testbed-payment"): "app=testbed-payment",
     ("rca-testbed-banking", "testbed-oracle"): "app=testbed-oracle",
+    # F17-R watches the banking transfer pod dropping NotReady under its
+    # readinessProbe fault while commerce checkout degrades cross-domain.
+    ("rca-testbed-banking", "testbed-transfer"): "app=testbed-transfer",
 }
 F12_PRODUCT_TARGET = {
     "namespace": "rca-testbed-commerce",
@@ -173,6 +176,7 @@ APPROVED_DEPLOYMENT_REPLICA_TARGETS = frozenset(
         ("rca-testbed-commerce", "testbed-shipping"),
         ("rca-testbed-commerce", "testbed-payment"),
         ("rca-testbed-commerce", "testbed-product"),
+        ("rca-testbed-banking", "testbed-transfer"),
     }
 )
 F05_PAYMENT_TARGET = {
@@ -187,6 +191,13 @@ F15_FOOD_PAYMENT_TARGET = {
     "namespace": "rca-testbed-food",
     "deployment": "testbed-payment",
     "container": "payment-service",
+}
+# F17-R must_rule_out: a rising transfer restart count would mean crashloop,
+# not the injected readiness fault — only the restart-count query is shared.
+F17_TRANSFER_TARGET = {
+    "namespace": "rca-testbed-banking",
+    "deployment": "testbed-transfer",
+    "container": "transfer-service",
 }
 F05_PAYMENT_BASELINE_RESOURCES = {
     "requests": {"cpu": "200m", "memory": "512Mi"},
@@ -559,6 +570,8 @@ class LiveProbeSet:
                 target = F05_PAYMENT_TARGET
             elif parameters == F15_FOOD_PAYMENT_TARGET and query.query_id in food_shared_ids:
                 target = F15_FOOD_PAYMENT_TARGET
+            elif parameters == F17_TRANSFER_TARGET and query.query_id == "kubernetes.container_restart_count":
+                target = F17_TRANSFER_TARGET
             else:
                 raise LiveProbeError("payment container target is not allowlisted")
             namespace = target["namespace"]
@@ -599,7 +612,7 @@ class LiveProbeSet:
                 )
             result = self._kubectl(
                 "get", "pods", "--namespace", namespace,
-                "--selector", "app=testbed-payment", "-o", "json",
+                "--selector", f"app={deployment}", "-o", "json",
             )
             items = json.loads(result.stdout).get("items", [])
             active = [item for item in items if item.get("metadata", {}).get("deletionTimestamp") is None]
