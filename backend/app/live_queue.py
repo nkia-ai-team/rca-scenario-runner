@@ -103,9 +103,22 @@ CYCLE_SCENARIO_ORDER = (
     "F11-G",
     "F11-R",
 )
-CYCLE_NORMAL_DURATION = timedelta(hours=2)
-CYCLE_BUFFER_DURATION = timedelta(minutes=10)
-CYCLE_COOLDOWN_DURATION = timedelta(minutes=30)
+def _cycle_duration(env_name: str, default: timedelta) -> timedelta:
+    """Contract v3 phase length, overridable in seconds for shortened smoke
+    cycles (capture derives its window from phases.json, so shortened cycles
+    stay internally consistent). Production leaves these unset."""
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    seconds = int(raw)
+    if seconds <= 0:
+        raise ValueError(f"{env_name} must be a positive integer of seconds: {raw}")
+    return timedelta(seconds=seconds)
+
+
+CYCLE_NORMAL_DURATION = _cycle_duration("CYCLE_NORMAL_SEC", timedelta(hours=2))
+CYCLE_BUFFER_DURATION = _cycle_duration("CYCLE_BUFFER_SEC", timedelta(minutes=10))
+CYCLE_COOLDOWN_DURATION = _cycle_duration("CYCLE_COOLDOWN_SEC", timedelta(minutes=30))
 # Same-scenario cycle restarts are bounded to break infinite loops: two
 # consecutive restarts are allowed, the third pauses (spec §2.2 resume table).
 MAX_CYCLE_RESTARTS = 2
