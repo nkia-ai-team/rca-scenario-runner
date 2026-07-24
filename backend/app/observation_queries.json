@@ -209,6 +209,17 @@
         "index"
       ]
     },
+    "database.pg_slow_active_query_count": {
+      "adapter": "database",
+      "selector": "postgres.pg_stat_activity.slow_active_count",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "db_host",
+        "db_port",
+        "db_name",
+        "db_user"
+      ]
+    },
     "database.oracle_tagged_session_count": {
       "adapter": "database",
       "selector": "oracle.client_identifier.session_count",

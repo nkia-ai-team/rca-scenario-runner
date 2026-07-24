@@ -88,11 +88,17 @@ PROMETHEUS_TEMPLATES = {
 APPROVED_SERVICES = frozenset({"commerce-gateway", "commerce-order", "commerce-payment"})
 APPROVED_APM_SERVICES = frozenset(
     {"commerce-gateway", "commerce-product", "commerce-order", "commerce-pricing",
-     "commerce-payment", "food-delivery-payment"}
+     "commerce-payment", "food-delivery-payment",
+     # F20-Q (food order heap pressure) + F20-P (banking transfer/account/api/
+     # ledger chain observation).
+     "food-delivery-order", "core-banking-transfer", "core-banking-account",
+     "core-banking-api", "core-banking-ledger"}
 )
 # F19-P: Hikari pending gauge (OTel semconv db.client.connections.pending_requests,
 # live-verified 2026-07-24 on VictoriaMetrics 119:18428).
-APPROVED_HIKARI_SERVICES = frozenset({"food-delivery-order"})
+# F20-P: transfer's own Hikari pool occupied by the trunc() full-scan stats
+# query — the decisive "own connection pool contention" signal for F20-P.
+APPROVED_HIKARI_SERVICES = frozenset({"food-delivery-order", "core-banking-transfer"})
 APPROVED_NODE_TARGETS = frozenset({"tb-w1", "tb-w2", "tb-w3"})
 APPROVED_BUSINESS_KEYS = frozenset({"checkout", "order-1"})
 APPROVED_K8S_TARGETS = {
@@ -170,6 +176,22 @@ PAYMENT_DUPLICATE_SINCE_T1_SQL = (
     "(current_setting('lucida.payment_t1')::timestamptz AT TIME ZONE 'UTC') "
     "GROUP BY order_id HAVING count(*) > 1) AS duplicates"
 )
+# F20-R decisive evidence: count of backends actively running a query for
+# more than 2s on the shared commerce PostgreSQL instance — the ground truth
+# for "the instance is busy with slow scans" that node_cpu_utilization (node-
+# level proxy) can't isolate. Instance-wide (not schema-filtered) because the
+# cross-schema oison signature is exactly that unrelated schemas' backends
+# also show up as long-running while order-service floods it with full scans.
+PG_SLOW_ACTIVE_QUERY_SQL = (
+    "SELECT count(*) AS slow_active_count FROM pg_stat_activity "
+    "WHERE state = 'active' AND now() - query_start > interval '2 seconds'"
+)
+PG_SLOW_ACTIVE_QUERY_CONTRACT = {
+    "db_host": "192.168.122.77",
+    "db_port": 30432,
+    "db_name": "commerce",
+    "db_user": "commerce",
+}
 INDEX_PRESENT_CONTRACT = {
     "db_host": "192.168.122.77",
     "db_port": 30432,
@@ -211,6 +233,15 @@ F17_TRANSFER_TARGET = {
     "namespace": "rca-testbed-banking",
     "deployment": "testbed-transfer",
     "container": "transfer-service",
+}
+# F20-Q decisive evidence: the food order-service container climbing toward
+# its 1Gi memory limit as the unpaged/GROUP-BY-DATE() slowquery journeys load
+# unbounded result sets into the JVM heap. Memory + restart-count + OOM
+# queries are shared with the F05/F15 payment OOM ladder shape.
+F20_FOOD_ORDER_TARGET = {
+    "namespace": "rca-testbed-food",
+    "deployment": "testbed-order",
+    "container": "order-service",
 }
 F05_PAYMENT_BASELINE_RESOURCES = {
     "requests": {"cpu": "200m", "memory": "512Mi"},
@@ -601,6 +632,14 @@ class LiveProbeSet:
                 target = F15_FOOD_PAYMENT_TARGET
             elif parameters == F17_TRANSFER_TARGET and query.query_id == "kubernetes.container_restart_count":
                 target = F17_TRANSFER_TARGET
+            elif parameters == F20_FOOD_ORDER_TARGET and query.query_id in {
+                "kubernetes.container_memory_current_bytes",
+                "kubernetes.container_memory_limit_bytes",
+                "kubernetes.container_restart_count",
+                "kubernetes.container_last_termination_reason",
+                "kubernetes.container_oom_killed",
+            }:
+                target = F20_FOOD_ORDER_TARGET
             else:
                 raise LiveProbeError("payment container target is not allowlisted")
             namespace = target["namespace"]
@@ -703,7 +742,9 @@ class LiveProbeSet:
             )
             return ready, _aware(self.clock()), f"kubernetes:node:{node}:ready"
         if query.query_id == "kubernetes.deployment_container_memory_limit":
-            if dict(query.parameters) not in (F05_PAYMENT_TARGET, F15_FOOD_PAYMENT_TARGET):
+            if dict(query.parameters) not in (
+                F05_PAYMENT_TARGET, F15_FOOD_PAYMENT_TARGET, F20_FOOD_ORDER_TARGET,
+            ):
                 raise LiveProbeError("container memory limit target is not allowlisted")
             namespace = str(query.parameters["namespace"])
             deployment = str(query.parameters["deployment"])
@@ -891,6 +932,16 @@ class LiveProbeSet:
                 _response_time(response, self.clock),
                 "database:payment-duplicate-order-count-since-t1",
             )
+        if query.query_id == "database.pg_slow_active_query_count":
+            if dict(query.parameters) != PG_SLOW_ACTIVE_QUERY_CONTRACT:
+                raise LiveProbeError("PG slow-query target is not allowlisted")
+            response = self.database_client(
+                PG_SLOW_ACTIVE_QUERY_SQL, (), credentials=self.database_credentials,
+            )
+            count = response.get("slow_active_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise LiveProbeError("PG slow active query count is invalid")
+            return count, _response_time(response, self.clock), "database:pg-slow-active-query-count"
         if query.query_id == "database.index_present":
             if dict(query.parameters) != INDEX_PRESENT_CONTRACT:
                 raise LiveProbeError("database index target is not allowlisted")
