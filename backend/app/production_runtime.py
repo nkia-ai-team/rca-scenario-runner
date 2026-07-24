@@ -346,6 +346,7 @@ def production_runtime(
     process_runner: ProcessRunner = subprocess.run,
     live_probes: LiveProbeSet | None = None,
     artifact_fallback: bool = False,
+    skip_isolation_checks: bool = False,
 ) -> AdaptiveRuntime:
     if run_dir is not None:
         store = RunArtifactStore(run_dir.parent)
@@ -401,6 +402,7 @@ def production_runtime(
         approved_profile_id=approved,
         spec=scenario.controller,
         clock=clock,
+        skip_isolation_checks=skip_isolation_checks,
         eligibility_probe=(
             ArtifactEligibilityProbe(evidence_path, clock=clock)
             if asynchronous_probes is None

@@ -60,8 +60,9 @@ class Runner:
         self.current = None
         self.started: list[tuple[str, str]] = []
 
-    async def start(self, *, scenario_id: str, mode: str):
+    async def start(self, *, scenario_id: str, mode: str, skip_isolation_checks: bool = False):
         self.started.append((scenario_id, mode))
+        self.skip_isolation_checks_seen = skip_isolation_checks
         self.current = RunInfo(
             run_id=f"run-{scenario_id}-{len(self.started)}",
             scenario_id=scenario_id,
@@ -494,3 +495,56 @@ async def test_v2_path_never_writes_topology_bundle_marker(tmp_path: Path) -> No
 
     assert not (runner.artifact_store.root / run_id / "topology-bundle.path").is_file()
     assert queue._topology_collector is None
+
+
+@pytest.mark.asyncio
+async def test_cycle_injection_opts_out_of_isolation_checks(tmp_path: Path) -> None:
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    # The cycle path tells the runner to skip clean-window / scenario_overlap so a
+    # prior cycle run left inside the 30m overlap window cannot block injection.
+    assert runner.skip_isolation_checks_seen is True
+
+
+@pytest.mark.asyncio
+async def test_resume_resets_cycle_restart_counts(tmp_path: Path) -> None:
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    await queue.start()
+    state = await queue.tick()  # -> cycle_normal
+    # Simulate a scenario that already burned its restart budget.
+    queue._write(state.model_copy(update={"cycle_restart_counts": {"F01-R": 2}}))
+    paused = queue._pause(queue.snapshot(), "operator halt")
+    assert paused.phase == "paused"
+
+    resumed = await queue.resume()
+    assert resumed.phase == "cycle_reset"
+    assert resumed.cycle_restart_counts == {}
+
+
+@pytest.mark.asyncio
+async def test_collector_restart_wipes_stale_bundle_dir(tmp_path: Path) -> None:
+    gen = {"n": 0}
+
+    def factory(bundle_dir):
+        directory = Path(bundle_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"gen{gen['n']}.json").write_text("x", encoding="utf-8")
+        gen["n"] += 1
+        return FakeTopologyCollector(bundle_dir)
+
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    queue.topology_collector_factory = factory
+    await queue.start()
+    await queue.tick()  # cycle_reset -> normal, starts collector (writes gen0)
+
+    bundle = queue._cycle_topology_dir(queue.snapshot())
+    assert (bundle / "gen0.json").is_file()
+    # An orphan left by the previous collector instance (manifest can't cover it).
+    (bundle / "orphan.json").write_text("stale", encoding="utf-8")
+
+    # A restart reuses the same bundle dir; the wipe must clear stale files so the
+    # fresh manifest exactly describes the directory (capture ingest contract).
+    queue._start_cycle_topology(queue.snapshot())
+    assert not (bundle / "gen0.json").exists()
+    assert not (bundle / "orphan.json").exists()
+    assert (bundle / "gen1.json").is_file()

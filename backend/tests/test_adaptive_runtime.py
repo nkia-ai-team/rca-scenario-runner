@@ -477,3 +477,66 @@ async def test_slightly_future_observed_at_is_not_marked_stale() -> None:
     for name, signal in tick["signals"].items():
         assert signal["freshness"] == "fresh", name
         assert signal["usable"] is True, name
+
+
+def _isolation_evidence(now):
+    # A dirty clean-window (check_results false) plus a lingering overlap — the
+    # exact shape a prior cycle run leaves inside the 30m overlap window.
+    return EligibilityEvidence(
+        checked_at=now,
+        source="fake:baseline-store",
+        quality="good",
+        check_results={"clean-window": False, "baseline-traffic": True},
+        clean_window_start=now - timedelta(minutes=5),  # too short for v2
+        clean_window_end=now,
+        overlapping_run_ids=["prev-cycle-run"],
+        baseline_active=True,
+    )
+
+
+def test_v2_isolation_gates_block_on_overlap_and_clean_window():
+    from app.adaptive_runtime import EligibilityRequest, _eligibility_reasons
+
+    now = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
+    request = EligibilityRequest(
+        run_id="r", scenario_id="F01-H",
+        checks=["clean-window", "baseline-traffic"],
+        clean_window_sec=1800, requested_at=now,
+    )
+    reasons = _eligibility_reasons(request, _isolation_evidence(now))
+    assert "check_failed:clean-window" in reasons
+    assert "scenario_overlap" in reasons
+    assert "clean_window_too_short" in reasons
+
+
+def test_cycle_skip_isolation_suppresses_clean_window_and_overlap():
+    from app.adaptive_runtime import EligibilityRequest, _eligibility_reasons
+
+    now = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
+    request = EligibilityRequest(
+        run_id="r", scenario_id="F01-H",
+        checks=["clean-window", "baseline-traffic"],
+        clean_window_sec=1800, requested_at=now,
+    )
+    reasons = _eligibility_reasons(
+        request, _isolation_evidence(now), skip_isolation_checks=True
+    )
+    assert "check_failed:clean-window" not in reasons
+    assert "scenario_overlap" not in reasons
+    assert "clean_window_too_short" not in reasons
+    assert "clean_window_after_check" not in reasons
+    # Non-isolation gates still apply.
+    assert reasons == []
+
+
+def test_skip_isolation_still_enforces_baseline_active():
+    from app.adaptive_runtime import EligibilityRequest, _eligibility_reasons
+
+    now = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
+    request = EligibilityRequest(
+        run_id="r", scenario_id="F01-H",
+        checks=["baseline-traffic"], clean_window_sec=1800, requested_at=now,
+    )
+    evidence = _isolation_evidence(now).model_copy(update={"baseline_active": False})
+    reasons = _eligibility_reasons(request, evidence, skip_isolation_checks=True)
+    assert "baseline_inactive" in reasons

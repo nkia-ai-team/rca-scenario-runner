@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -468,6 +469,9 @@ class LiveScenarioQueue:
                         "cycle_buffer_started_at": None,
                         "cycle_golden_id": None,
                         "cycle_golden_sha256": None,
+                        # Operator resume clears the restart budget: a fixed blocker
+                        # shouldn't leave a stale count that pauses again immediately.
+                        "cycle_restart_counts": {},
                         "phase_started_at": now,
                         "expected_transition_at": now,
                         "reason": None,
@@ -892,7 +896,12 @@ class LiveScenarioQueue:
                     state, f"preflight not clean at buffer end ({verdict.verdict})"
                 )
         try:
-            run = await self.runner.start(scenario_id=scenario_id, mode="run")
+            # The cycle time axis provides injection separation, so opt out of the
+            # v2 clean-window / scenario_overlap eligibility gates (root fix for the
+            # abandoned-run overlap that the exemption marker only patched).
+            run = await self.runner.start(
+                scenario_id=scenario_id, mode="run", skip_isolation_checks=True
+            )
         except Exception as error:
             return self._restart_cycle(state, f"injection start failed for {scenario_id}: {error}")
         if verdict is not None:
@@ -1190,7 +1199,13 @@ class LiveScenarioQueue:
             return
         self._stop_cycle_topology()
         try:
-            collector = self.topology_collector_factory(self._cycle_topology_dir(state))
+            bundle_dir = self._cycle_topology_dir(state)
+            # A restart reuses the same bundle dir (queue_id-next_index); wipe any
+            # prior instance's files first so the fresh manifest exactly describes
+            # the directory contents (capture ingest contract: manifest covers all).
+            if bundle_dir.exists():
+                shutil.rmtree(bundle_dir)
+            collector = self.topology_collector_factory(bundle_dir)
             collector.start()
             self._topology_collector = collector
         except Exception:

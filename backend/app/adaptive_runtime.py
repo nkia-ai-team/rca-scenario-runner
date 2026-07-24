@@ -155,6 +155,10 @@ class ControllerSession(StrictModel):
     cleanup: CleanupEvidence | None = None
     recovery: RecoveryEvidence | None = None
     terminal_at: datetime | None = None
+    # v3 continuous cycle opts out of the clean-window/scenario_overlap isolation
+    # gates (the cycle time axis provides separation). Persisted so restart keeps
+    # the same decision. Default False = v2 behaviour unchanged.
+    skip_isolation_checks: bool = False
 
     @model_validator(mode="after")
     def validate_evaluation_profile(self) -> "ControllerSession":
@@ -263,6 +267,7 @@ class AdaptiveRuntime:
         eligibility_probe: ReadOnlyEligibilityProbe,
         poller: ObservationPoller,
         applier: ProfileApplier,
+        skip_isolation_checks: bool = False,
     ) -> "AdaptiveRuntime":
         session = ControllerSession(
             run_id=run_id,
@@ -272,6 +277,7 @@ class AdaptiveRuntime:
             approved_profile_id=approved_profile_id,
             spec=spec,
             created_at=_aware(clock.now()),
+            skip_isolation_checks=skip_isolation_checks,
         )
         return cls(
             session,
@@ -314,7 +320,9 @@ class AdaptiveRuntime:
             requested_at=now,
         )
         evidence = await _maybe_await(self.eligibility_probe.inspect(request))
-        reasons = _eligibility_reasons(request, evidence)
+        reasons = _eligibility_reasons(
+            request, evidence, skip_isolation_checks=self.session.skip_isolation_checks
+        )
         self.session = self.session.model_copy(
             update={
                 "eligibility": evidence,
@@ -672,25 +680,34 @@ class AdaptiveRuntime:
 
 
 def _eligibility_reasons(
-    request: EligibilityRequest, evidence: EligibilityEvidence
+    request: EligibilityRequest,
+    evidence: EligibilityEvidence,
+    *,
+    skip_isolation_checks: bool = False,
 ) -> list[str]:
     requested_at = _aware(request.requested_at)
     checked_at = _aware(evidence.checked_at)
     window_start = _aware(evidence.clean_window_start)
     window_end = _aware(evidence.clean_window_end)
+    # The clean-window and scenario_overlap gates are v2-queue isolation
+    # guarantees. The v3 continuous cycle (reset + 2h normal + buffer) already
+    # separates injections on its own time axis, so it opts out of both — the
+    # previous cycle's run legitimately sits inside the 30m overlap window.
     reasons = [
         f"check_failed:{check}"
         for check in request.checks
         if evidence.check_results.get(check) is not True
+        and not (skip_isolation_checks and check == "clean-window")
     ]
     window = (window_end - window_start).total_seconds()
-    if window < request.clean_window_sec:
-        reasons.append("clean_window_too_short")
-    if window_end > checked_at:
-        reasons.append("clean_window_after_check")
+    if not skip_isolation_checks:
+        if window < request.clean_window_sec:
+            reasons.append("clean_window_too_short")
+        if window_end > checked_at:
+            reasons.append("clean_window_after_check")
     if checked_at < requested_at:
         reasons.append("eligibility_before_request")
-    if evidence.overlapping_run_ids:
+    if evidence.overlapping_run_ids and not skip_isolation_checks:
         reasons.append("scenario_overlap")
     if not evidence.baseline_active:
         reasons.append("baseline_inactive")

@@ -243,6 +243,8 @@ class ScenarioRunner:
         self,
         scenario_id: str,
         mode: Literal["run", "cleanup"],
+        *,
+        skip_isolation_checks: bool = False,
     ) -> RunInfo:
         scenario = get_scenario(scenario_id)
         external_manifest = None
@@ -388,6 +390,7 @@ class ScenarioRunner:
                 fencing_token=lease.fencing_token,
                 manual_dirty_cleanup=manual_dirty_cleanup,
                 run_dir=run_dir,
+                skip_isolation_checks=skip_isolation_checks,
             )
         )
         return self.get_current()  # type: ignore[return-value]
@@ -515,6 +518,7 @@ class ScenarioRunner:
         fencing_token: int,
         manual_dirty_cleanup: bool,
         run_dir: Path | None,
+        skip_isolation_checks: bool = False,
     ) -> None:
         assert self._current is not None
         run_id = self._current.run_id
@@ -544,6 +548,7 @@ class ScenarioRunner:
                         fencing_token=fencing_token,
                         run_dir=run_dir,
                         log_file=log_file,
+                        skip_isolation_checks=skip_isolation_checks,
                     )
                 else:
                     exit_code = await self._invoke_once(
@@ -709,6 +714,7 @@ class ScenarioRunner:
         fencing_token: int,
         run_dir: Path,
         log_file=None,
+        skip_isolation_checks: bool = False,
     ) -> tuple[int, object | None]:
         """Drive and persist a controller session; effects stay dependency-bound."""
 
@@ -739,6 +745,7 @@ class ScenarioRunner:
                     ),
                     dispatcher=self.dispatcher_path,
                     run_dir=run_dir,
+                    skip_isolation_checks=skip_isolation_checks,
                 )
             session = await runtime.begin()
             self.artifact_store.persist_session(
