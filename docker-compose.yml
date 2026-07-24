@@ -84,6 +84,11 @@ services:
       - PG_PASSWORD=${PG_PASSWORD:-}
       - CH_PASSWORD=${CH_PASSWORD:-}
       - MODEL_SNAPSHOT_SSH_TARGET=${MODEL_SNAPSHOT_SSH_TARGET:-}
+      # trainer-reset(golden) 활성화 (2026-07-21)
+      - GOLDEN_RESET_ENABLED=${GOLDEN_RESET_ENABLED:-}
+      - GOLDEN_STORE_ROOT=${GOLDEN_STORE_ROOT:-/data/eval-cases/goldens}
+      - RESTORE_SCRIPT=${RESTORE_SCRIPT:-/opt/lucida/restore-golden-state.sh}
+      - PG_USER=${PG_USER:-lucida}
       # 신계약 캡처의 토폴로지 스냅샷용 query API 로그인
       - QUERY_API_URL=${QUERY_API_URL:-http://192.168.230.119:18080}
       - QUERY_API_USER=${QUERY_API_USER:-manager}
