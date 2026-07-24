@@ -334,7 +334,13 @@ class LiveScenarioQueue:
         for name in self.required_env:
             checks[f"env:{name}"] = bool(os.environ.get(name))
         try:
-            self._queue_contract()
+            # Cycle mode freezes its own 13-scenario contract; the v2 live
+            # registry contract must not gate it (registry edits for other
+            # work would otherwise block the cycle queue).
+            if self.cycle_mode:
+                self._cycle_contract()
+            else:
+                self._queue_contract()
             checks["live_manifest_snapshot"] = True
         except Exception:
             checks["live_manifest_snapshot"] = False
