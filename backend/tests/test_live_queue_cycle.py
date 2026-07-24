@@ -354,3 +354,74 @@ async def test_resume_from_pause_reenters_cycle_reset(tmp_path: Path) -> None:
     assert resumed.phase == "cycle_reset"
     assert resumed.current_scenario_id is None
     assert resumed.cycle_started_at is None
+
+
+@pytest.mark.asyncio
+async def test_cycle_restart_excuses_failed_run_from_clean_window(tmp_path: Path) -> None:
+    queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+
+    # Injection produced a failed (non-dirty) run -> cycle restarts.
+    runner.current = runner.current.model_copy(update={"status": "failed", "dirty": False})
+    state = await queue.tick()
+    assert state.phase == "cycle_reset"
+    assert state.cycle_restart_counts == {"F01-R": 1}
+
+    marker = runner.artifact_store.root / run_id / "clean-window-excused.json"
+    assert marker.is_file()
+    doc = json.loads(marker.read_text())
+    assert doc["reason"] == "cycle-restart"
+    assert doc["scenario_id"] == "F01-R"
+    assert doc["excused_at"].endswith("Z")
+
+
+@pytest.mark.asyncio
+async def test_cycle_capture_complete_excuses_run_from_clean_window(tmp_path: Path) -> None:
+    queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+    _complete_injection(runner, scheduler, clock, run_id,
+                        t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    state = await queue.tick()  # -> cooldown
+    clock.value = state_expected(state)
+    await queue.tick()  # -> waiting_capture
+
+    scheduler.jobs[run_id].status = "completed"
+    (runner.artifact_store.root / run_id / "capture-complete.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    state = await queue.tick()  # capture done -> next cycle_reset
+    assert state.phase == "cycle_reset"
+
+    marker = runner.artifact_store.root / run_id / "clean-window-excused.json"
+    assert marker.is_file()
+    assert json.loads(marker.read_text())["reason"] == "cycle-complete"
+
+
+@pytest.mark.asyncio
+async def test_v2_path_never_writes_cycle_clean_window_excuse(tmp_path: Path) -> None:
+    # The v2 queue (CYCLE_MODE off) must not gain the cycle exemption marker on
+    # its normal capture-complete path.
+    from tests.test_live_queue import make_queue
+
+    queue, runner, _, scheduler, clock = make_queue(tmp_path)
+    await queue.start()
+    state = await queue.tick()
+    run_id = state.current_run_id
+    runner.current = runner.current.model_copy(
+        update={"status": "succeeded", "finished_at": clock.now(), "exit_code": 0}
+    )
+    scheduler.jobs[run_id] = SimpleNamespace(
+        status="pending", t2="2026-07-16T08:10:00Z", failure=None
+    )
+    await queue.tick()  # -> waiting_capture
+    scheduler.jobs[run_id].status = "completed"
+    capture = runner.artifact_store.root / run_id / "capture-complete.json"
+    capture.parent.mkdir(parents=True, exist_ok=True)
+    capture.write_text("{}\n", encoding="utf-8")
+    runner.current = None
+    state = await queue.tick()  # -> waiting_clean_window (v2)
+
+    assert state.phase == "waiting_clean_window"
+    assert not (runner.artifact_store.root / run_id / "clean-window-excused.json").is_file()

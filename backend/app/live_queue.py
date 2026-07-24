@@ -92,19 +92,22 @@ TRANSIENT_AUTO_RETRY_PREFIXES = ("profile_apply_failed:",)
 # physically ineffective (2,016-row table, no symptom), so its ground truth is
 # false (2026-07-24 redesign CUT, user-confirmed). The four G negatives stay —
 # restored registry wiring ships with the same decision.
+# Order: eight positives first, the four G negatives last — G needs re-calibration
+# (2026-07-24 smoke: F01-G adaptive aborted with must_rule_out), so leading with G
+# kept stalling the queue on calibration issues.
 CYCLE_SCENARIO_ORDER = (
-    "F01-G",
     "F01-H",
     "F01-R",
-    "F03-G",
     "F04-R",
-    "F05-G",
     "F06-R",
     "F07-H",
     "F08-H",
     "F09-P",
-    "F11-G",
     "F11-R",
+    "F01-G",
+    "F03-G",
+    "F05-G",
+    "F11-G",
 )
 def _cycle_duration(env_name: str, default: timedelta) -> timedelta:
     """Contract v3 phase length, overridable in seconds for shortened smoke
@@ -971,6 +974,13 @@ class LiveScenarioQueue:
             self.runner.artifact_store.root / state.current_run_id / "capture-complete.json"
         ).is_file():
             return self._pause(state, f"capture completion evidence missing: {state.current_run_id}")
+        # Exempt this completed run from the next cycle's clean-window overlap gate
+        # (its captured residue is separated by the next reset + 2h normal lead-in).
+        self._write_cycle_clean_window_excuse(
+            state.current_run_id,
+            state.current_scenario_id or state.scenario_ids[state.next_index],
+            "cycle-complete",
+        )
         self._thaw_trainer()
         completed = [*state.completed_run_ids, state.current_run_id]
         next_index = state.next_index + 1
@@ -1002,10 +1012,42 @@ class LiveScenarioQueue:
         self._write(state)
         return state
 
+    def _write_cycle_clean_window_excuse(
+        self, run_id: str, scenario_id: str, reason: str
+    ) -> None:
+        """Exempt a cycle run from the v2 clean-window overlap gate.
+
+        The continuous cycle (reset + 2h normal + buffer) guarantees separation
+        on its own time axis, so a prior cycle run left inside live_probes'
+        30m overlap window must not block the next injection. Reuses the existing
+        ``clean-window-excused.json`` marker honoured by
+        ``LiveProbes._overlap_evidence``. Cycle mode only."""
+        marker = self.runner.artifact_store.root / run_id / "clean-window-excused.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "scenario_id": scenario_id,
+                    "reason": reason,
+                    "excused_at": self._format(self.clock.now()),
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
     def _restart_cycle(self, state: LiveQueueState, reason: str) -> LiveQueueState:
         """Restart the current scenario's cycle from trainer_reset. Two
         consecutive restarts are allowed; the third pauses (spec §2.2)."""
         scenario_id = state.current_scenario_id or state.scenario_ids[state.next_index]
+        # A run that actually started must not linger in the next cycle's overlap
+        # window; excuse it before rewinding (only when injection reached a run).
+        if state.current_run_id is not None:
+            self._write_cycle_clean_window_excuse(
+                state.current_run_id, scenario_id, "cycle-restart"
+            )
         count = state.cycle_restart_counts.get(scenario_id, 0) + 1
         if count > MAX_CYCLE_RESTARTS:
             return self._pause(
