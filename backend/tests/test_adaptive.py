@@ -149,6 +149,53 @@ def test_settle_and_min_hold_gate_success() -> None:
     assert holding.reason == "min_hold"
 
 
+def test_must_rule_out_deferred_until_after_settle_and_min_hold() -> None:
+    # Injections that deliberately restart the target pod (k8s.env, k8s.probe)
+    # drive the alternative-cause signal true transiently during the expected
+    # restart. must_rule_out must not veto the run before the injection settles
+    # past min_hold; a signal that clears before min_hold must still succeed.
+    spec = _spec()
+    state = start(spec)
+
+    settling = advance(
+        spec, state, Observation(elapsed_sec=4, signals=_safe_signals(db_lock=True))
+    )
+    assert settling.phase == ControllerPhase.SETTLING
+    assert settling.reason == "settling"
+
+    holding = advance(
+        spec, settling, Observation(elapsed_sec=6, signals=_safe_signals(db_lock=True))
+    )
+    assert holding.phase == ControllerPhase.EVALUATING
+    assert holding.reason == "min_hold"
+
+    # Signal clears before min_hold (pod recovered) -> success, not abort.
+    first = advance(
+        spec, holding, Observation(elapsed_sec=10, signals=_safe_signals(error_rate=0.1))
+    )
+    assert first.phase == ControllerPhase.EVALUATING
+    succeeded = advance(
+        spec, first, Observation(elapsed_sec=11, signals=_safe_signals(error_rate=0.1))
+    )
+    assert succeeded.phase == ControllerPhase.SUCCEEDED
+
+
+def test_must_rule_out_persisting_past_min_hold_still_aborts() -> None:
+    # A genuine alternative cause (pod never recovers) keeps the streak alive
+    # past min_hold and must still abort, preserving failure detection.
+    spec = _spec()
+    state = start(spec)
+    holding = advance(
+        spec, state, Observation(elapsed_sec=6, signals=_safe_signals(db_lock=True))
+    )
+    assert holding.phase == ControllerPhase.EVALUATING
+    aborted = advance(
+        spec, holding, Observation(elapsed_sec=10, signals=_safe_signals(db_lock=True))
+    )
+    assert aborted.phase == ControllerPhase.ABORTED
+    assert aborted.reason == "must_rule_out_detected"
+
+
 def test_must_rule_out_true_aborts_and_false_allows_success() -> None:
     spec = _spec()
     state = start(spec)

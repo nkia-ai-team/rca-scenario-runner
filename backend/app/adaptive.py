@@ -211,13 +211,6 @@ def advance(
         return _transition(
             current, ControllerPhase.ABORTED, ControllerAction.ABORT, "abort_condition"
         )
-    if _confirmed(spec.must_rule_out, streaks, "must_rule_out"):
-        return _transition(
-            current,
-            ControllerPhase.ABORTED,
-            ControllerAction.ABORT,
-            "must_rule_out_detected",
-        )
 
     safety_unknown = _has_unusable_signal(spec.abort, observation.signals) or raw_ruleout is None
     safety_pending = raw_abort is True or raw_ruleout is True
@@ -229,6 +222,21 @@ def advance(
     if observation.elapsed_sec < level.min_hold_sec:
         return _transition(
             current, ControllerPhase.EVALUATING, ControllerAction.WAIT, "min_hold"
+        )
+
+    # Alternative-cause veto is judged only once the injection has settled past
+    # min_hold. Injections that deliberately restart the target pod (k8s.env,
+    # k8s.probe) drive pod_ready=false transiently during the expected restart;
+    # evaluating must_rule_out before min_hold aborted those runs on their own
+    # injection mechanism. A genuine alternative cause (pod never recovers) keeps
+    # the streak alive past min_hold and still aborts here; immediate dangers are
+    # already handled by the abort set above.
+    if _confirmed(spec.must_rule_out, streaks, "must_rule_out"):
+        return _transition(
+            current,
+            ControllerPhase.ABORTED,
+            ControllerAction.ABORT,
+            "must_rule_out_detected",
         )
 
     if not safety_unknown and not safety_pending and _confirmed(spec.success, streaks, "success"):
