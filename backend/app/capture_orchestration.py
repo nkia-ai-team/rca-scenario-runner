@@ -34,7 +34,13 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ScenarioMetadata(StrictModel):
+class ScenarioMetadata(BaseModel):
+    # The registry carries additional design fields (class, root_cause,
+    # must_support, ... — scenario-redesign 2026-07-24). Capture's canonical
+    # metadata is exactly these six; extras are ignored so registry evolution
+    # cannot brick queue readiness, and sha256() stays a six-field digest.
+    model_config = ConfigDict(extra="ignore")
+
     title: str = Field(min_length=1)
     description: str = Field(min_length=1)
     cause: str = Field(min_length=1)
