@@ -114,6 +114,7 @@ ORACLE_TAG_CONTRACT = {"client_identifier": "rca-F01-P-oracle-lock"}
 MYSQL_INDEX_CONTRACT = {
     "database": "fooddelivery", "table": "menus", "index": "idx_menus_category"
 }
+OUTBOX_UNPUBLISHED_CONTRACT = {"namespace": "rca-testbed-banking"}
 HOST_PROBE_CONTRACTS = {
     "F02-H": ("192.168.122.184", "fio", "/opt/local-path-provisioner/pvc-5d71e22a-1225-4505-a7cc-5cf29dad4cf5_rca-testbed-commerce_pgdata-testbed-postgres-0"),
     "F10-R": ("192.168.122.184", "watermark", "/opt/local-path-provisioner/pvc-5d71e22a-1225-4505-a7cc-5cf29dad4cf5_rca-testbed-commerce_pgdata-testbed-postgres-0"),
@@ -818,6 +819,20 @@ class LiveProbeSet:
             if raw not in {"0", "1"}:
                 raise LiveProbeError("MySQL index presence is invalid")
             return raw == "1", _aware(self.clock()), "database:mysql-index-present"
+        if query.query_id == "database.outbox_unpublished_count":
+            # F18-P decisive evidence: BANKING.outbox_events rows the halted
+            # relay has not published (published_at IS NULL, init.sql:60-70).
+            if dict(query.parameters) != OUTBOX_UNPUBLISHED_CONTRACT:
+                raise LiveProbeError("outbox count target is not allowlisted")
+            result = self._kubectl(
+                "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
+                "sh", "-lc",
+                "printf 'alter session set container=FREEPDB1;\\nset pages 0 feedback off heading off\\nselect count(*) from banking.outbox_events where published_at is null;\\nexit;\\n' | sqlplus -s / as sysdba",
+            )
+            raw = result.stdout.strip()
+            if not re.fullmatch(r"[0-9]+", raw):
+                raise LiveProbeError("outbox unpublished count is invalid")
+            return int(raw), _aware(self.clock()), "database:outbox-unpublished-count"
         if query.query_id == "database.payment_duplicate_order_count_since_t1":
             state = self._f06_pulse_state(query)
             started_at = _parse_time(state.get("started_at"))
