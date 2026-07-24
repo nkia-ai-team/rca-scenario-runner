@@ -1,0 +1,15 @@
+service:
+  name: cross-domain
+  title: Cross-domain composite scenarios
+  description: >-
+    둘 이상의 테스트베드 도메인에서 의도적으로 시간 중첩 장애를 발생시켜
+    사건 경계 split/merge/multi-root를 검증하는 합성 시나리오군.
+  owner: project
+target:
+  server: 192.168.200.109
+  ssh_user: root
+  arch: arm64
+  kubeconfig: /root/tb-kubeconfig
+  namespaces:
+    - rca-testbed-commerce
+    - rca-testbed-food

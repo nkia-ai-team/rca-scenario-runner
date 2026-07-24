@@ -1,6 +1,7 @@
 import pytest
 from httpx import AsyncClient
 
+from app.runner import get_runner
 from tests.conftest import wait_until_idle
 
 
@@ -10,19 +11,19 @@ async def test_healthz(client: AsyncClient) -> None:
     assert resp.json() == {"status": "ok", "version": "0.1.0"}
 
 
-async def test_list_scenarios_returns_plopvape_four(client: AsyncClient) -> None:
+async def test_list_scenarios_returns_plopvape_catalog(client: AsyncClient) -> None:
+    # 개수 하드코딩 금지 — 시나리오는 계속 늘어난다. 원조 4개 포함 여부만 고정.
     resp = await client.get("/api/scenarios")
     assert resp.status_code == 200
     data = resp.json()
     plopvape = [s for s in data if s["domain"] == "plopvape-shop"]
-    assert len(plopvape) == 4
-    assert {s["short_id"] for s in plopvape} == {"01", "02", "03", "04"}
-    assert {s["id"] for s in plopvape} == {
+    ids = {s["id"] for s in plopvape}
+    assert {
         "plopvape-shop:01",
         "plopvape-shop:02",
         "plopvape-shop:03",
         "plopvape-shop:04",
-    }
+    } <= ids
 
 
 async def test_get_single_scenario(client: AsyncClient) -> None:
@@ -42,14 +43,14 @@ async def test_list_domains(client: AsyncClient) -> None:
     slugs = {d["slug"] for d in data}
     assert "plopvape-shop" in slugs
     plopvape = next(d for d in data if d["slug"] == "plopvape-shop")
-    assert plopvape["scenario_count"] == 4
+    assert plopvape["scenario_count"] >= 4
 
 
 async def test_plopvape_scenarios_have_rca_ground_truth(client: AsyncClient) -> None:
-    """plopvape 4 시나리오 모두 difficulty + expected_rca_root_cause 채워져 RCA 채점 가능해야 한다."""
+    """plopvape 시나리오 전부 difficulty + expected_rca_root_cause 채워져 RCA 채점 가능해야 한다."""
     resp = await client.get("/api/scenarios")
     plopvape = [s for s in resp.json() if s["domain"] == "plopvape-shop"]
-    assert len(plopvape) == 4
+    assert len(plopvape) >= 4
     for s in plopvape:
         assert isinstance(s["difficulty"], int) and 1 <= s["difficulty"] <= 5, (
             f"{s['id']} difficulty missing or out of range"
@@ -110,6 +111,20 @@ async def test_active_endpoint_reflects_busy_state(client: AsyncClient) -> None:
     assert after.json()["is_active"] is False
 
 
+async def test_watchdog_decision_endpoint_is_read_only_idle(
+    client: AsyncClient, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_path = tmp_path / "coordinator.json"
+    monkeypatch.setenv("COORDINATOR_STATE_PATH", str(state_path))
+    response = await client.post(
+        "/api/controller/watchdog/decision",
+        json={"now": "2026-07-16T00:00:00Z", "heartbeat_timeout_sec": 30},
+    )
+    assert response.status_code == 200
+    assert response.json()["action"] == "idle"
+    assert not state_path.exists()
+
+
 async def test_cleanup_mode(client: AsyncClient) -> None:
     resp = await client.post("/api/scenarios/02/cleanup")
     assert resp.status_code == 200
@@ -117,6 +132,25 @@ async def test_cleanup_mode(client: AsyncClient) -> None:
     final = await wait_until_idle(client, scenario_id="02")
     assert final["status"] == "succeeded"
     assert any("cleanup complete" in line for line in final["log_tail"])
+
+
+async def test_dry_run_has_no_execution_side_effects(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def forbidden_subprocess(*args, **kwargs):
+        raise AssertionError("dry-run must not create a subprocess")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", forbidden_subprocess)
+    assert get_runner().log_dir.exists() is False
+    resp = await client.post("/api/scenarios/01/dry-run")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is True
+    assert body["side_effects"] is False
+    assert body["orchestrator"]["transport"] == "local"
+    assert len(body["orchestrator"]["script_sha256"]) == 64
+    assert "legacy scenario has no explicit injection_points" in body["warnings"]
+    assert get_runner().log_dir.exists() is False
 
 
 async def test_history_records_completed_run(client: AsyncClient) -> None:
@@ -135,7 +169,7 @@ async def test_full_log_download(client: AsyncClient) -> None:
     run_id = start.json()["run_id"]
     await wait_until_idle(client, scenario_id="04")
 
-    log = await client.get(f"/api/scenarios/04/logs", params={"run_id": run_id})
+    log = await client.get("/api/scenarios/04/logs", params={"run_id": run_id})
     assert log.status_code == 200
     assert "starting" in log.text
     assert "[OK] done" in log.text

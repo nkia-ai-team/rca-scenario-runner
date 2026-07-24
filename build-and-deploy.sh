@@ -43,7 +43,12 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 PORT="${PORT:-8090}"
 SCENARIOS_HOST_PATH="${SCENARIOS_HOST_PATH:-./scenarios/services}"
-KUBECONFIG_HOST_PATH="${KUBECONFIG_HOST_PATH:-/home/nkia/.kube}"
+KUBECONFIG_HOST_PATH="${KUBECONFIG_HOST_PATH:-/root/tb-kubeconfig}"
+TB_RUNNER_SSH_KEY_HOST_PATH="${TB_RUNNER_SSH_KEY_HOST_PATH:-/root/.ssh/tb_key}"
+SSH_KNOWN_HOSTS_HOST_PATH="${SSH_KNOWN_HOSTS_HOST_PATH:-/root/.ssh/known_hosts}"
+SCENARIO_MANIFEST_HOST_PATH="${SCENARIO_MANIFEST_HOST_PATH:-../testbed-services/scripts/scenarios/manifests}"
+SCENARIO_CONTRACT_HOST_PATH="${SCENARIO_CONTRACT_HOST_PATH:-../testbed-services/scripts/scenarios}"
+CAPTURE_SCRIPT_HOST_PATH="${CAPTURE_SCRIPT_HOST_PATH:-../testbed-services/scripts/capture-eval-case.sh}"
 
 # compose v1 vs v2 감지
 if docker compose version &>/dev/null; then
@@ -90,14 +95,35 @@ phase_prereqs() {
     script_count="$(find "$SCENARIOS_HOST_PATH" -path '*/scripts/scenario-*.sh' | wc -l)"
     log_ok "시나리오 스크립트 총합: $script_count 개"
 
-    if [[ ! -f "${KUBECONFIG_HOST_PATH}/config" ]]; then
-        log_error "kubeconfig 누락: ${KUBECONFIG_HOST_PATH}/config"
+    if [[ ! -f "${KUBECONFIG_HOST_PATH}" ]]; then
+        log_error "kubeconfig 누락: ${KUBECONFIG_HOST_PATH}"
         exit 1
     fi
-    log_ok "kubeconfig 확인: ${KUBECONFIG_HOST_PATH}/config"
+    log_ok "kubeconfig 확인: ${KUBECONFIG_HOST_PATH}"
+
+    [[ -f "$TB_RUNNER_SSH_KEY_HOST_PATH" ]] || {
+        log_error "tb-runner SSH key 누락: $TB_RUNNER_SSH_KEY_HOST_PATH"; exit 1;
+    }
+    [[ -f "$SSH_KNOWN_HOSTS_HOST_PATH" ]] || {
+        log_error "SSH known_hosts 누락: $SSH_KNOWN_HOSTS_HOST_PATH"; exit 1;
+    }
+    [[ -d "$SCENARIO_MANIFEST_HOST_PATH" ]] || {
+        log_error "64개 manifest 경로 누락: $SCENARIO_MANIFEST_HOST_PATH"; exit 1;
+    }
+    [[ -f "$SCENARIO_CONTRACT_HOST_PATH/run-scenario.sh" ]] || {
+        log_error "trusted scenario contract 누락: $SCENARIO_CONTRACT_HOST_PATH"; exit 1;
+    }
+    [[ -f "$CAPTURE_SCRIPT_HOST_PATH" ]] || {
+        log_error "capture script 누락: $CAPTURE_SCRIPT_HOST_PATH"; exit 1;
+    }
+    for secret_name in COMMERCE_DB_PASSWORD PG_PASSWORD CH_PASSWORD; do
+        [[ -n "${!secret_name:-}" ]] || {
+            log_error "필수 live/capture 자격증명 누락: $secret_name (.env 확인)"; exit 1;
+        }
+    done
 
     if command -v kubectl &>/dev/null; then
-        if KUBECONFIG="${KUBECONFIG_HOST_PATH}/config" kubectl --request-timeout=3s -n rca-testbed get pods &>/dev/null; then
+        if KUBECONFIG="${KUBECONFIG_HOST_PATH}" kubectl --request-timeout=3s get nodes &>/dev/null; then
             log_ok "K3s(rca-testbed) 접근 정상"
         else
             log_warn "호스트 kubectl 에서 rca-testbed 조회 실패 — 컨테이너 내부에서 재확인됩니다."

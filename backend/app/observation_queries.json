@@ -1,0 +1,405 @@
+{
+  "schema_version": "1.0",
+  "queries": {
+    "loadgen.achieved_rps": {
+      "adapter": "loadgen_summary",
+      "selector": "iterations.rate",
+      "freshness_sec": 30,
+      "allowed_parameters": []
+    },
+    "loadgen.checkout_5xx_rate": {
+      "adapter": "loadgen_summary",
+      "selector": "checkout.5xx.rate",
+      "freshness_sec": 30,
+      "allowed_parameters": []
+    },
+    "http.entry_health": {
+      "adapter": "http_probe",
+      "request_ref": "scenario.entry_health",
+      "freshness_sec": 15,
+      "allowed_parameters": []
+    },
+    "http.target_health": {
+      "adapter": "http_probe",
+      "request_ref": "scenario.target_health",
+      "freshness_sec": 15,
+      "allowed_parameters": []
+    },
+    "prometheus.user_p95": {
+      "adapter": "prometheus",
+      "template_id": "http-server-duration-p95-v1",
+      "freshness_sec": 60,
+      "allowed_parameters": [
+        "service_name"
+      ]
+    },
+    "prometheus.apm_service_p95": {
+      "adapter": "prometheus",
+      "template_id": "apm-agent-percentile95-v1",
+      "freshness_sec": 120,
+      "allowed_parameters": [
+        "service_name"
+      ]
+    },
+    "prometheus.apm_service_error_rate": {
+      "adapter": "prometheus",
+      "template_id": "apm-agent-error-rate-v1",
+      "freshness_sec": 60,
+      "allowed_parameters": [
+        "service_name"
+      ]
+    },
+    "prometheus.container_cpu_throttled_time": {
+      "adapter": "prometheus",
+      "template_id": "kcm-pod-cpu-throttled-time-v1",
+      "freshness_sec": 60,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "prometheus.pod_network_error_rate": {
+      "adapter": "prometheus",
+      "template_id": "kcm-workload-network-error-rate-v1",
+      "freshness_sec": 60,
+      "allowed_parameters": [
+        "namespace",
+        "deployment"
+      ]
+    },
+    "kubernetes.pod_ready": {
+      "adapter": "kubernetes",
+      "selector": "pod.condition.Ready",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "resource"
+      ]
+    },
+    "kubernetes.image_pull_failure": {
+      "adapter": "kubernetes",
+      "selector": "pod.container.waiting.image_pull_failure",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "resource",
+        "container"
+      ]
+    },
+    "kubernetes.deployment_available_replicas": {
+      "adapter": "kubernetes",
+      "selector": "deployment.status.available_replicas",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment"
+      ]
+    },
+    "kubernetes.kafka_consumer_lag": {
+      "adapter": "kubernetes",
+      "selector": "kafka.consumer_group.total_lag",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "pod",
+        "bootstrap_server",
+        "consumer_group"
+      ]
+    },
+    "kubernetes.deployment_container_cpu_limit": {
+      "adapter": "kubernetes",
+      "selector": "deployment.container.resources.limits.cpu",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "kubernetes.container_restart_count": {
+      "adapter": "kubernetes",
+      "selector": "pod.container.restart_count",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "kubernetes.container_last_termination_reason": {
+      "adapter": "kubernetes",
+      "selector": "pod.container.last_termination_reason",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "kubernetes.container_oom_killed": {
+      "adapter": "kubernetes",
+      "selector": "pod.container.last_termination_oom_killed",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "kubernetes.container_resources_match": {
+      "adapter": "kubernetes",
+      "selector": "deployment.container.resources.match_baseline",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "kubernetes.container_liveness_probe_match": {
+      "adapter": "kubernetes",
+      "selector": "deployment.container.liveness_probe.match_baseline",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "kubernetes.container_memory_current_bytes": {
+      "adapter": "kubernetes",
+      "selector": "pod.container.cgroup.memory.current_bytes",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "kubernetes.container_memory_limit_bytes": {
+      "adapter": "kubernetes",
+      "selector": "pod.container.cgroup.memory.limit_bytes",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "database.tagged_session_count": {
+      "adapter": "database",
+      "selector": "scenario_tag.session_count",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_tag"
+      ]
+    },
+    "database.index_present": {
+      "adapter": "database",
+      "selector": "postgres.index.present",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "db_host",
+        "db_port",
+        "db_name",
+        "db_user",
+        "schema",
+        "table",
+        "index"
+      ]
+    },
+    "database.oracle_tagged_session_count": {
+      "adapter": "database",
+      "selector": "oracle.client_identifier.session_count",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "client_identifier"
+      ]
+    },
+    "database.mysql_index_present": {
+      "adapter": "database",
+      "selector": "mysql.index.present",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "database",
+        "table",
+        "index"
+      ]
+    },
+    "host.scenario_active": {
+      "adapter": "host_probe",
+      "selector": "scenario.process_or_artifact.active",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "host.scenario_clean": {
+      "adapter": "host_probe",
+      "selector": "scenario.process_and_artifact.clean",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "host.filesystem_used_percent": {
+      "adapter": "host_probe",
+      "selector": "scenario.target.filesystem_used_percent",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "database.payment_duplicate_order_count_since_t1": {
+      "adapter": "database",
+      "selector": "payment.duplicate_order_count_since_t1",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "business.checkout_invariant": {
+      "adapter": "business_probe",
+      "selector": "checkout.final_state_consistent",
+      "freshness_sec": 60,
+      "allowed_parameters": [
+        "business_key"
+      ]
+    },
+    "mock.transient_consumed_count": {
+      "adapter": "business_probe",
+      "selector": "mock.pulse_state.transient_consumed_count",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "mock.pulse_age_seconds": {
+      "adapter": "business_probe",
+      "selector": "mock.pulse_state.age_seconds",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "mock.duplicate_expectation_count": {
+      "adapter": "business_probe",
+      "selector": "mock.pulse_state.duplicate_expectation_count",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "mock.expired_unconsumed_count": {
+      "adapter": "business_probe",
+      "selector": "mock.pulse_state.expired_unconsumed_count",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "mock.transient_expectation_absent": {
+      "adapter": "business_probe",
+      "selector": "mock.pulse_state.transient_expectation_absent",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "mock.snapshot_restored": {
+      "adapter": "business_probe",
+      "selector": "mock.pulse_state.snapshot_restored",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "capture.export_complete": {
+      "adapter": "capture_status",
+      "selector": "export.checksum_verified",
+      "freshness_sec": 60,
+      "allowed_parameters": [
+        "run_id"
+      ]
+    },
+    "kubernetes.deployment_container_memory_limit": {
+      "adapter": "kubernetes",
+      "selector": "deployment.container.resources.limits.memory",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "scenario.mock_flap_episode": {
+      "adapter": "business_probe",
+      "selector": "scenario_state.mock_flap.episode",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "scenario.mock_flap_fault_active": {
+      "adapter": "business_probe",
+      "selector": "scenario_state.mock_flap.fault_active",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "business.order_duplicate_count_since_t1": {
+      "adapter": "database",
+      "selector": "order.duplicate_business_key_count_since_t1",
+      "freshness_sec": 60,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
+    },
+    "prometheus.node_cpu_utilization": {
+      "adapter": "prometheus",
+      "template_id": "kcm-node-cpu-utilization-v1",
+      "freshness_sec": 60,
+      "allowed_parameters": [
+        "node"
+      ]
+    },
+    "prometheus.node_memory_utilization": {
+      "adapter": "prometheus",
+      "template_id": "kcm-node-memory-utilization-v1",
+      "freshness_sec": 60,
+      "allowed_parameters": [
+        "node"
+      ]
+    },
+    "kubernetes.node_ready": {
+      "adapter": "kubernetes",
+      "selector": "node.status.ready",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "node"
+      ]
+    },
+    "kubernetes.deployment_resources_match_baseline": {
+      "adapter": "kubernetes",
+      "selector": "deployment.container.resources.matches_f05_baseline",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    },
+    "kubernetes.deployment_liveness_probe_matches_baseline": {
+      "adapter": "kubernetes",
+      "selector": "deployment.container.liveness_probe.matches_f05_baseline",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "namespace",
+        "deployment",
+        "container"
+      ]
+    }
+  }
+}

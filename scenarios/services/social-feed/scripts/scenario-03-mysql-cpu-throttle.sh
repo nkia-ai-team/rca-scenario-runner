@@ -15,7 +15,7 @@
 set -uo pipefail
 
 # k3d 도메인별 클러스터: social 전용 kubeconfig (공유 config 의 current-context 드리프트 무관)
-export KUBECONFIG=/home/nkia/.kube/social.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="rca-testbed-social"
 DB_STS="testbed-mysql"
 # k3d 는 호스트로 NodePort 를 publish 하지 않으므로, API 호출은 클러스터 내부에서

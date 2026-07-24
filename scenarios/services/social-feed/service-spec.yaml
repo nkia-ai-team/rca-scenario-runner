@@ -13,7 +13,7 @@ target:
   ssh_user: nkia
   arch: arm64
   namespace: rca-testbed-social
-  kubeconfig: /home/nkia/.kube/social.yaml
+  kubeconfig: /root/tb-kubeconfig
   api_base: http://127.0.0.1:30081
 scenarios:
 - id: scenario-01

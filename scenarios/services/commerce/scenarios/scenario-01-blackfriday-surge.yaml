@@ -1,0 +1,106 @@
+# 시나리오당 파일 하나 (testbed-services spec-scenario-design §10 레이아웃).
+# 최상위 = 시나리오 엔트리 하나. 주입 스크립트는 ../scripts/ (runner 해석 경로 관례).
+id: scenario-01
+file: scenario-01-blackfriday-surge.sh
+execution:
+  orchestrator:
+    transport: local
+    location: scenario-runner@192.168.200.109
+    timeout_sec: 900
+  injection_points:
+    - id: north-south-surge
+      kind: north_south
+      transport: ssh
+      location: tb-runner@192.168.122.206
+      host: 192.168.122.206
+      user: root
+      identity_file: /root/.ssh/tb_key
+      target: commerce tb-cp NodePort 192.168.122.77:30080
+      entry_path: tb-runner → tb-cp NodePort → commerce api-gateway
+      cleanup_location: tb-runner@192.168.122.206
+      rationale: 사용자 트래픽은 baseline과 동일한 north-south 진입점을 사용해야 한다.
+      feasibility: ready
+      managed_by: orchestrator
+title: Black Friday Surge Latency Brownout (L1)
+description: 실측된 surge 80 RPS 인입 폭주 → order 경로 처리 용량의 무릎을 넘어
+  latency brownout·pool pending·dropped iteration을 유발한다. 미실측 100+ RPS의
+  완전 고갈을 가정하지 않고 capacity probe3에서 재현된 상한을 사용한다.
+cause_domain: APM
+root_cause:
+  target_kind: service
+  target_id_source: commerce api-gateway/order-service의 APM target (119 targets 테이블에서
+    service.name 매칭 — golden 승격 시 정본 target_id로 교체)
+  mechanism: 인입 surge가 80 RPS(실측 baseline 8 RPS 포함 총 약 88 RPS)로 급증하여
+    order 경로 처리 용량의 무릎을 넘고 HikariCP pending·p95 latency·drop이 증가
+expected_depth: entity
+injection:
+  script: scenario-01-blackfriday-surge.sh
+  parameters:
+    load:
+      journeys: [browsing, cart, checkout]   # checkout 가중 50% — 주문 폭주형 mix
+      target_rps: 80                         # probe3에서 실제 검증된 surge 상한
+      measured_baseline_rps: 8
+      intensity_multiplier: 10               # 실측 당시 서술용 배수(실행 강도 정본은 target_rps)
+      capacity_reference:
+        healthy_ceiling_rps: 60
+        knee_rps: 70
+        measured_upper_rps: 80
+        observed_at_80: {p95: 2.53s, overall_5xx: 1.7%, pool_pending: 24, dropped_iterations: 71}
+      ramp: { up: 2m, hold: 8m, down: 1m }
+      seed: 4242
+      preconditions:
+        flagship_inventory_rows: 16
+        min_stock_per_flagship: 900000       # probe3의 100만 seed가 baseline으로 감소하는 여유 허용
+      stop_conditions:
+        entry_health_non_200_consecutive: 3
+        entry_probe_over_10s_consecutive: 3
+      achieved_rps: runtime                   # 실행 후 k6 summary에서 기록
+    surge_script: testbed-services commerce/loadgen/surge.js (tb-runner /opt/loadgen/commerce/surge.js 배치본)
+    entry: http://192.168.122.77:30080 (tb-cp NodePort — baseline과 동일 경로, R2)
+expected_anomalies:
+- target: order-service APM target (target_id_source — 승격 시 정본 교체)
+  signal: metric
+  name: db.client.connections.pending_requests level shift (probe3 s80 pending=24)
+  direction: up
+  within: 5m
+  precondition: ai_coverages에 해당 (target×metric) 등록 — 검증 패스에서 선행 확인
+- target: order-service APM target (target_id_source — 승격 시 정본 교체)
+  signal: metric
+  name: http.server.request.duration latency level shift (probe3 s80 p95=2.53s)
+  direction: up
+  within: 5m
+  precondition: ai_coverages에 해당 (target×metric) 등록
+- target: api-gateway/order-service APM target (target_id_source — 승격 시 정본 교체)
+  signal: metric
+  name: http.server.request.count / throughput rate level shift (surge 80 RPS)
+  direction: up
+  within: 5m
+  precondition: ai_coverages에 해당 (target×metric) 등록
+signals:
+  must_support:
+  - surge achieved RPS가 목표 80 RPS에 근접하고 인입 spike가 시간상 최선행
+  - HikariCP pending과 p95 latency 증가가 트래픽 spike 이후에 발생
+  - order → product/inventory/payment cascade 지연 전파 (trace)
+  must_rule_out:
+  - DB 자체 결함 아님 — slow query/lock 정상 (트래픽 유입이 원인)
+  - 재고 소진 409→502 폭풍 아님 — flagship 16행 stock precondition 통과
+  - 배포/설정 변경 없음 (change 이벤트 부재)
+  expected_missing: []
+propagation:
+- surge 80 RPS 급증 (north-south, 게이트웨이 경유; 총 약 88 RPS)
+- order 경로 처리 용량 무릎 초과 → HikariCP pending과 dropped iteration 발생
+- p95 약 2.5초 latency brownout → 상류 게이트웨이 지연·일부 5xx
+- 사용자 체감: 주문 지연·간헐 실패 (인시던트 격상 조건 R0 충족)
+estimated_duration_sec: 720
+side_effects:
+- baseline loadgen은 건드리지 않음(R1) — 스크립트가 사전·사후로 active 확인
+- surge 종료 후 잔존 k6는 cleanup이 pkill (매칭 태그 surge.js 한정 — baseline 안전)
+- 스크립트는 재고를 조작하지 않고 flagship stock precondition만 fail-closed 검증
+- 100+ RPS 풀 완전 고갈은 미실측이므로 이 시나리오의 기대값에 포함하지 않음
+difficulty: 3
+expected_rca_root_cause: '80 RPS surge가 order 처리 용량의 무릎을 넘어 latency brownout을
+  만든 것이 시작점. 결정적 시그널: achieved RPS spike가 시간상 최선행이고 HikariCP
+  pending·p95 latency·drop이 뒤따른다. DB lock/slow query, 배포 변경, 재고 소진을
+  원인으로 확정하면 오답이다. 100+ RPS의 완전 pool 고갈은 미실측이므로 주장하지 않는다.
+
+  '

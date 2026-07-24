@@ -1,0 +1,24 @@
+service:
+  name: commerce
+  description: 'RCA 테스트베드 commerce 플래그십 (대폭 확장판, 구 plopvape-shop 후속).
+
+    109 KVM 게스트 VM kubeadm 클러스터(rca-testbed-commerce ns): nginx + api-gateway +
+    9개 서비스(order/product/inventory/payment/notification/user/cart/pricing/shipping)
+    + postgres + redis + kafka. baseline 부하는 tb-runner(192.168.122.206)의
+    loadgen systemd 3유닛이 상주 생성.
+
+    부하 시나리오 규칙 정본: testbed-services docs/spec-scenario-load.md (R0~R9).
+
+    '
+  owner: ydkim
+  linear_project: RCA 테스트베드
+target:
+  server: 192.168.200.109
+  ssh_user: root
+  arch: arm64
+  namespace: rca-testbed-commerce
+  kubeconfig: /root/tb-kubeconfig
+  api_base: http://192.168.122.77:30080
+# 시나리오는 시나리오당 파일 하나 — scenarios/*.yaml (spec-scenario-design §10).
+# 이 파일은 service/target 공통 정보만 담는다. scenarios: 리스트를 여기 두는
+# 레거시 형식도 로더가 계속 지원하지만, commerce는 per-scenario 레이아웃을 쓴다.

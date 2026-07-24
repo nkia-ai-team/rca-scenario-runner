@@ -25,11 +25,11 @@ services:
       - "${PORT:-8090}"
 
     volumes:
-      # 호스트의 kubeconfig 를 read-only 로 노출. 컨테이너 안에서도
-      # 호스트와 동일한 경로(/home/nkia/.kube)로 보이게 해서 NKIAAI-480
-      # 스크립트들이 `export KUBECONFIG=/home/nkia/.kube/config` 를 그대로
-      # 쓸 수 있게 한다. 스크립트 수정을 피하기 위한 선택.
-      - ${KUBECONFIG_HOST_PATH:-/home/nkia/.kube}:/home/nkia/.kube:ro
+      # 현재 kubeadm 4-node testbed의 정본 kubeconfig만 read-only로 노출한다.
+      - ${KUBECONFIG_HOST_PATH:-/root/tb-kubeconfig}:/root/tb-kubeconfig:ro
+      # commerce north-south surge는 tb-runner의 k6를 SSH로 기동한다.
+      - ${TB_RUNNER_SSH_KEY_HOST_PATH:-/root/.ssh/tb_key}:/root/.ssh/tb_key:ro
+      - ${SSH_KNOWN_HOSTS_HOST_PATH:-/root/.ssh/known_hosts}:/root/.ssh/known_hosts:ro
 
       # Multi-domain scenarios tree — service-spec.yaml + scripts/ per domain.
       # backend/scenarios.py globs <root>/*/service-spec.yaml; runner picks
@@ -38,8 +38,21 @@ services:
       # that previously forced single-testbed mounting.
       - ${SCENARIOS_HOST_PATH:-./scenarios/services}:/app/scenarios:ro
 
+      # testbed-services가 소유하는 64개 plan-only manifest.
+      - ${SCENARIO_MANIFEST_HOST_PATH:-../testbed-services/scripts/scenarios/manifests}:/app/scenario-manifests:ro
+      # Controller는 이 고정 root의 digest-검증 dispatcher/profile API만 호출한다.
+      - ${SCENARIO_CONTRACT_HOST_PATH:-../testbed-services/scripts/scenarios}:/opt/lucida/scenario-contracts:ro
+      - ${CAPTURE_SCRIPT_HOST_PATH:-../testbed-services/scripts/capture-eval-case.sh}:/opt/lucida/capture-eval-case.sh:ro
+      # capture가 sibling으로 호출하는 assembled/ 조립기 + 일일 정상 세그먼트 덤프기.
+      - ${ASSEMBLE_SCRIPT_HOST_PATH:-../testbed-services/scripts/assemble-eval-case.sh}:/opt/lucida/assemble-eval-case.sh:ro
+      - ${DUMP_NORMAL_SEGMENT_SCRIPT_HOST_PATH:-../testbed-services/scripts/dump-normal-segment.sh}:/opt/lucida/dump-normal-segment.sh:ro
+
       # 실행 로그를 호스트에 보존 (컨테이너 재시작 시에도 유지)
       - ${LOGS_HOST_PATH:-./logs}:/app/logs:rw
+      - ${STATE_HOST_PATH:-./state}:/app/state:rw
+      - ${RUNS_HOST_PATH:-./runs}:/var/lib/lucida/scenario-runs:rw
+      - ${PROFILE_STATE_HOST_PATH:-./profile-state}:/var/lib/lucida/scenario-profile-state:rw
+      - ${EVAL_CASES_HOST_PATH:-./eval-cases}:/data/eval-cases:rw
 
       # 호스트 docker daemon socket. scenario-02 가 pg-mock 컨테이너를
       # start/stop 하는 데 사용. 보안: 컨테이너가 호스트의 모든 docker
@@ -47,12 +60,48 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:rw
 
     environment:
-      - KUBECONFIG=/home/nkia/.kube/config
+      - KUBECONFIG=/root/tb-kubeconfig
       - SCRIPT_DIR=/app/scenarios
       - SCENARIOS_ROOT=/app/scenarios
+      - SCENARIO_MANIFEST_ROOT=/app/scenario-manifests
+      - COORDINATOR_STATE_PATH=/app/state/coordinator.json
+      - CAPTURE_STATE_PATH=/app/state/capture-jobs.json
+      - LIVE_QUEUE_STATE_PATH=/app/state/live-queue.json
+      - LIVE_CONTROLLER_REGISTRY_PATH=/opt/lucida/scenario-contracts/registry/controllers.json
+      - TRUSTED_RUNS_ROOT=/var/lib/lucida/scenario-runs
+      - CAPTURE_SCRIPT=/opt/lucida/capture-eval-case.sh
+      - ASSEMBLE_SCRIPT=/opt/lucida/assemble-eval-case.sh
+      - DUMP_NORMAL_SEGMENT_SCRIPT=/opt/lucida/dump-normal-segment.sh
+      - EVAL_CASE_ROOT=/data/eval-cases
+      - NORMAL_SEGMENT_ROOT=/data/eval-cases/normal-segments
+      - CAPTURE_HOST_OUTPUT_ROOT=${CAPTURE_HOST_OUTPUT_ROOT:-/root/rca-scenario-runner/eval-cases}
+      - ARCHIVE_SSH_TARGET=${ARCHIVE_SSH_TARGET:-}
+      - ARCHIVE_ROOT=${ARCHIVE_ROOT:-/data/eval-cases}
+      - ARCHIVE_BWLIMIT_KBPS=${ARCHIVE_BWLIMIT_KBPS:-4096}
+      - BASELINE_EVIDENCE_PATH=/app/state/baseline-evidence.json
+      - OBSERVATION_SNAPSHOT_PATH=/app/state/observations.json
+      - COMMERCE_DB_PASSWORD=${COMMERCE_DB_PASSWORD:-}
+      - PG_PASSWORD=${PG_PASSWORD:-}
+      - CH_PASSWORD=${CH_PASSWORD:-}
+      - MODEL_SNAPSHOT_SSH_TARGET=${MODEL_SNAPSHOT_SSH_TARGET:-}
+      # trainer-reset(golden) 활성화 (2026-07-21)
+      - GOLDEN_RESET_ENABLED=${GOLDEN_RESET_ENABLED:-}
+      - GOLDEN_STORE_ROOT=${GOLDEN_STORE_ROOT:-/data/eval-cases/goldens}
+      - RESTORE_SCRIPT=${RESTORE_SCRIPT:-/opt/lucida/restore-golden-state.sh}
+      - PG_USER=${PG_USER:-lucida}
+      # 신계약 캡처의 토폴로지 스냅샷용 query API 로그인
+      - QUERY_API_URL=${QUERY_API_URL:-http://192.168.230.119:18080}
+      - QUERY_API_USER=${QUERY_API_USER:-manager}
+      - QUERY_API_PASSWORD=${QUERY_API_PASSWORD:-}
+      # 캡처 종료 시 열린 인시던트 자동 종결(clean-slate 정책, 2026-07-21)
+      - LUCIDA_QUERY_URL=${LUCIDA_QUERY_URL:-http://192.168.230.119:18080}
+      - LUCIDA_OBSERVER_URL=${LUCIDA_OBSERVER_URL:-http://192.168.230.119:18087}
+      - LUCIDA_LOGIN_USER=${LUCIDA_LOGIN_USER:-}
+      - LUCIDA_LOGIN_PASSWORD=${LUCIDA_LOGIN_PASSWORD:-}
       - DEFAULT_DOMAIN=${DEFAULT_DOMAIN:-plopvape-shop}
       - LOG_DIR=/app/logs
       - STATIC_DIR=/app/static
+
 
     # 선택: 기본 stdout/stderr 로깅 (docker logs scenario-runner 로 확인)
     logging:

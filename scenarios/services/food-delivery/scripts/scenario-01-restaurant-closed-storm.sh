@@ -28,7 +28,7 @@
 
 set -uo pipefail
 
-export KUBECONFIG=/home/nkia/.kube/food-delivery.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="rca-testbed-food"
 DB_POD="testbed-postgres-0"
 DB_USER="fooddelivery"

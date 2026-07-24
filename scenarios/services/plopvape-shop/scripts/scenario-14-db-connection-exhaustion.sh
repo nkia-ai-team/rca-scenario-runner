@@ -20,7 +20,7 @@
 set -uo pipefail
 
 # runner가 default kubeconfig를 주입하므로 강제 지정(plopvape 클러스터, default context 회피).
-export KUBECONFIG=/home/nkia/.kube/plopvape.yaml
+export KUBECONFIG="${KUBECONFIG:-/root/tb-kubeconfig}"
 NAMESPACE="${NAMESPACE:-rca-testbed-plopvape}"
 PG_POD="${PG_POD:-testbed-postgres-0}"
 # k3d 는 호스트로 NodePort 를 publish 하지 않으므로, API 호출은 클러스터 내부에서

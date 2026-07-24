@@ -1,0 +1,128 @@
+# F15-T2 — 용량값과 무관한 시간 중첩 이종 장애 파일럿.
+# 실제 실행 전 testbed-services의 시나리오 승인·용량 조사 완료 게이트를 통과해야 한다.
+id: scenario-f15-t2
+file: scenario-f15-t2-staggered-independent-faults.sh
+execution:
+  orchestrator:
+    transport: local
+    location: scenario-runner@192.168.200.109
+    timeout_sec: 900
+  injection_points:
+    - id: commerce-inventory-lock
+      kind: database
+      transport: kubectl
+      location: commerce PostgreSQL pod@testbed-postgres-0
+      namespace: rca-testbed-commerce
+      resource: pod/testbed-postgres-0
+      target: inventory_schema.inventory rows
+      entry_path: scenario-runner → kubectl exec → PostgreSQL session
+      cleanup_location: commerce PostgreSQL pod@testbed-postgres-0
+      rationale: blocking session과 실제 checkout DB 경로가 같은 PostgreSQL 인스턴스에 있어야 한다.
+      feasibility: ready
+      managed_by: orchestrator
+    - id: food-external-pg-429
+      kind: external_mock
+      transport: kubectl
+      location: food external-pg-mock deployment
+      namespace: rca-testbed-food
+      resource: deployment/testbed-external-pg-mock
+      target: POST /pay expectation
+      entry_path: scenario-runner → kubectl port-forward/control API → food payment outbound call
+      cleanup_location: food external-pg-mock deployment
+      rationale: 외부 의존 오류는 payment 서비스가 실제 호출하는 mock endpoint에서 생성해야 한다.
+      feasibility: prerequisite
+      managed_by: orchestrator
+title: Staggered Independent Checkout Failures
+description: >-
+  commerce inventory PostgreSQL row lock을 먼저 시작하고 3분 뒤 food-delivery
+  external PG 429를 시작한다. 두 장애 구간과 사용자 증상은 겹치지만 원인 자원과
+  topology가 독립이므로 event cluster와 incident가 둘로 분리되어야 한다.
+cause_domain: null
+root_cause:
+  target_kind: multi
+  mechanism: >-
+    시간적으로 겹친 독립 원인 두 개: commerce PostgreSQL inventory row lock과
+    food-delivery external payment gateway 429. 둘 사이에 인과관계나 공통 root는 없다.
+  causes:
+    - domain: DPM
+      target_kind: database
+      target_id_source: 119 targets의 PostgreSQL-commerce DPM target
+      dimension: {label: table, value: inventory_schema.inventory}
+      mechanism: 전체 inventory row의 장기 FOR UPDATE 점유
+    - domain: APM
+      target_kind: external_dependency
+      target_id_source: food-delivery-payment APM target 2e6120e3-37fa-4c44-a224-6ab13afdd9ee
+      dimension: {label: http.status_code, value: "429"}
+      mechanism: external PG /pay 호출의 독립적인 rate-limit 응답
+expected_depth: dimension
+injection:
+  script: scenario-f15-t2-staggered-independent-faults.sh
+  parameters:
+    relation: independent
+    expected_case_boundary: split
+    sub_injections:
+      - id: commerce-inventory-lock
+        location: commerce PostgreSQL pod
+        offset: 0s
+        duration: 8m
+      - id: food-external-pg-429
+        location: food-delivery external-pg-mock
+        offset: 3m
+        duration: 4m
+    capture:
+      t1: earliest_sub_injection_start
+      t2: latest_sub_injection_end
+      window: "[t1-2h,t2+45m]"
+expected_anomalies:
+  - target: PostgreSQL-commerce DPM target
+    signal: metric
+    name: dpm.postgresql.session.blocked_session / lock wait
+    direction: up
+    within: 5m
+    precondition: DPM collector last_collect_status=success
+  - target: commerce-inventory APM target 414db206-d121-43b1-886c-78b240d23a7a
+    signal: trace
+    name: inventory reserve latency/error
+    direction: up
+    within: 10m
+    precondition: baseline commerce checkout traffic active
+  - target: food-delivery-payment APM target 2e6120e3-37fa-4c44-a224-6ab13afdd9ee
+    signal: trace
+    name: external PG HTTP 429
+    direction: up
+    within: 5m
+    precondition: baseline food-delivery order traffic active
+signals:
+  must_support:
+    - commerce DB blocking session과 점유 SQL이 첫 번째 사건에만 존재
+    - food payment outbound span 429가 두 번째 사건에만 존재
+    - 두 root 사이 호출·배치·변경·공통 인프라 인과 edge가 없음
+  must_rule_out:
+    - 발생 시각이 가깝다는 이유만으로 한 클러스터나 한 인시던트로 병합
+    - commerce DB lock을 food-delivery 결제 실패의 원인으로 전파
+    - external PG 429를 commerce inventory 지연의 원인으로 전파
+  expected_missing: []
+expected_clusters:
+  relation: split
+  count: 2
+  must_not_share_root: true
+expected_incidents:
+  count: 2
+  relation: independent
+  allow_time_overlap: true
+propagation:
+  - commerce inventory row lock → checkout inventory reserve 대기·실패
+  - 3분 뒤 food external PG 429 → payment·order 실패
+  - 두 증상 구간은 겹치지만 topology와 결정적 root signal은 분리
+estimated_duration_sec: 540
+side_effects:
+  - baseline loadgen은 읽기만 확인하고 수정·중단하지 않음
+  - commerce lock은 transaction rollback 또는 전용 backend terminate로 해제
+  - food mock expectation은 정상 200 응답으로 복원
+  - 한쪽 cleanup 실패 시 전체 시나리오 실패, 후속 시나리오 실행 금지
+  - food 주문 경로의 배차 풀 상시 503이 복구되기 전에는 dry-run만 허용하고 라이브 실행·golden 승격 금지
+difficulty: 5
+expected_rca_root_cause: >-
+  단일 원인을 확정하면 안 된다. commerce 실패는 PostgreSQL inventory row lock,
+  food-delivery 실패는 external PG 429라는 독립 원인으로 각각 설명하고, 시간 중첩
+  외에는 두 사건을 연결할 인과 근거가 없음을 명시해야 한다.
