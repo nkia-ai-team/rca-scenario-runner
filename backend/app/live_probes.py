@@ -216,6 +216,15 @@ KAFKA_LAG_CONTRACT = {
     "bootstrap_server": "localhost:9092",
     "consumer_group": "shipping-service",
 }
+# F18-P proves the ledger consumer lag stays flat while the outbox relay is
+# halted — the discriminator against F04-R (consumer stop, lag grows).
+BANKING_KAFKA_LAG_CONTRACT = {
+    "namespace": "rca-testbed-banking",
+    "pod": "testbed-kafka-0",
+    "bootstrap_server": "localhost:9092",
+    "consumer_group": "ledger-service",
+}
+APPROVED_KAFKA_LAG_CONTRACTS = (KAFKA_LAG_CONTRACT, BANKING_KAFKA_LAG_CONTRACT)
 
 
 class LiveProbeError(RuntimeError):
@@ -737,7 +746,7 @@ class LiveProbeSet:
                 f"kubernetes:{namespace}:{deployment}:available-replicas"
             )
         if query.query_id == "kubernetes.kafka_consumer_lag":
-            if dict(query.parameters) != KAFKA_LAG_CONTRACT:
+            if dict(query.parameters) not in APPROVED_KAFKA_LAG_CONTRACTS:
                 raise LiveProbeError("Kafka lag target is not allowlisted")
             namespace = str(query.parameters["namespace"])
             pod = str(query.parameters["pod"])
