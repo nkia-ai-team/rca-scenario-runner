@@ -428,19 +428,25 @@ class LiveProbeSet:
 
     def _loadgen_observation(self, query: ApprovedQuery) -> tuple[float, datetime, str]:
         if query.parameters or query.query_id not in {
-            "loadgen.achieved_rps", "loadgen.checkout_5xx_rate"
+            "loadgen.achieved_rps", "loadgen.checkout_5xx_rate",
+            "loadgen.write_step_status_rate", "loadgen.read_step_status_rate",
+            "loadgen.food_create_status_rate", "loadgen.transfer_2xx_rate",
         }:
             raise LiveProbeError("unsupported loadgen query")
         document = self._loadgen_live_document()
         field = {
             "loadgen.achieved_rps": "achieved_rps",
             "loadgen.checkout_5xx_rate": "checkout_5xx_rate",
+            "loadgen.write_step_status_rate": "business_nonok_rate",
+            "loadgen.read_step_status_rate": "read_nonok_rate",
+            "loadgen.food_create_status_rate": "business_5xx_rate",
+            "loadgen.transfer_2xx_rate": "business_2xx_rate",
         }[query.query_id]
         value = document.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
             raise LiveProbeError(f"k6 {field} is invalid")
-        if field == "checkout_5xx_rate" and value > 1:
-            raise LiveProbeError("k6 checkout_5xx_rate is outside [0,1]")
+        if field.endswith("_rate") and value > 1:
+            raise LiveProbeError(f"k6 {field} is outside [0,1]")
         return float(value), _parse_time(document["observed_at"]), f"k6:{field}"
 
     def _http_observation(self, query: ApprovedQuery) -> tuple[int, datetime, str]:
