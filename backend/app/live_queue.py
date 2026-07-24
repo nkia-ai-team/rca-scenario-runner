@@ -88,11 +88,14 @@ TRANSIENT_AUTO_RETRY_PREFIXES = ("profile_apply_failed:",)
 #     -> cycle_cooldown(30m) -> waiting_capture([cycle_start, t2+30m]).
 # Enabled only when CYCLE_MODE=1; otherwise the v2 daily-segment queue above is
 # preserved unchanged. The 13 re-capture scenarios are the first v3 subjects.
+# F02-R is excluded from the original 13 captures: its injection was proven
+# physically ineffective (2,016-row table, no symptom), so its ground truth is
+# false (2026-07-24 redesign CUT, user-confirmed). The four G negatives stay —
+# restored registry wiring ships with the same decision.
 CYCLE_SCENARIO_ORDER = (
     "F01-G",
     "F01-H",
     "F01-R",
-    "F02-R",
     "F03-G",
     "F04-R",
     "F05-G",
