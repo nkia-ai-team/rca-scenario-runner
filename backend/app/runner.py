@@ -865,7 +865,13 @@ class ScenarioRunner:
             self.artifact_store.write_result(run_dir, session.trusted_evidence())
             return
         case_token = re.sub(r"[^a-z0-9]+", "-", session.scenario_id.lower()).strip("-")
-        case_id = f"case-{case_token}-{session.run_id[-8:].lower()}"
+        # v3 marker distinguishes continuous-cycle (schema 2.0) cases from the
+        # legacy v2 library that shares /data/eval-cases (2026-07-25, A-plan
+        # coexistence — consumers must tell case-f01-r-v3-<h> from the old
+        # case-f01-r-<h> at a glance). Only emitted in cycle mode; v2 keeps its
+        # name so already-delivered references stay valid.
+        marker = "v3-" if getattr(session.spec, "cycle_mode", False) or os.environ.get("CYCLE_MODE", "").lower() in {"1", "true", "yes", "on"} else ""
+        case_id = f"case-{case_token}-{marker}{session.run_id[-8:].lower()}"
         evidence = None
         if mode == "evaluation":
             if not self.dispatcher_path.is_file() or not self.catalog_path.is_file():
