@@ -945,6 +945,15 @@ class LiveScenarioQueue:
             return self._pause(state, f"capture was not scheduled: {state.current_run_id}")
         t2 = parse_utc(job.t2, field="t2")
         now = self.clock.now()
+        # Write phases.json at cooldown ENTRY (t2), not cooldown end. All phase
+        # boundaries are deterministic once t2 is known (cooldown.end = t2 +
+        # CYCLE_COOLDOWN_DURATION), and the capture job fires at t2 + POST_WINDOW
+        # (20m). When cooldown (30m) > POST_WINDOW, a cooldown-end write lands
+        # after the capture invoker already built its args → --phases-json
+        # missing, only --topology-bundle present → capture aborts. Writing here
+        # guarantees phases.json exists well before any capture fire. (2026-07-25,
+        # exposed on the production run — shortened smoke cooldown 5m<20m hid it.)
+        self._write_cycle_phases(state)
         state = state.model_copy(
             update={
                 "phase": "cycle_cooldown",
@@ -958,9 +967,11 @@ class LiveScenarioQueue:
         return state
 
     def _tick_cycle_cooldown(self, state: LiveQueueState) -> LiveQueueState:
-        """Hold the 30m recovery/settle window, then write phases.json and hand
-        off to capture. Data already lives in the stores, so a runner restart
-        just re-enters here and waits out the remaining time."""
+        """Hold the 30m recovery/settle window, then hand off to capture. Data
+        already lives in the stores, so a runner restart just re-enters here and
+        waits out the remaining time. phases.json was already written at cooldown
+        entry (t2); re-write here is idempotent and covers a restart-mid-cooldown
+        that skipped the entry write."""
         if not self._transition_due(state):
             return state
         self._write_cycle_phases(state)

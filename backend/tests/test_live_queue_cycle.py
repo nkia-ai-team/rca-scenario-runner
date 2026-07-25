@@ -160,9 +160,15 @@ async def test_cycle_full_flow_reaches_capture_and_starts_next_cycle(tmp_path: P
     state = await queue.tick()  # running -> cycle_cooldown
     assert state.phase == "cycle_cooldown"
     assert state.expected_transition_at == "2026-07-16T10:45:00Z"  # t2 + 30m
+    # phases.json must exist at cooldown ENTRY (t2), before the capture job fires
+    # at t2 + POST_WINDOW (20m) — a cooldown-end write (t2+30m) would land after
+    # the invoker built its args when cooldown (30m) > POST_WINDOW. Regression:
+    # 2026-07-25 production run F01-H aborted with --topology-bundle but no
+    # --phases-json because phases.json was written 10m too late.
+    assert (runner.artifact_store.root / run_id / "phases.json").is_file()
 
     clock.value = state_expected(state)
-    state = await queue.tick()  # cooldown -> waiting_capture (+phases.json)
+    state = await queue.tick()  # cooldown -> waiting_capture
     assert state.phase == "waiting_capture"
     assert (runner.artifact_store.root / run_id / "phases.json").is_file()
 
