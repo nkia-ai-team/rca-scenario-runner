@@ -1704,6 +1704,15 @@ def get_live_queue() -> LiveScenarioQueue:
                     query_url=query_url,
                 )
 
+        # CYCLE_SCENARIOS overrides the frozen 12-scenario order for targeted
+        # single/subset recaptures (e.g. F01-G recalibration) without a code
+        # change. Comma-separated ids; unset keeps CYCLE_SCENARIO_ORDER.
+        cycle_scenarios_env = os.environ.get("CYCLE_SCENARIOS", "").strip()
+        cycle_scenario_ids = (
+            tuple(s.strip() for s in cycle_scenarios_env.split(",") if s.strip())
+            if cycle_scenarios_env
+            else CYCLE_SCENARIO_ORDER
+        )
         _queue = LiveScenarioQueue(
             runner,
             state_path,
@@ -1714,6 +1723,7 @@ def get_live_queue() -> LiveScenarioQueue:
             golden_reset_enabled=os.environ.get("GOLDEN_RESET_ENABLED", "").lower()
             in {"1", "true", "yes", "on"},
             cycle_mode=cycle_mode,
+            cycle_scenario_ids=cycle_scenario_ids,
             topology_collector_factory=topology_collector_factory,
         )
     return _queue
