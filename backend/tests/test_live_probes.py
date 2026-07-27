@@ -11,6 +11,7 @@ import pytest
 from app.adaptive_runtime import EligibilityRequest
 from app.live_probes import (
     DEPLOYMENT_REPLICAS_CONTRACT,
+    BLOCKED_SESSION_SQL,
     EXPECTED_KUBE_CONTEXT,
     EXPECTED_KUBE_NODES,
     F12_PRODUCT_TARGET,
@@ -207,6 +208,8 @@ class Fakes:
             return {"zero_stock_count": 2, "observed_at": NOW.isoformat()}
         if sql == RESTOCK_MOVEMENT_SQL:
             return {"restock_count": 0, "observed_at": NOW.isoformat()}
+        if sql == BLOCKED_SESSION_SQL:
+            return {"blocked_count": 4, "observed_at": NOW.isoformat()}
         return {"tagged_count": 3, "observed_at": NOW.isoformat()}
 
 
@@ -418,18 +421,33 @@ def test_all_producers_use_fixed_templates_selectors_and_parameterized_database(
     assert secret not in all_argv and kwargs["credentials"]["password"] == secret
 
 
-def test_f01r_database_observation_uses_exact_executor_application_name(tmp_path) -> None:
+def test_f01r_database_observation_counts_blocked_sessions_on_the_target_relation(tmp_path) -> None:
+    # F01-R/F06-H no longer tag the injecting session (the tag was the answer in
+    # plain text), so the controller confirms the lock by its victims instead.
     fakes = Fakes()
     probes = _probes(tmp_path, fakes)
     query = ApprovedQueryRegistry.from_path().bind(
         {
-            "query_id": "database.tagged_session_count",
-            "parameters": {"scenario_tag": "rca-F01-R-inventory-lock"},
+            "query_id": "database.blocked_session_count",
+            "parameters": {"schema": "inventory_schema", "table": "inventory"},
         }
     )
     value = probes.observe(query)
-    assert value["quality"] == "good" and value["value"] == 3
-    assert fakes.database_calls[0][1] == ("rca-F01-R-inventory-lock",)
+    assert value["quality"] == "good" and value["value"] == 4
+    sql, parameters, _ = fakes.database_calls[0]
+    assert sql == BLOCKED_SESSION_SQL and parameters == ("inventory_schema.inventory",)
+
+
+def test_blocked_session_probe_rejects_relations_outside_the_approved_lock_levels(tmp_path) -> None:
+    probes = _probes(tmp_path, Fakes())
+    query = ApprovedQueryRegistry.from_path().bind(
+        {
+            "query_id": "database.blocked_session_count",
+            "parameters": {"schema": "public", "table": "orders"},
+        }
+    )
+    value = probes.observe(query)
+    assert value["quality"] == "error"
 
 
 def test_f02r_index_probe_is_fixed_and_parameterized(tmp_path) -> None:

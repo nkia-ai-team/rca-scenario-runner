@@ -187,6 +187,29 @@ TAGGED_SESSION_SQL = (
     "SELECT count(*) AS tagged_count FROM pg_stat_activity "
     "WHERE application_name = current_setting('lucida.scenario_tag')"
 )
+# Successor to TAGGED_SESSION_SQL for the PostgreSQL lock scenarios (F01-R,
+# F06-H). Those injectors no longer wear a scenario-encoded application_name —
+# the tag was the answer written in plain text in the captured data (quality
+# charter L1), so the injecting session now presents itself as "PostgreSQL JDBC
+# Driver" exactly like the app. A name-based count therefore always returns 0.
+#
+# The replacement counts the injection's *victims* instead of its signature:
+# sessions that are blocked (pg_blocking_pids) while touching the target
+# relation. This is strictly better evidence — a held lock nobody waits on is
+# not an incident (charter G3), so what the controller needs to confirm is that
+# the lock actually bites. Covers both lock scopes: a row-lock waiter blocks on
+# transactionid while holding a granted relation lock on the target, and a
+# table-lock waiter blocks on the relation itself. Both match on l.relation.
+BLOCKED_SESSION_SQL = (
+    "SELECT count(*) AS blocked_count FROM pg_stat_activity a "
+    "WHERE cardinality(pg_blocking_pids(a.pid)) > 0 "
+    "AND EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid "
+    "AND l.relation = to_regclass(current_setting('lucida.lock_relation')))"
+)
+# Only relations an approved db.lock level actually targets may be probed.
+BLOCKED_SESSION_RELATIONS = frozenset(
+    {"inventory_schema.inventory", "payment_schema.payments"}
+)
 INDEX_PRESENT_SQL = (
     "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_indexes "
     "WHERE schemaname = current_setting('lucida.index_schema') "
@@ -1108,6 +1131,21 @@ class LiveProbeSet:
                 _response_time(response, self.clock),
                 "database:order-duplicate-count-since-t1",
             )
+        if query.query_id == "database.blocked_session_count":
+            if set(query.parameters) != {"schema", "table"}:
+                raise LiveProbeError("blocked session probe requires schema and table")
+            relation = f"{query.parameters['schema']}.{query.parameters['table']}"
+            if relation not in BLOCKED_SESSION_RELATIONS:
+                raise LiveProbeError("blocked session relation is not allowlisted")
+            response = self.database_client(
+                BLOCKED_SESSION_SQL,
+                (relation,),
+                credentials=self.database_credentials,
+            )
+            count = response.get("blocked_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise LiveProbeError("blocked session count is invalid")
+            return count, _response_time(response, self.clock), "database:blocked-session-count"
         if query.query_id != "database.tagged_session_count" or set(query.parameters) - {"scenario_tag"}:
             raise LiveProbeError("unsupported database query")
         tag = query.parameters.get("scenario_tag") or (

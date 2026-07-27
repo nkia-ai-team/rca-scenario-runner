@@ -195,6 +195,15 @@
         "scenario_tag"
       ]
     },
+    "database.blocked_session_count": {
+      "adapter": "database",
+      "selector": "postgres.pg_locks.blocked_session_count",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "schema",
+        "table"
+      ]
+    },
     "database.index_present": {
       "adapter": "database",
       "selector": "postgres.index.present",

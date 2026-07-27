@@ -42,6 +42,7 @@ from app.observations import (
     PrometheusAdapter,
 )
 from app.live_probes import (
+    BLOCKED_SESSION_SQL,
     INDEX_PRESENT_SQL,
     PAYMENT_DUPLICATE_SINCE_T1_SQL,
     LiveProbeSet,
@@ -450,6 +451,11 @@ def _configured_live_probes(
         if sql == TAGGED_SESSION_SQL and len(parameters) == 1:
             pgoptions = f"-c lucida.scenario_tag={parameters[0]}"
             result_field = "tagged_count"
+        elif sql == BLOCKED_SESSION_SQL and parameters in (
+            ("inventory_schema.inventory",), ("payment_schema.payments",)
+        ):
+            pgoptions = f"-c lucida.lock_relation={parameters[0]}"
+            result_field = "blocked_count"
         elif sql == INDEX_PRESENT_SQL and parameters == (
             "product_schema", "products", "idx_products_name"
         ):
