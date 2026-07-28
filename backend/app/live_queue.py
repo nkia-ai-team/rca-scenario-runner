@@ -36,15 +36,15 @@ from app.runner import ScenarioRunner, get_runner
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+# F03-G, F09-P and F11-G left this queue on 2026-07-27: the golden audit parked
+# them (readiness=parked in testbed-services catalog.json), so compile-plan no
+# longer yields live_allowed and the dispatcher would refuse them anyway.
 LIVE_SCENARIO_ORDER = (
     "F01-R",
     "F01-H",
-    "F03-G",
     "F06-R",
     "F07-H",
     "F08-H",
-    "F09-P",
-    "F11-G",
 )
 QUEUE_POLL_INTERVAL_SEC = 5
 # Daily normal-segment protection (spec §2.1): the 00:00-02:00 KST window is
@@ -91,11 +91,12 @@ TRANSIENT_AUTO_RETRY_PREFIXES = ("profile_apply_failed:",)
 # preserved unchanged. The 13 re-capture scenarios are the first v3 subjects.
 # F02-R is excluded from the original 13 captures: its injection was proven
 # physically ineffective (2,016-row table, no symptom), so its ground truth is
-# false (2026-07-24 redesign CUT, user-confirmed). The four G negatives stay —
-# restored registry wiring ships with the same decision.
-# Order: eight positives first, the four G negatives last — G needs re-calibration
-# (2026-07-24 smoke: F01-G adaptive aborted with must_rule_out), so leading with G
-# kept stalling the queue on calibration issues.
+# false (2026-07-24 redesign CUT, user-confirmed).
+# The four G negatives (F01-G, F03-G, F05-G, F11-G) and F09-P left on
+# 2026-07-27: the golden audit parked all five. The G four are no-incident
+# cases, which the quality charter §1 abolished outright; F09-P's success rules
+# were all self-fulfilling and its throttling signal does not exist. Anything
+# they already produced is not usable as evaluation data.
 CYCLE_SCENARIO_ORDER = (
     "F01-H",
     "F01-R",
@@ -103,12 +104,7 @@ CYCLE_SCENARIO_ORDER = (
     "F06-R",
     "F07-H",
     "F08-H",
-    "F09-P",
     "F11-R",
-    "F01-G",
-    "F03-G",
-    "F05-G",
-    "F11-G",
 )
 def _cycle_duration(env_name: str, default: timedelta) -> timedelta:
     """Contract v3 phase length, overridable in seconds for shortened smoke
