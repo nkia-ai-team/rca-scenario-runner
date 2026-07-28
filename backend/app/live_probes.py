@@ -213,6 +213,24 @@ MYSQL_INDEX_CONTRACT = {
     "database": "fooddelivery", "table": "menus", "index": "idx_menus_category"
 }
 OUTBOX_UNPUBLISHED_CONTRACT = {"namespace": "rca-testbed-banking"}
+# F04-H decisive evidence: commerce order_schema.outbox_events rows the halted
+# relay has not published. The banking counterpart above goes through sqlplus on
+# testbed-oracle-0 and is therefore unusable here — commerce lives on
+# PostgreSQL, so this one rides the same database_client as the other commerce
+# probes. Baseline sits near zero because the relay drains every 2s
+# (OutboxRelay @Scheduled), which is what makes a monotone climb decisive.
+COMMERCE_OUTBOX_UNPUBLISHED_CONTRACT = {
+    "db_host": "192.168.122.77",
+    "db_port": 30432,
+    "db_name": "commerce",
+    "db_user": "commerce",
+    "schema": "order_schema",
+    "table": "outbox_events",
+}
+COMMERCE_OUTBOX_UNPUBLISHED_SQL = (
+    "SELECT count(*) AS unpublished_count FROM order_schema.outbox_events "
+    "WHERE published_at IS NULL"
+)
 HOST_PROBE_CONTRACTS = {
     "F02-H": ("192.168.122.184", "fio", "/opt/local-path-provisioner/pvc-5d71e22a-1225-4505-a7cc-5cf29dad4cf5_rca-testbed-commerce_pgdata-testbed-postgres-0"),
     "F10-R": ("192.168.122.184", "watermark", "/opt/local-path-provisioner/pvc-5d71e22a-1225-4505-a7cc-5cf29dad4cf5_rca-testbed-commerce_pgdata-testbed-postgres-0"),
@@ -1125,6 +1143,20 @@ class LiveProbeSet:
             if not re.fullmatch(r"[0-9]+", raw):
                 raise LiveProbeError("outbox unpublished count is invalid")
             return int(raw), _aware(self.clock()), "database:outbox-unpublished-count"
+        if query.query_id == "database.commerce_outbox_unpublished_count":
+            if dict(query.parameters) != COMMERCE_OUTBOX_UNPUBLISHED_CONTRACT:
+                raise LiveProbeError("commerce outbox count target is not allowlisted")
+            response = self.database_client(
+                COMMERCE_OUTBOX_UNPUBLISHED_SQL, (), credentials=self.database_credentials,
+            )
+            count = response.get("unpublished_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise LiveProbeError("commerce outbox unpublished count is invalid")
+            return (
+                count,
+                _response_time(response, self.clock),
+                "database:commerce-outbox-unpublished-count",
+            )
         if query.query_id == "database.payment_duplicate_order_count_since_t1":
             state = self._f06_pulse_state(query)
             started_at = _parse_time(state.get("started_at"))

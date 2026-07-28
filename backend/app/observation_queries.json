@@ -453,6 +453,19 @@
         "namespace"
       ]
     },
+    "database.commerce_outbox_unpublished_count": {
+      "adapter": "database",
+      "selector": "commerce.outbox_unpublished_count",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "db_host",
+        "db_port",
+        "db_name",
+        "db_user",
+        "schema",
+        "table"
+      ]
+    },
     "prometheus.hikari_pending_connections": {
       "adapter": "prometheus",
       "template_id": "otel-hikari-pending-v1",

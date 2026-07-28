@@ -15,6 +15,8 @@ from app.live_probes import (
     EXPECTED_KUBE_CONTEXT,
     EXPECTED_KUBE_NODES,
     F12_PRODUCT_TARGET,
+    COMMERCE_OUTBOX_UNPUBLISHED_CONTRACT,
+    COMMERCE_OUTBOX_UNPUBLISHED_SQL,
     INDEX_PRESENT_CONTRACT,
     INDEX_PRESENT_SQL,
     INVENTORY_STOCK_CONTRACT,
@@ -208,6 +210,8 @@ class Fakes:
             return {"zero_stock_count": 2, "observed_at": NOW.isoformat()}
         if sql == RESTOCK_MOVEMENT_SQL:
             return {"restock_count": 0, "observed_at": NOW.isoformat()}
+        if sql == COMMERCE_OUTBOX_UNPUBLISHED_SQL:
+            return {"unpublished_count": 37, "observed_at": NOW.isoformat()}
         if sql == BLOCKED_SESSION_SQL:
             return {"blocked_count": 4, "observed_at": NOW.isoformat()}
         return {"tagged_count": 3, "observed_at": NOW.isoformat()}
@@ -519,6 +523,36 @@ def test_f23r_inventory_stock_and_restock_probes_are_fixed_and_parameterized(tmp
     tampered["table"] = "products"
     rejected = probes.observe(
         registry.bind({"query_id": "database.inventory_stock_level", "parameters": tampered})
+    )
+    assert rejected["quality"] == "error" and rejected["value"] is None
+
+
+def test_f04h_commerce_outbox_probe_is_fixed_and_separate_from_banking(tmp_path) -> None:
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+
+    observed = probes.observe(
+        registry.bind(
+            {
+                "query_id": "database.commerce_outbox_unpublished_count",
+                "parameters": COMMERCE_OUTBOX_UNPUBLISHED_CONTRACT,
+            }
+        )
+    )
+
+    assert observed["quality"] == "good" and observed["value"] == 37
+    sql, parameters, _ = fakes.database_calls[0]
+    assert sql == COMMERCE_OUTBOX_UNPUBLISHED_SQL and parameters == ()
+    # The banking probe shells into Oracle; this one must never take that path.
+    assert not [call for call, _ in fakes.process_calls if call[0] == "kubectl"]
+
+    tampered = dict(COMMERCE_OUTBOX_UNPUBLISHED_CONTRACT)
+    tampered["schema"] = "banking"
+    rejected = probes.observe(
+        registry.bind(
+            {"query_id": "database.commerce_outbox_unpublished_count", "parameters": tampered}
+        )
     )
     assert rejected["quality"] == "error" and rejected["value"] is None
 
