@@ -624,6 +624,11 @@ class LiveProbeSet:
             # F23-R: business_409_rate is computed by the north-south monitor
             # (business_step status==409 fraction) alongside business_5xx_rate.
             "loadgen.checkout_409_rate": "business_409_rate",
+            # F06-P: 하류 rate limit(429)은 4xx의 또 다른 부분집합이라
+            # business_nonok_rate로는 검증 거절과 구분되지 않고,
+            # business_5xx_rate로는 아예 보이지 않는다 — 앱이 하류 상태코드를
+            # 5xx로 승격하지 않고 그대로 전파하기 때문이다.
+            "loadgen.food_create_429_rate": "business_429_rate",
             # F17-P dual-arm reuse: direct arm 2xx rate / control arm reject
             # rate, both already emitted per business_step/read_step tagging.
             "loadgen.frozen_bypass_completed_rate": "business_2xx_rate",
