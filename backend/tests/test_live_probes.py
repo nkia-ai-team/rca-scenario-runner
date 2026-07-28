@@ -224,7 +224,7 @@ def _paths(tmp_path: Path) -> ProbePaths:
     )
 
 
-def _probes(tmp_path: Path, fakes: Fakes, *, credentials=None) -> LiveProbeSet:
+def _probes(tmp_path: Path, fakes: Fakes, *, credentials=None, scenario_id="F07-H") -> LiveProbeSet:
     paths = _paths(tmp_path)
     _write(
         paths.baseline_status,
@@ -247,7 +247,7 @@ def _probes(tmp_path: Path, fakes: Fakes, *, credentials=None) -> LiveProbeSet:
         http_client=fakes.http,
         database_client=fakes.database,
         database_credentials=credentials or {"password": "top-secret", "user": "probe"},
-        scenario_id="F07-H",
+        scenario_id=scenario_id,
         clock=lambda: NOW,
         paths=paths,
     )
@@ -436,6 +436,28 @@ def test_f01r_database_observation_counts_blocked_sessions_on_the_target_relatio
     assert value["quality"] == "good" and value["value"] == 4
     sql, parameters, _ = fakes.database_calls[0]
     assert sql == BLOCKED_SESSION_SQL and parameters == ("inventory_schema.inventory",)
+
+
+def test_timeline_scenario_ids_can_read_their_own_load_summary(tmp_path) -> None:
+    # F15-T1..T4 are timeline compositions; the old single-letter id pattern
+    # excluded them, so achieved_rps errored on every tick of F15-T1.
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes, scenario_id="F15-T1")
+    _write(
+        _paths(tmp_path).loadgen_summary,
+        {
+            "scenario_id": "F15-T1",
+            "scenario_tag": "scenario_id=F15-T1",
+            "achieved_rps": 72.5,
+            "checkout_5xx_rate": 0.125,
+            "entry_status": 200,
+            "business_ok": True,
+            "observed_at": NOW.isoformat(),
+        },
+    )
+    query = ApprovedQueryRegistry.from_path().bind({"query_id": "loadgen.achieved_rps"})
+    value = probes.observe(query)
+    assert value["quality"] == "good" and value["value"] == 72.5
 
 
 def test_blocked_session_probe_rejects_relations_outside_the_approved_lock_levels(tmp_path) -> None:

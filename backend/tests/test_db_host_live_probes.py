@@ -4,7 +4,7 @@ import json
 import subprocess
 from datetime import datetime, timezone
 
-from app.live_probes import HOST_PROBE_CONTRACTS, LiveProbeSet
+from app.live_probes import APPROVED_ORACLE_TAGS, HOST_PROBE_CONTRACTS, LiveProbeSet
 from app.observations import ApprovedQueryRegistry
 
 NOW = datetime(2026, 7, 17, 3, 0, tzinfo=timezone.utc)
@@ -60,6 +60,29 @@ def test_oracle_and_mysql_queries_are_fixed_kubectl_reads() -> None:
     rendered = json.dumps([argv for argv, _ in fake.calls])
     assert "v$session" in rendered and "information_schema.statistics" in rendered
     assert all(call[0][0:2] == ["kubectl", "--kubeconfig"] for call in fake.calls)
+
+
+def test_oracle_probe_reads_every_approved_lock_tag_not_just_f01p() -> None:
+    # The tag used to be frozen into one contract dict and hand-encoded as
+    # chr() codes in the SQL, so F08-G and F15-G had no observable Oracle lock.
+    for tag in sorted(APPROVED_ORACLE_TAGS):
+        fake = FakeProcess()
+        result = observe(fake, "database.oracle_tagged_session_count", {
+            "client_identifier": tag
+        })
+        assert result["quality"] == "good"
+        rendered = json.dumps([argv for argv, _ in fake.calls])
+        # The tag reaches the query as chr()-joined codes, never as a raw quote.
+        assert "||".join(f"chr({ord(ch)})" for ch in tag) in rendered
+        assert f"'{tag}'" not in rendered
+
+
+def test_oracle_probe_rejects_a_tag_outside_the_approved_set() -> None:
+    fake = FakeProcess()
+    result = observe(fake, "database.oracle_tagged_session_count", {
+        "client_identifier": "rca-F99-Z-oracle-lock"
+    })
+    assert result["quality"] == "error"
 
 
 def test_host_queries_use_only_measured_worker_and_fixed_probe_script() -> None:

@@ -154,7 +154,34 @@ F12_PRODUCT_TARGET = {
     "deployment": "testbed-product",
     "container": "product-service",
 }
-ORACLE_TAG_CONTRACT = {"client_identifier": "rca-F01-P-oracle-lock"}
+# Every Oracle lock scenario, not just F01-P. The tag used to be frozen into a
+# single contract dict *and* hand-encoded as chr() codes inside the SQL, so
+# F08-G and F15-G had no way to be observed at all and pointed their Oracle
+# observations at the PostgreSQL probe instead — which cannot see an Oracle
+# session, so the gate could never pass.
+# PostgreSQL side. F01-R and F06-H are absent on purpose: their injectors now
+# impersonate the real application (G6/L1), so they are observed through
+# database.blocked_session_count instead of a name. The three that remain still
+# tag, and F15-G was missing here — which is why its lock was invisible to its
+# own controller.
+APPROVED_SESSION_TAGS = frozenset({
+    "rca-F02-G-batch-heavy-sql",
+    "rca-F15-G-inventory-lock",
+    "rca-F15-T1-inventory-lock",
+})
+APPROVED_ORACLE_TAGS = frozenset({
+    "rca-F01-P-oracle-lock",
+    "rca-F08-G-oracle-lock",
+    "rca-F15-G-oracle-lock",
+})
+
+
+def _oracle_string_literal(value: str) -> str:
+    """Render a string as chr()||chr() so it can ride inside the nested
+    printf/sqlplus shell pipeline without a single quote of its own."""
+    if not value or not all(32 <= ord(ch) < 127 for ch in value):
+        raise LiveProbeError("Oracle tag is not printable ASCII")
+    return "||".join(f"chr({ord(ch)})" for ch in value)
 MYSQL_INDEX_CONTRACT = {
     "database": "fooddelivery", "table": "menus", "index": "idx_menus_category"
 }
@@ -989,12 +1016,18 @@ class LiveProbeSet:
 
     def _database_observation(self, query: ApprovedQuery) -> tuple[Any, datetime, str]:
         if query.query_id == "database.oracle_tagged_session_count":
-            if dict(query.parameters) != ORACLE_TAG_CONTRACT:
+            if set(query.parameters) != {"client_identifier"}:
+                raise LiveProbeError("Oracle session probe requires client_identifier")
+            tag = query.parameters["client_identifier"]
+            if tag not in APPROVED_ORACLE_TAGS:
                 raise LiveProbeError("Oracle session tag is not allowlisted")
             result = self._kubectl(
                 "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
                 "sh", "-lc",
-                "printf 'alter session set container=FREEPDB1;\\nset pages 0 feedback off heading off\\nselect count(*) from v$session where client_identifier=chr(114)||chr(99)||chr(97)||chr(45)||chr(70)||chr(48)||chr(49)||chr(45)||chr(80)||chr(45)||chr(111)||chr(114)||chr(97)||chr(99)||chr(108)||chr(101)||chr(45)||chr(108)||chr(111)||chr(99)||chr(107);\\nexit;\\n' | sqlplus -s / as sysdba",
+                "printf 'alter session set container=FREEPDB1;\\n"
+                "set pages 0 feedback off heading off\\n"
+                "select count(*) from v$session where client_identifier="
+                f"{_oracle_string_literal(tag)};\\nexit;\\n' | sqlplus -s / as sysdba",
             )
             raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
@@ -1154,15 +1187,7 @@ class LiveProbeSet:
         if (
             not isinstance(tag, str)
             or len(tag) > 96
-            or not (
-                tag.startswith("lucida:")
-                or tag in {
-                    "rca-F01-R-inventory-lock",
-                    "rca-F02-G-batch-heavy-sql",
-                    "rca-F06-H-payment-lock",
-                    "rca-F15-T1-inventory-lock",
-                }
-            )
+            or not (tag.startswith("lucida:") or tag in APPROVED_SESSION_TAGS)
         ):
             raise LiveProbeError("database scenario tag is invalid")
         response = self.database_client(
@@ -1288,7 +1313,12 @@ class LiveProbeSet:
         return document
 
     def _loadgen_live_document(self) -> dict[str, Any]:
-        if self.scenario_id is None or not re.fullmatch(r"F[0-9]{2}-[A-Z]", self.scenario_id):
+        # T-suffixed ids (F15-T1..T4) are timeline compositions and were excluded
+        # by the single-letter pattern, so F15-T1 could never read its own load
+        # summary — achieved_rps failed the probe on every tick.
+        if self.scenario_id is None or not re.fullmatch(
+            r"F[0-9]{2}-(?:[A-Z]|T[1-4])", self.scenario_id
+        ):
             raise LiveProbeError("loadgen observation requires an allowlisted scenario id")
         if self.paths.loadgen_summary.is_file():
             document = _read_json(self.paths.loadgen_summary)
