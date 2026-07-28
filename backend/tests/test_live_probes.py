@@ -696,9 +696,11 @@ def test_restaurant_apm_p95_and_error_rate_are_approved_live_observations(tmp_pa
     assert all(item["quality"] == "good" for item in values.values())
 
 
-def test_jvm_nondaemon_thread_count_is_approved_for_f21_targets(tmp_path) -> None:
-    # F21-Q/P: no Tomcat-thread-pool metric exists — the JVM non-daemon thread
-    # sum is the approved approximation, allowlisted for order and api only.
+def test_jvm_daemon_thread_count_is_approved_for_f21_targets(tmp_path) -> None:
+    # F21-Q/P: no Tomcat-thread-pool metric exists, so the JVM daemon thread sum
+    # is the approximation — daemon, because Tomcat's http-nio-*-exec workers are
+    # daemon threads. The non-daemon sum this used until 2026-07-28 excluded them
+    # and sat flat at 4-5 forever. Allowlisted for order and api only.
     fakes = Fakes()
     probes = _probes(tmp_path, fakes)
     registry = ApprovedQueryRegistry.from_path()
@@ -706,7 +708,7 @@ def test_jvm_nondaemon_thread_count_is_approved_for_f21_targets(tmp_path) -> Non
     order = probes.observe(
         registry.bind(
             {
-                "query_id": "prometheus.jvm_nondaemon_thread_count",
+                "query_id": "prometheus.jvm_daemon_thread_count",
                 "parameters": {"service_name": "food-delivery-order"},
             }
         )
@@ -714,7 +716,7 @@ def test_jvm_nondaemon_thread_count_is_approved_for_f21_targets(tmp_path) -> Non
     api = probes.observe(
         registry.bind(
             {
-                "query_id": "prometheus.jvm_nondaemon_thread_count",
+                "query_id": "prometheus.jvm_daemon_thread_count",
                 "parameters": {"service_name": "core-banking-api"},
             }
         )
@@ -722,7 +724,7 @@ def test_jvm_nondaemon_thread_count_is_approved_for_f21_targets(tmp_path) -> Non
     rejected = probes.observe(
         registry.bind(
             {
-                "query_id": "prometheus.jvm_nondaemon_thread_count",
+                "query_id": "prometheus.jvm_daemon_thread_count",
                 "parameters": {"service_name": "commerce-order"},
             }
         )
@@ -734,7 +736,7 @@ def test_jvm_nondaemon_thread_count_is_approved_for_f21_targets(tmp_path) -> Non
     assert rendered == (
         "sum without(grade,target_id,host_name,process_pid,os_description,os_type,"
         'host_arch,jvm_thread_state) (apm.agent.otel.java.jvm.thread.count'
-        '{service_name="core-banking-api",jvm_thread_daemon="false"})'
+        '{service_name="core-banking-api",jvm_thread_daemon="true"})'
     )
 
 

@@ -85,13 +85,16 @@ PROMETHEUS_TEMPLATES = {
         'pod=~"testbed-product-.*"})'
     ),
     # F21-Q/P: no Tomcat-thread-pool metric exists in the APM pipeline —
-    # apm.agent.otel.java.jvm.thread.count (non-daemon sum) is the approved
-    # approximation (live-verified 2026-07-24, jvm_thread_state/host/pid labels
-    # collapsed via `sum without`).
-    "otel-jvm-nondaemon-thread-count-v1": (
+    # Tomcat's http-nio-*-exec worker threads are DAEMON threads, so the
+    # non-daemon filter this query used until 2026-07-28 excluded exactly the
+    # pool the thread-saturation scenarios (F21-P, F21-Q) are about. Measured on
+    # VictoriaMetrics 119:18428 over 24h: non-daemon sits flat at 4-5 and never
+    # moves, while daemon runs ~40 at rest and climbs to ~80 under load. A gate
+    # of "busy threads >= 180" against the non-daemon count could never fire.
+    "otel-jvm-daemon-thread-count-v1": (
         'sum without(grade,target_id,host_name,process_pid,os_description,os_type,'
         'host_arch,jvm_thread_state) (apm.agent.otel.java.jvm.thread.count'
-        '{service_name="%s",jvm_thread_daemon="false"})'
+        '{service_name="%s",jvm_thread_daemon="true"})'
     ),
 }
 APPROVED_SERVICES = frozenset({"commerce-gateway", "commerce-order", "commerce-payment"})
@@ -708,7 +711,7 @@ class LiveProbeSet:
             if service not in APPROVED_HIKARI_SERVICES:
                 raise LiveProbeError("Hikari service_name is not allowlisted")
             promql = PROMETHEUS_TEMPLATES[query.template_id] % service
-        elif query.query_id == "prometheus.jvm_nondaemon_thread_count":
+        elif query.query_id == "prometheus.jvm_daemon_thread_count":
             if set(query.parameters) != {"service_name"}:
                 raise LiveProbeError("JVM thread query requires the fixed service parameter")
             service = query.parameters["service_name"]
