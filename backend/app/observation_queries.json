@@ -528,6 +528,14 @@
       "selector": "business.429.rate",
       "freshness_sec": 30,
       "allowed_parameters": []
+    },
+    "host.disk_io_utilization": {
+      "adapter": "host_probe",
+      "selector": "scenario.target.disk_io_utilization",
+      "freshness_sec": 30,
+      "allowed_parameters": [
+        "scenario_id"
+      ]
     }
   }
 }

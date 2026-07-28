@@ -190,7 +190,11 @@ HOST_PROBE_CONTRACTS = {
     "F02-H": ("192.168.122.184", "fio", "/opt/local-path-provisioner/pvc-5d71e22a-1225-4505-a7cc-5cf29dad4cf5_rca-testbed-commerce_pgdata-testbed-postgres-0"),
     "F10-R": ("192.168.122.184", "watermark", "/opt/local-path-provisioner/pvc-5d71e22a-1225-4505-a7cc-5cf29dad4cf5_rca-testbed-commerce_pgdata-testbed-postgres-0"),
     "F10-H": ("192.168.122.14", "fio", "/opt/local-path-provisioner/pvc-3439d85f-f921-4b19-8808-c679506a31dd_rca-testbed-food_mysqldata-testbed-mysql-0"),
-    "F10-P": ("192.168.122.184", "fio", "/opt/local-path-provisioner/pvc-01f9e717-727a-4227-a09b-584ec371c99f_rca-testbed-banking_oracledata-testbed-oracle-0"),
+    # 2026-07-28: Oracle moved to tb-w2 when the domain-worker placement was
+    # pinned with nodeSelector, and its local-path PV had to be reprovisioned —
+    # so both the host and the PVC uuid changed. The old pair pointed at a
+    # directory that no longer exists on a node the injection never touches.
+    "F10-P": ("192.168.122.11", "fio", "/opt/local-path-provisioner/pvc-2c369013-b180-417a-9eda-da922c78b6ee_rca-testbed-banking_oracledata-testbed-oracle-0"),
     "F15-P": ("192.168.122.11", "pressure", ""),
 }
 HOST_PROBE_SCRIPT = br'''#!/usr/bin/env bash
@@ -198,7 +202,7 @@ set -euo pipefail
 scenario="$1"; mode="$2"; target="$3"
 state_root=/var/lib/lucida/scenario-profile-state
 pidfile="$state_root/${scenario}.pid"
-active=false; artifact=false; used=0
+active=false; artifact=false; used=0; io_util=0
 if [[ -s "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then active=true; fi
 case "$mode" in
  fio) [[ -e "$target/.lucida-${scenario}-fio" ]] && artifact=true ;;
@@ -207,8 +211,24 @@ case "$mode" in
  *) exit 2 ;;
 esac
 if [[ -n "$target" ]]; then used=$(df -P "$target" | awk 'NR==2{gsub(/%/,"",$5); print $5}'); fi
+# Disk busy percentage for the device backing $target, sampled from
+# /proc/diskstats io_ticks (ms spent with I/O in flight) over a 1s window.
+# Partitions report io_ticks unreliably, so resolve the parent disk first.
+if [[ -n "$target" ]]; then
+  src=$(df -P "$target" | awk 'NR==2{print $1}')
+  dev=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)
+  [[ -z "$dev" ]] && dev=$(basename "$src")
+  t0=$(awk -v d="$dev" '$3==d{print $13}' /proc/diskstats)
+  sleep 1
+  t1=$(awk -v d="$dev" '$3==d{print $13}' /proc/diskstats)
+  if [[ -n "$t0" && -n "$t1" && "$t1" -ge "$t0" ]]; then
+    io_util=$(( (t1 - t0) / 10 ))
+    (( io_util > 100 )) && io_util=100
+  fi
+fi
 clean=true; $active && clean=false; $artifact && clean=false
-printf '{"active":%s,"clean":%s,"filesystem_used_percent":%s}\n' "$active" "$clean" "$used"
+printf '{"active":%s,"clean":%s,"filesystem_used_percent":%s,"disk_io_utilization":%s}\n' \
+  "$active" "$clean" "$used" "$io_util"
 '''
 TAGGED_SESSION_SQL = (
     "SELECT count(*) AS tagged_count FROM pg_stat_activity "
@@ -1240,9 +1260,23 @@ class LiveProbeSet:
             value = payload.get("filesystem_used_percent")
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
                 raise LiveProbeError("filesystem utilization is invalid")
+        elif query.query_id == "host.disk_io_utilization":
+            # The storage-saturation scenarios (F02-H, F10-H, F10-P) need to show
+            # that the device is busy, not merely that the database is slow —
+            # without it "storage saturation" is indistinguishable from a lock,
+            # a slow query, or a starved pool. KCM exposes node CPU and memory
+            # but no per-device I/O, so this is measured on the host directly.
+            if not target:
+                raise LiveProbeError("host scenario has no filesystem target")
+            value = payload.get("disk_io_utilization")
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+                raise LiveProbeError("disk utilization is invalid")
         else:
             raise LiveProbeError("unsupported host query")
-        if query.query_id != "host.filesystem_used_percent" and not isinstance(value, bool):
+        if query.query_id not in (
+            "host.filesystem_used_percent",
+            "host.disk_io_utilization",
+        ) and not isinstance(value, bool):
             raise LiveProbeError("host state is invalid")
         return value, _aware(self.clock()), f"host:{scenario_id}:{query.query_id}"
 
