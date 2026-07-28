@@ -74,9 +74,22 @@ PROMETHEUS_TEMPLATES = {
     "otel-hikari-pending-v1": (
         'sum(db.client.connections.pending_requests{service_name="%s"})'
     ),
+    # Parameterized on 2026-07-28. It used to hardcode testbed-product, which
+    # made the throttling signal exist for F12-H and for nothing else — F09-P
+    # throttles testbed-inventory and was rejected before it reached PromQL.
     "kcm-pod-cpu-throttled-time-v1": (
-        'max without(grade) (kcm.pod.cpu_throttled_time{namespace="rca-testbed-commerce",'
-        'pod=~"testbed-product-.*"})'
+        'max without(grade) (kcm.pod.cpu_throttled_time{namespace="%s",'
+        'pod=~"%s-.*"})'
+    ),
+    # Old-gen occupancy immediately after a collection, as a fraction of the
+    # pool limit. This is the GC-pressure signal: a heap that cannot be reclaimed
+    # keeps climbing here even though used/committed look busy either way.
+    # jvm.gc.duration is not collected, so this stands in for it (F09-H).
+    "otel-jvm-old-gen-after-gc-ratio-v1": (
+        'max by (service_name) (apm.agent.otel.java.jvm.memory.used_after_last_gc'
+        '{service_name="%s",jvm_memory_pool_name="Tenured Gen"}) '
+        '/ max by (service_name) (apm.agent.otel.java.jvm.memory.limit'
+        '{service_name="%s",jvm_memory_pool_name="Tenured Gen"})'
     ),
     "kcm-workload-network-error-rate-v1": (
         'max without(grade) (kcm.pod.network_rx_error{namespace="rca-testbed-commerce",'
@@ -113,6 +126,13 @@ APPROVED_APM_SERVICES = frozenset(
 # F21-Q/P: JVM non-daemon thread sum approximates the Tomcat 200-thread pool
 # (no Tomcat-specific metric exists in the pipeline — see PROMETHEUS_TEMPLATES).
 APPROVED_JVM_THREAD_SERVICES = frozenset({"food-delivery-order", "core-banking-api"})
+# F09-H: heap pressure on commerce order.
+APPROVED_GC_SERVICES = frozenset({"commerce-order"})
+# (namespace, deployment, container) allowed to be asked about CPU throttling.
+THROTTLE_TARGETS = {
+    ("rca-testbed-commerce", "testbed-product", "product-service"),
+    ("rca-testbed-commerce", "testbed-inventory", "inventory-service"),
+}
 # F19-P: Hikari pending gauge (OTel semconv db.client.connections.pending_requests,
 # live-verified 2026-07-24 on VictoriaMetrics 119:18428).
 # F20-P: transfer's own Hikari pool occupied by the trunc() full-scan stats
@@ -719,9 +739,23 @@ class LiveProbeSet:
                 raise LiveProbeError("JVM thread service_name is not allowlisted")
             promql = PROMETHEUS_TEMPLATES[query.template_id] % service
         elif query.query_id == "prometheus.container_cpu_throttled_time":
-            if dict(query.parameters) != F12_PRODUCT_TARGET:
+            if set(query.parameters) != {"namespace", "deployment", "container"}:
+                raise LiveProbeError("CPU throttle query requires the fixed target parameters")
+            target = (
+                query.parameters["namespace"],
+                query.parameters["deployment"],
+                query.parameters["container"],
+            )
+            if target not in THROTTLE_TARGETS:
                 raise LiveProbeError("CPU throttle target is not allowlisted")
-            promql = PROMETHEUS_TEMPLATES[query.template_id]
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % (target[0], target[1])
+        elif query.query_id == "prometheus.jvm_old_gen_after_gc_ratio":
+            if set(query.parameters) != {"service_name"}:
+                raise LiveProbeError("GC ratio query requires the fixed service parameter")
+            service = query.parameters["service_name"]
+            if service not in APPROVED_GC_SERVICES:
+                raise LiveProbeError("GC service_name is not allowlisted")
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % (service, service)
         elif query.query_id == "prometheus.pod_network_error_rate":
             expected = {
                 "namespace": F12_PRODUCT_TARGET["namespace"],
