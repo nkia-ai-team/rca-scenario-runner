@@ -114,7 +114,11 @@ APPROVED_JVM_THREAD_SERVICES = frozenset({"food-delivery-order", "core-banking-a
 # live-verified 2026-07-24 on VictoriaMetrics 119:18428).
 # F20-P: transfer's own Hikari pool occupied by the trunc() full-scan stats
 # query — the decisive "own connection pool contention" signal for F20-P.
-APPROVED_HIKARI_SERVICES = frozenset({"food-delivery-order", "core-banking-transfer"})
+# F02-H: commerce order's pool backing up is what separates "the storage is
+# saturated" from "the application got slower" — the wait is on the DB side.
+APPROVED_HIKARI_SERVICES = frozenset(
+    {"food-delivery-order", "core-banking-transfer", "commerce-order"}
+)
 APPROVED_NODE_TARGETS = frozenset({"tb-w1", "tb-w2", "tb-w3"})
 APPROVED_BUSINESS_KEYS = frozenset({"checkout", "order-1"})
 APPROVED_K8S_TARGETS = {
