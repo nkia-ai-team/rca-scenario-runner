@@ -359,6 +359,9 @@ BLOCKED_SESSION_SQL = (
 BLOCKED_SESSION_RELATIONS = frozenset(
     {"inventory_schema.inventory", "payment_schema.payments"}
 )
+# F14-P's reconciliation window. Pinned so a widened window cannot quietly turn a
+# stale backlog into a fresh "damage" reading.
+LEDGER_UNMATCHED_CONTRACT = {"window_minutes": 5, "grace_seconds": 60}
 INDEX_PRESENT_SQL = (
     "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_indexes "
     "WHERE schemaname = current_setting('lucida.index_schema') "
@@ -1297,6 +1300,45 @@ class LiveProbeSet:
             if not re.fullmatch(r"[0-9]+", raw):
                 raise LiveProbeError("integrity violation count is invalid")
             return int(raw), _aware(self.clock()), "database:integrity-violation-count"
+        if query.query_id == "database.ledger_unmatched_transfer_count":
+            # F14-P decisive evidence: transfers that COMMITTED but whose ledger
+            # rows never landed, because the consumer swallowed the write error
+            # and still committed the offset.
+            #
+            # Deliberately NOT the double-entry imbalance.  recordTransfer writes
+            # DEBIT and CREDIT in one transaction, so this defect drops both and
+            # (DEBIT - CREDIT) stays exactly 0 forever -- the reconciliation batch
+            # is structurally blind to it.  Asserting on imbalance would have been
+            # a success condition that can never fire.
+            #
+            # Windowed rather than since-t1 so the signal also falls back to 0
+            # once writes resume, which is what the recovery gate needs.  The
+            # grace tail excludes transfers whose ledger write is still in flight.
+            parameters = dict(query.parameters)
+            if parameters != LEDGER_UNMATCHED_CONTRACT:
+                raise LiveProbeError("ledger reconciliation window is not allowlisted")
+            window = int(parameters["window_minutes"])
+            grace = int(parameters["grace_seconds"])
+            result = self._kubectl(
+                "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
+                "sh", "-lc",
+                "printf 'alter session set container=FREEPDB1;\\n"
+                "set pages 0 feedback off heading off\\n"
+                "select count(*) from banking.transfers t "
+                "where t.status=''COMPLETED'' "
+                # sys_extract_utc: created_at is stored UTC-naive, so comparing it
+                # against a plain systimestamp would shift the window by the DB
+                # host's offset.
+                f"and t.created_at >= sys_extract_utc(systimestamp) - numtodsinterval({window}, ''MINUTE'') "
+                f"and t.created_at < sys_extract_utc(systimestamp) - numtodsinterval({grace}, ''SECOND'') "
+                "and not exists (select 1 from banking.ledger_entries le "
+                "where le.transfer_ref = t.transfer_ref);\\n"
+                "exit;\\n' | sqlplus -s / as sysdba",
+            )
+            raw = result.stdout.strip()
+            if not re.fullmatch(r"[0-9]+", raw):
+                raise LiveProbeError("ledger unmatched transfer count is invalid")
+            return int(raw), _aware(self.clock()), "database:ledger-unmatched-transfer-count"
         if query.query_id == "business.order_duplicate_count_since_t1":
             # F15-R non-idempotency guard: a 429-retry that creates a second
             # payment row for one order is the duplicate signature that would
