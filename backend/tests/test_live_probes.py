@@ -11,6 +11,7 @@ import pytest
 from app.adaptive_runtime import EligibilityRequest
 from app.live_probes import (
     DEPLOYMENT_REPLICAS_CONTRACT,
+    LOADGEN_FIELDS,
     BLOCKED_SESSION_SQL,
     EXPECTED_KUBE_CONTEXT,
     EXPECTED_KUBE_NODES,
@@ -964,6 +965,30 @@ def test_new_loadgen_rate_queries_map_to_the_expected_summary_fields(tmp_path) -
 
     with pytest.raises(ObservationContractError):
         registry.bind({"query_id": "loadgen.checkout_409_rate", "parameters": {"step": "checkout"}})
+
+
+def test_every_registered_loadgen_query_is_observable(tmp_path) -> None:
+    """The registry and the probe must agree on which loadgen queries exist.
+
+    loadgen.food_create_429_rate was registered and field-mapped but omitted
+    from a second hand-maintained guard set, so F06-P's only success condition
+    raised "unsupported loadgen query" on every tick.
+    """
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    document = json.loads(probes.paths.loadgen_summary.read_text())
+    document.update(dict.fromkeys(LOADGEN_FIELDS.values(), 0.25))
+    document["achieved_rps"] = 40.0
+    _write(probes.paths.loadgen_summary, document)
+
+    registered = {
+        query_id for query_id in registry._queries if query_id.startswith("loadgen.")
+    }
+    assert registered == set(LOADGEN_FIELDS)
+    for query_id in sorted(registered):
+        observed = probes.observe(registry.bind({"query_id": query_id}))
+        assert observed["quality"] == "good", query_id
 
 
 @pytest.mark.parametrize(

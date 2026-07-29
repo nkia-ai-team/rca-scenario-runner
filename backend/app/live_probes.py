@@ -36,6 +36,30 @@ EXPECTED_KUBE_NODES = frozenset({"tb-cp", "tb-w1", "tb-w2", "tb-w3"})
 LOADGEN_HOST = "192.168.122.206"
 LOADGEN_USER = "nkia"
 LOADGEN_KEY = "/root/.ssh/tb_key"
+# k6 live-summary fields, keyed by query id. This mapping is the *only*
+# allowlist for loadgen observations — a second hand-maintained id set used to
+# guard it, and loadgen.food_create_429_rate was added here but not there, so
+# F06-P's sole success condition failed closed on every tick (2026-07-29).
+LOADGEN_FIELDS = {
+    "loadgen.achieved_rps": "achieved_rps",
+    "loadgen.checkout_5xx_rate": "checkout_5xx_rate",
+    "loadgen.write_step_status_rate": "business_nonok_rate",
+    "loadgen.read_step_status_rate": "read_nonok_rate",
+    "loadgen.food_create_status_rate": "business_5xx_rate",
+    "loadgen.transfer_2xx_rate": "business_2xx_rate",
+    # F23-R: business_409_rate is computed by the north-south monitor
+    # (business_step status==409 fraction) alongside business_5xx_rate.
+    "loadgen.checkout_409_rate": "business_409_rate",
+    # F06-P: 하류 rate limit(429)은 4xx의 또 다른 부분집합이라
+    # business_nonok_rate로는 검증 거절과 구분되지 않고, business_5xx_rate로는
+    # 아예 보이지 않는다 — 앱이 하류 상태코드를 5xx로 승격하지 않고 그대로
+    # 전파하기 때문이다.
+    "loadgen.food_create_429_rate": "business_429_rate",
+    # F17-P dual-arm reuse: direct arm 2xx rate / control arm reject rate, both
+    # already emitted per business_step/read_step tagging.
+    "loadgen.frozen_bypass_completed_rate": "business_2xx_rate",
+    "loadgen.normal_path_reject_rate": "read_nonok_rate",
+}
 TARGET_HEALTH_URL = "http://192.168.122.77:30080/health"
 PROMETHEUS_URL = os.environ.get(
     "PROMETHEUS_URL", "http://192.168.230.119:18428/api/v1/query"
@@ -705,35 +729,10 @@ class LiveProbeSet:
         return overlaps, coordinator_clean
 
     def _loadgen_observation(self, query: ApprovedQuery) -> tuple[float, datetime, str]:
-        if query.parameters or query.query_id not in {
-            "loadgen.achieved_rps", "loadgen.checkout_5xx_rate",
-            "loadgen.write_step_status_rate", "loadgen.read_step_status_rate",
-            "loadgen.food_create_status_rate", "loadgen.transfer_2xx_rate",
-            "loadgen.checkout_409_rate", "loadgen.frozen_bypass_completed_rate",
-            "loadgen.normal_path_reject_rate",
-        }:
+        if query.parameters or query.query_id not in LOADGEN_FIELDS:
             raise LiveProbeError("unsupported loadgen query")
         document = self._loadgen_live_document()
-        field = {
-            "loadgen.achieved_rps": "achieved_rps",
-            "loadgen.checkout_5xx_rate": "checkout_5xx_rate",
-            "loadgen.write_step_status_rate": "business_nonok_rate",
-            "loadgen.read_step_status_rate": "read_nonok_rate",
-            "loadgen.food_create_status_rate": "business_5xx_rate",
-            "loadgen.transfer_2xx_rate": "business_2xx_rate",
-            # F23-R: business_409_rate is computed by the north-south monitor
-            # (business_step status==409 fraction) alongside business_5xx_rate.
-            "loadgen.checkout_409_rate": "business_409_rate",
-            # F06-P: 하류 rate limit(429)은 4xx의 또 다른 부분집합이라
-            # business_nonok_rate로는 검증 거절과 구분되지 않고,
-            # business_5xx_rate로는 아예 보이지 않는다 — 앱이 하류 상태코드를
-            # 5xx로 승격하지 않고 그대로 전파하기 때문이다.
-            "loadgen.food_create_429_rate": "business_429_rate",
-            # F17-P dual-arm reuse: direct arm 2xx rate / control arm reject
-            # rate, both already emitted per business_step/read_step tagging.
-            "loadgen.frozen_bypass_completed_rate": "business_2xx_rate",
-            "loadgen.normal_path_reject_rate": "read_nonok_rate",
-        }[query.query_id]
+        field = LOADGEN_FIELDS[query.query_id]
         value = document.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
             raise LiveProbeError(f"k6 {field} is invalid")
