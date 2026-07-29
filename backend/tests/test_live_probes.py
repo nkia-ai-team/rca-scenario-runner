@@ -15,6 +15,8 @@ from app.live_probes import (
     EXPECTED_KUBE_CONTEXT,
     EXPECTED_KUBE_NODES,
     F12_PRODUCT_TARGET,
+    BASELINE_PAID_ORDERS_MIN,
+    BASELINE_PAID_ORDERS_SQL,
     COMMERCE_OUTBOX_UNPUBLISHED_CONTRACT,
     COMMERCE_OUTBOX_UNPUBLISHED_SQL,
     INDEX_PRESENT_CONTRACT,
@@ -53,6 +55,7 @@ class Fakes:
         self.process_calls: list[tuple[list[str], dict]] = []
         self.http_calls: list[tuple[str, str, dict]] = []
         self.database_calls: list[tuple[str, tuple[str, ...], dict]] = []
+        self.paid_orders = 120
 
     def process(self, argv, **kwargs):
         argv = list(argv)
@@ -212,6 +215,8 @@ class Fakes:
             return {"restock_count": 0, "observed_at": NOW.isoformat()}
         if sql == COMMERCE_OUTBOX_UNPUBLISHED_SQL:
             return {"unpublished_count": 37, "observed_at": NOW.isoformat()}
+        if sql == BASELINE_PAID_ORDERS_SQL:
+            return {"paid_count": self.paid_orders, "observed_at": NOW.isoformat()}
         if sql == BLOCKED_SESSION_SQL:
             return {"blocked_count": 4, "observed_at": NOW.isoformat()}
         return {"tagged_count": 3, "observed_at": NOW.isoformat()}
@@ -289,6 +294,35 @@ def test_eligibility_uses_canonical_kubeconfig_exact_context_nodes_and_fixed_hea
         ["kubectl", "--kubeconfig", KUBECONFIG, "get", "nodes", "-o", "json"],
     ]
     assert [(method, url) for method, url, _ in fakes.http_calls] == [("GET", TARGET_HEALTH_URL)]
+
+
+def test_baseline_business_success_blocks_when_checkout_stops_completing(tmp_path) -> None:
+    # 2026-07-28: a missing banking seed account made every commerce checkout
+    # fail for a day while baseline-traffic stayed green — k6 was running, it
+    # was just failing. This check is what tells those two states apart.
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+
+    healthy = probes.inspect(_eligibility(checks=["baseline-business-success"]))
+    assert healthy.check_results["baseline-business-success"] is True
+    sql, parameters, _ = fakes.database_calls[0]
+    assert sql == BASELINE_PAID_ORDERS_SQL and parameters == ()
+
+    fakes.paid_orders = BASELINE_PAID_ORDERS_MIN - 1
+    starved = probes.inspect(_eligibility(checks=["baseline-business-success"]))
+    assert starved.check_results["baseline-business-success"] is False
+
+
+def test_baseline_business_success_fails_closed_when_the_database_is_unreachable(tmp_path) -> None:
+    fakes = Fakes()
+
+    def exploding(sql, parameters, **kwargs):
+        raise RuntimeError("postgres is unreachable")
+
+    probes = _probes(tmp_path, fakes)
+    probes.database_client = exploding
+    evidence = probes.inspect(_eligibility(checks=["baseline-business-success"]))
+    assert evidence.check_results["baseline-business-success"] is False
 
 
 def test_unknown_check_is_rejected_before_any_external_call(tmp_path) -> None:

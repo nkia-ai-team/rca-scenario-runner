@@ -48,6 +48,10 @@ APPROVED_CHECK_IDS = frozenset(
         "coordinator-clean",
         "clean-window",
         "baseline-traffic",
+        # "traffic is flowing" and "transactions are succeeding" are different
+        # questions; only the second one would have caught the 2026-07-28
+        # missing-seed-account outage. See BASELINE_PAID_ORDERS_SQL.
+        "baseline-business-success",
         "target-health",
     }
 )
@@ -231,6 +235,27 @@ COMMERCE_OUTBOX_UNPUBLISHED_SQL = (
     "SELECT count(*) AS unpublished_count FROM order_schema.outbox_events "
     "WHERE published_at IS NULL"
 )
+# Preflight: did a real business transaction complete recently? "Load is
+# flowing" (baseline-traffic) does not answer that — it only proves k6 is
+# running, and k6 keeps running happily while every checkout fails.
+#
+# 2026-07-28: commerce checkout failed 100% for a full day because the banking
+# seed account 'commerce-merchant' went missing in the Oracle re-seed. Nothing
+# caught it. Scenarios that certify damage as "checkout 5xx >= 5%" were
+# trivially true with no injection at all, and scenarios that require a healthy
+# checkout were trivially false. A whole day of runs would have been fiction.
+#
+# A PAID order is the widest single assertion available: it clears order ->
+# payment -> core-banking transfer, so one query covers the cross-domain path
+# that no per-service health endpoint sees.
+BASELINE_PAID_ORDERS_SQL = (
+    "SELECT count(*) AS paid_count FROM order_schema.orders "
+    "WHERE status = 'PAID' AND created_at >= now() - interval '5 minutes'"
+)
+# Baseline commerce runs continuously and yields ~24 PAID orders/min (measured
+# 2026-07-28: 245 in 10 minutes). Five in five minutes is a ~96% drop — far
+# below normal jitter, so this trips on a broken path, not on a slow one.
+BASELINE_PAID_ORDERS_MIN = 5
 HOST_PROBE_CONTRACTS = {
     "F02-H": ("192.168.122.184", "fio", "/opt/local-path-provisioner/pvc-5d71e22a-1225-4505-a7cc-5cf29dad4cf5_rca-testbed-commerce_pgdata-testbed-postgres-0"),
     "F10-R": ("192.168.122.184", "watermark", "/opt/local-path-provisioner/pvc-5d71e22a-1225-4505-a7cc-5cf29dad4cf5_rca-testbed-commerce_pgdata-testbed-postgres-0"),
@@ -532,6 +557,7 @@ class LiveProbeSet:
             "coordinator-clean": lambda: coordinator_clean,
             "clean-window": lambda: not overlap_ids,
             "baseline-traffic": self._baseline_active,
+            "baseline-business-success": self._baseline_business_succeeds,
             "target-health": self._target_healthy,
         }
         results = {check: _safe_bool(checks[check]) for check in request.checks}
@@ -636,6 +662,15 @@ class LiveProbeSet:
             timeout=15,
         )
         return result.stdout.strip() == "active"
+
+    def _baseline_business_succeeds(self) -> bool:
+        response = self.database_client(
+            BASELINE_PAID_ORDERS_SQL, (), credentials=self.database_credentials,
+        )
+        count = response.get("paid_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise LiveProbeError("baseline paid-order count is invalid")
+        return count >= BASELINE_PAID_ORDERS_MIN
 
     def _target_healthy(self) -> bool:
         response = self.http_client("GET", TARGET_HEALTH_URL, timeout=5.0)
