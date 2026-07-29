@@ -231,6 +231,7 @@ def _paths(tmp_path: Path) -> ProbePaths:
         loadgen_summary=tmp_path / "state" / "k6-summary.json",
         capture_root=tmp_path / "runs",
         profile_state=tmp_path / "profile-state",
+        baseline_summary_dir=tmp_path / "state",
     )
 
 
@@ -965,6 +966,106 @@ def test_new_loadgen_rate_queries_map_to_the_expected_summary_fields(tmp_path) -
 
     with pytest.raises(ObservationContractError):
         registry.bind({"query_id": "loadgen.checkout_409_rate", "parameters": {"step": "checkout"}})
+
+
+def _write_baseline(probes, domain: str, *, claims: str | None = None, **overrides) -> None:
+    """Write baseline-<domain>-live.json. `claims` fakes the domain *inside* it."""
+    document = {
+        "domain": claims or domain,
+        "unit": f"loadgen-{domain}",
+        "achieved_rps": 8.0,
+        "checkout_5xx_rate": 0.5,
+        "business_5xx_rate": 0.5,
+        "entry_status": 200,
+        "business_ok": True,
+        "observed_at": NOW.isoformat(),
+    }
+    document.update(overrides)
+    _write(probes.paths.baseline_summary_dir / f"baseline-{domain}-live.json", document)
+
+
+def test_loadgen_domain_parameter_reads_the_resident_baseline_document(tmp_path) -> None:
+    """Observation must not require the scenario to flood that domain itself.
+
+    Before the observation plane was separated, every loadgen observation came
+    from /tmp/rca-scenario-<ID>-live.json, which exists only while the scenario's
+    own k6 runs — so a scenario could only see the business outcome of the one
+    domain it poured load into. That is what blocked F15-G/T3/T4.
+    """
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    _write_baseline(probes, "food-delivery", business_5xx_rate=0.75, checkout_5xx_rate=0.75)
+
+    scoped = probes.observe(
+        registry.bind(
+            {"query_id": "loadgen.checkout_5xx_rate", "parameters": {"domain": "food-delivery"}}
+        )
+    )
+    unscoped = probes.observe(registry.bind({"query_id": "loadgen.checkout_5xx_rate"}))
+
+    assert scoped["quality"] == "good" and scoped["value"] == 0.75
+    assert scoped["source"] == "k6:baseline:food-delivery:checkout_5xx_rate"
+    # The scenario's own document is untouched — the 43 live controllers pass no
+    # parameters and must keep reading exactly what they read before.
+    assert unscoped["value"] == 0.125 and unscoped["source"] == "k6:checkout_5xx_rate"
+
+
+def test_baseline_document_must_be_fresh_named_and_free_of_scenario_identity(tmp_path) -> None:
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+
+    # Parameter *names* are checked by the registry; the domain allowlist is
+    # enforced at the probe, the same way business_key is.
+    with pytest.raises(ObservationContractError):
+        registry.bind(
+            {"query_id": "loadgen.checkout_5xx_rate", "parameters": {"realm": "commerce"}}
+        )
+    unknown_domain = registry.bind(
+        {"query_id": "loadgen.checkout_5xx_rate", "parameters": {"domain": "social-feed"}}
+    )
+    _write_baseline(probes, "social-feed")
+    assert probes.observe(unknown_domain)["quality"] != "good"
+
+    # A document that names another domain must not satisfy this observation.
+    _write_baseline(probes, "commerce", claims="core-banking")
+    bound = registry.bind(
+        {"query_id": "loadgen.checkout_5xx_rate", "parameters": {"domain": "commerce"}}
+    )
+    assert probes.observe(bound)["quality"] != "good"
+
+    # A scenario's own k6 output must never be mistaken for the resident baseline.
+    _write_baseline(probes, "commerce", scenario_id="F07-H")
+    assert probes.observe(bound)["quality"] != "good"
+
+    # Stale means the resident unit stopped publishing — fail closed, not silent.
+    _write_baseline(
+        probes, "commerce", observed_at=(NOW - timedelta(seconds=120)).isoformat()
+    )
+    assert probes.observe(bound)["quality"] != "good"
+
+    _write_baseline(probes, "commerce")
+    assert probes.observe(bound)["quality"] == "good"
+
+
+def test_every_loadgen_query_is_observable_against_a_baseline_document(tmp_path) -> None:
+    """Domain scoping must cover the whole field map, not the two ids it was written for."""
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    _write_baseline(probes, "commerce", **dict.fromkeys(LOADGEN_FIELDS.values(), 0.25))
+    _write_baseline(
+        probes,
+        "commerce",
+        **{**dict.fromkeys(LOADGEN_FIELDS.values(), 0.25), "achieved_rps": 9.0},
+    )
+
+    for query_id in sorted(LOADGEN_FIELDS):
+        observed = probes.observe(
+            registry.bind({"query_id": query_id, "parameters": {"domain": "commerce"}})
+        )
+        assert observed["quality"] == "good", query_id
 
 
 def test_every_registered_loadgen_query_is_observable(tmp_path) -> None:

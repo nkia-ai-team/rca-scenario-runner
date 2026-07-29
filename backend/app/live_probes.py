@@ -60,6 +60,14 @@ LOADGEN_FIELDS = {
     "loadgen.frozen_bypass_completed_rate": "business_2xx_rate",
     "loadgen.normal_path_reject_rate": "read_nonok_rate",
 }
+# Observation plane separation (2026-07-29): a loadgen observation may name a
+# domain, in which case it reads that domain's *baseline* live document instead
+# of the scenario's own k6 output. Without this every loadgen observation was
+# only available for the one domain the scenario itself flooded, which is what
+# blocked F15-G/T3/T4 and forced surge scripts to double as observation vehicles.
+# Deliberately not a new id space: 10 fields x 3 domains would fork LOADGEN_FIELDS,
+# and a forked allowlist is exactly what killed F06-P.
+APPROVED_LOADGEN_DOMAINS = frozenset({"commerce", "core-banking", "food-delivery"})
 TARGET_HEALTH_URL = "http://192.168.122.77:30080/health"
 PROMETHEUS_URL = os.environ.get(
     "PROMETHEUS_URL", "http://192.168.230.119:18428/api/v1/query"
@@ -534,6 +542,10 @@ class ProbePaths:
     runs: Path = Path("/var/lib/lucida/scenario-runs")
     baseline_status: Path = Path("/app/state/loadgen/baseline-status.json")
     loadgen_summary: Path = Path("/app/state/loadgen/latest-summary.json")
+    # Per-domain baseline live documents, published continuously by the resident
+    # loadgen units (see testbed-services docs/spec-scenario-observation-plane.md).
+    # The filename carries the domain: baseline-<domain>-live.json.
+    baseline_summary_dir: Path = Path("/app/state/loadgen")
     capture_root: Path = Path("/var/lib/lucida/scenario-runs")
     profile_state: Path = Path("/var/lib/lucida/scenario-profile-state")
 
@@ -729,16 +741,24 @@ class LiveProbeSet:
         return overlaps, coordinator_clean
 
     def _loadgen_observation(self, query: ApprovedQuery) -> tuple[float, datetime, str]:
-        if query.parameters or query.query_id not in LOADGEN_FIELDS:
+        if query.query_id not in LOADGEN_FIELDS:
             raise LiveProbeError("unsupported loadgen query")
-        document = self._loadgen_live_document()
+        if set(query.parameters) - {"domain"}:
+            raise LiveProbeError("unsupported loadgen query")
+        domain = query.parameters.get("domain")
+        # No domain means the historical behaviour: read the scenario's own k6
+        # output. The 43 live controllers pass no parameters and are untouched.
+        document = (
+            self._baseline_live_document(domain) if domain else self._loadgen_live_document()
+        )
         field = LOADGEN_FIELDS[query.query_id]
         value = document.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
             raise LiveProbeError(f"k6 {field} is invalid")
         if field.endswith("_rate") and value > 1:
             raise LiveProbeError(f"k6 {field} is outside [0,1]")
-        return float(value), _parse_time(document["observed_at"]), f"k6:{field}"
+        source = f"k6:baseline:{domain}:{field}" if domain else f"k6:{field}"
+        return float(value), _parse_time(document["observed_at"]), source
 
     def _http_observation(self, query: ApprovedQuery) -> tuple[int, datetime, str]:
         if query.parameters:
@@ -1456,6 +1476,51 @@ class LiveProbeSet:
         document = _read_json(path)
         if document.get("scenario_id") != "F06-G":
             raise LiveProbeError("mock pulse state belongs to another scenario")
+        return document
+
+    def _baseline_live_document(self, domain: str) -> dict[str, Any]:
+        """Read a domain's resident baseline live document.
+
+        Separates the observation plane from the injection plane: this document
+        exists whether or not the running scenario pours load into that domain,
+        because the resident loadgen unit publishes it continuously.
+        """
+        if domain not in APPROVED_LOADGEN_DOMAINS:
+            raise LiveProbeError("loadgen domain is not allowlisted")
+        local = self.paths.baseline_summary_dir / f"baseline-{domain}-live.json"
+        if local.parent != self.paths.baseline_summary_dir:
+            raise LiveProbeError("baseline summary path escaped the trusted root")
+        if local.is_file():
+            document = _read_json(local)
+        else:
+            completed = self.process_runner(
+                [
+                    "ssh", "-i", LOADGEN_KEY,
+                    "-o", "BatchMode=yes",
+                    "-o", "StrictHostKeyChecking=yes",
+                    "-o", "ConnectTimeout=10",
+                    f"{LOADGEN_USER}@{LOADGEN_HOST}",
+                    "cat", "--", f"/tmp/rca-baseline-{domain}-live.json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=_read_only_environment(),
+                timeout=15,
+            )
+            document = json.loads(completed.stdout)
+        if not isinstance(document, dict):
+            raise LiveProbeError("baseline live observation is not an object")
+        if document.get("domain") != domain:
+            raise LiveProbeError("baseline live observation belongs to another domain")
+        # A baseline document must never carry a scenario identity — if it does,
+        # a scenario's own k6 output has been mistaken for the resident baseline.
+        if "scenario_id" in document:
+            raise LiveProbeError("baseline live observation claims a scenario identity")
+        observed_at = _parse_time(document.get("observed_at"))
+        age = (_aware(self.clock()) - observed_at).total_seconds()
+        if not -CLOCK_SKEW_TOLERANCE_SEC <= age <= 30:
+            raise LiveProbeError("baseline live observation is stale or from the future")
         return document
 
     def _loadgen_live_document(self) -> dict[str, Any]:

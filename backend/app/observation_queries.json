@@ -5,13 +5,17 @@
       "adapter": "loadgen_summary",
       "selector": "iterations.rate",
       "freshness_sec": 30,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "loadgen.checkout_5xx_rate": {
       "adapter": "loadgen_summary",
       "selector": "checkout.5xx.rate",
       "freshness_sec": 30,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "http.entry_health": {
       "adapter": "http_probe",
@@ -425,25 +429,33 @@
       "adapter": "loadgen_summary",
       "selector": "business.nonok.rate",
       "freshness_sec": 30,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "loadgen.read_step_status_rate": {
       "adapter": "loadgen_summary",
       "selector": "read.nonok.rate",
       "freshness_sec": 30,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "loadgen.food_create_status_rate": {
       "adapter": "loadgen_summary",
       "selector": "business.5xx.rate",
       "freshness_sec": 30,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "loadgen.transfer_2xx_rate": {
       "adapter": "loadgen_summary",
       "selector": "business.2xx.rate",
       "freshness_sec": 30,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "database.outbox_unpublished_count": {
       "adapter": "database",
@@ -514,19 +526,25 @@
       "adapter": "loadgen_summary",
       "selector": "checkout.409.rate",
       "freshness_sec": 30,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "loadgen.frozen_bypass_completed_rate": {
       "adapter": "loadgen_summary",
       "selector": "business.2xx.rate",
       "freshness_sec": 30,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "loadgen.normal_path_reject_rate": {
       "adapter": "loadgen_summary",
       "selector": "read.nonok.rate",
       "freshness_sec": 30,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "database.integrity_violation_count": {
       "adapter": "database",
@@ -540,7 +558,9 @@
       "adapter": "loadgen_summary",
       "selector": "business.429.rate",
       "freshness_sec": 30,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "host.disk_io_utilization": {
       "adapter": "host_probe",
