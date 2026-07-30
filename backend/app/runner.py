@@ -245,6 +245,7 @@ class ScenarioRunner:
         mode: Literal["run", "cleanup"],
         *,
         skip_isolation_checks: bool = False,
+        repair_capsule: bool = False,
     ) -> RunInfo:
         scenario = get_scenario(scenario_id)
         external_manifest = None
@@ -258,7 +259,9 @@ class ScenarioRunner:
                     f"external scenario is plan-only or unresolved: {external_manifest.id}"
                 )
             if mode == "cleanup":
-                return await self._start_external_dirty_cleanup(scenario)
+                return await self._start_external_dirty_cleanup(
+                    scenario, repair_capsule=repair_capsule
+                )
 
         if self._lock.locked() or self.is_busy:
             raise RuntimeError("Another scenario is already running")
@@ -395,7 +398,9 @@ class ScenarioRunner:
         )
         return self.get_current()  # type: ignore[return-value]
 
-    async def _start_external_dirty_cleanup(self, scenario) -> RunInfo:
+    async def _start_external_dirty_cleanup(
+        self, scenario, *, repair_capsule: bool = False
+    ) -> RunInfo:
         if self._lock.locked() or self.is_busy:
             raise RuntimeError("Another scenario is already running")
         dirty = self.coordinator.snapshot().dirty_run
@@ -418,18 +423,32 @@ class ScenarioRunner:
         )
         self._task = asyncio.create_task(
             self._execute_external_dirty_cleanup(
-                dirty.run_id, dirty.fencing_token, claimant
+                dirty.run_id, dirty.fencing_token, claimant,
+                repair_capsule=repair_capsule,
             )
         )
         return self.get_current()  # type: ignore[return-value]
 
     async def _execute_external_dirty_cleanup(
-        self, dirty_run_id: str, fencing_token: int, claimant: str
+        self, dirty_run_id: str, fencing_token: int, claimant: str,
+        *, repair_capsule: bool = False,
     ) -> None:
         assert self._current is not None
         success = False
         try:
             run_dir = self.artifact_store.root / dirty_run_id
+            if repair_capsule:
+                # The capsule's own executor is what failed; re-cut the contract
+                # tree from the live root so cleanup has working code to run.
+                # plan.json is untouched, so the target of the cleanup is the
+                # same one injection created. See repair_capsule_contracts.
+                await asyncio.to_thread(
+                    self.artifact_store.repair_capsule_contracts,
+                    run_dir,
+                    self.dispatcher_path.parent,
+                    reason=f"manual dirty cleanup by {claimant}",
+                    now=self.clock.now(),
+                )
             capsule = self.artifact_store.verify_capsule(run_dir)
             plan = json.loads((run_dir / "plan.json").read_text(encoding="utf-8"))
             binding = capsule["binding"]

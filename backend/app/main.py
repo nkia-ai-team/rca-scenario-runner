@@ -139,10 +139,22 @@ async def api_run(scenario_id: str) -> RunInfo:
 
 
 @app.post("/api/scenarios/{scenario_id}/cleanup", response_model=RunInfo)
-async def api_cleanup(scenario_id: str) -> RunInfo:
+async def api_cleanup(scenario_id: str, repair_capsule: bool = False) -> RunInfo:
+    """Clean up a DIRTY run.
+
+    `repair_capsule` re-cuts the run's frozen contract tree from the live trusted
+    root before cleaning. Use it when the capsule's own executor is the defect —
+    otherwise the run cannot clean itself, and since DIRTY is global that blocks
+    every scenario. The run's plan is left untouched and re-verified, and the
+    swap is recorded in `capsule-repair.json`. Cleanup and recovery must still
+    pass on their own merits; this changes what code runs, not what counts as
+    clean.
+    """
     runner = get_runner()
     try:
-        return await runner.start(scenario_id=scenario_id, mode="cleanup")
+        return await runner.start(
+            scenario_id=scenario_id, mode="cleanup", repair_capsule=repair_capsule
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:

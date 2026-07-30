@@ -224,6 +224,84 @@ class RunArtifactStore:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
+    def repair_capsule_contracts(
+        self, run_dir: Path, contract_root: Path, *, reason: str, now: datetime
+    ) -> dict[str, Any]:
+        """Re-materialize a dirty run's contract tree from the live trusted root.
+
+        The capsule freezes two different things: `plan.json` says *what* was
+        applied, and `capsule/contracts` says *how* to undo it. Freezing the first
+        is the whole point — cleanup must target exactly what injection created.
+        Freezing the second permanently is what deadlocks us: if the executor that
+        cleans up is itself defective, the run can never reach a verified-clean
+        state, and because DIRTY is global that wedges every scenario, not just
+        the failed one. 2026-07-30: F21-P died on an unquoted `&`, and the same
+        defect sat inside its capsule, so its own cleanup could not run.
+
+        Repair therefore replaces the mechanism while holding the target fixed:
+
+        - `plan.json` is not touched and must still match `capsule.json`'s
+          `plan_sha256`. If what we are undoing changed, this is not a repair.
+        - The previous hash manifest is preserved in `capsule-repair.json` with
+          the reason and timestamp, so the swap is recorded rather than hidden.
+        - Repair is explicit, never automatic on cleanup failure. A capsule that
+          silently re-arms itself from the live tree is not frozen at all.
+        - It clears nothing by itself. Cleanup and recovery still have to pass
+          before `clear_dirty`, so "no residue" stays machine-verified — repair
+          only lets the machine get to the question.
+        """
+        capsule = self.verify_capsule(run_dir)
+        if not contract_root.is_dir() or contract_root.is_symlink():
+            raise RuntimeError("trusted contract root must be a real directory")
+        contracts = run_dir / "capsule" / "contracts"
+        previous_manifest_sha256 = capsule["hash_manifest_sha256"]
+
+        staging = Path(tempfile.mkdtemp(prefix=f".{run_dir.name}.repair.", dir=self.root))
+        try:
+            rebuilt = staging / "contracts"
+            shutil.copytree(contract_root, rebuilt, symlinks=False)
+            hashes: dict[str, str] = {}
+            for path in sorted(rebuilt.rglob("*")):
+                if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                    raise RuntimeError("repaired capsule contains a link or special file")
+                if path.is_dir():
+                    os.chmod(path, 0o750)
+                    continue
+                relative = path.relative_to(rebuilt).as_posix()
+                executable = bool(path.stat().st_mode & 0o111)
+                os.chmod(path, 0o750 if executable else 0o640)
+                hashes[relative] = file_sha256(path)
+            atomic_json(staging / "hashes.json", {"schema_version": 1, "files": hashes})
+            manifest_sha256 = file_sha256(staging / "hashes.json")
+
+            shutil.rmtree(contracts)
+            os.replace(rebuilt, contracts)
+            os.replace(staging / "hashes.json", run_dir / "capsule" / "hashes.json")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+        record_path = run_dir / "capsule-repair.json"
+        record: dict[str, Any] = {"schema_version": 1, "repairs": []}
+        if record_path.is_file():
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        repair = {
+            "reason": reason,
+            "repaired_at": now.isoformat(),
+            "contract_root": str(contract_root.resolve()),
+            "previous_hash_manifest_sha256": previous_manifest_sha256,
+            "hash_manifest_sha256": manifest_sha256,
+        }
+        record["repairs"].append(repair)
+        atomic_json(record_path, record)
+        atomic_json(
+            run_dir / "capsule.json",
+            {**capsule, "hash_manifest_sha256": manifest_sha256},
+        )
+        # The plan is deliberately re-verified after the rewrite: a repair that
+        # moved the target would be a different run wearing this run's id.
+        self.verify_capsule(run_dir)
+        return repair
+
     def verify_capsule(self, run_dir: Path) -> dict[str, Any]:
         if run_dir.parent != self.root or run_dir.is_symlink():
             raise RuntimeError("capsule escaped the trusted runs root")

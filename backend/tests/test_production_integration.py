@@ -720,3 +720,109 @@ def test_append_tick_writes_jsonl_inside_trusted_root(tmp_path) -> None:
     outside.mkdir()
     with pytest.raises(RuntimeError):
         store.append_tick(outside, {"at": "t2"})
+
+
+def _dirty_run_capsule(tmp_path, *, executor_body: str):
+    """A published capsule whose executor carries `executor_body`."""
+    plan = {
+        "scenario": {"id": "F21-P", "slug": "adaptive"},
+        "live_allowed": True,
+        "plan_digest": "b" * 64,
+        "profile_instances": [],
+    }
+    contract = _capsule_contract(tmp_path, plan)
+    (contract / "profiles" / "load.py").write_text(executor_body, encoding="utf-8")
+    (contract / "profiles" / "load.py").chmod(0o755)
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir, _ = store.prepare_capsule(
+        "F21-P-run-dirty",
+        contract_root=contract,
+        scenario_slug="adaptive",
+        binding={
+            "catalog_slug": "adaptive", "primary_profile": "load.north_south",
+            "logical_profile_id": "load.north_south", "companion_profiles": [],
+        },
+    )
+    return store, run_dir, contract
+
+
+def test_capsule_repair_swaps_the_mechanism_and_leaves_the_target_alone(tmp_path) -> None:
+    # The defect that motivated this: a run went DIRTY because its executor was
+    # broken, and the same broken executor was frozen inside its capsule, so its
+    # own cleanup could never run. DIRTY is global, so that wedged everything.
+    store, run_dir, contract = _dirty_run_capsule(tmp_path, executor_body="#!/bin/sh\nbroken\n")
+    frozen = run_dir / "capsule" / "contracts" / "profiles" / "load.py"
+    assert frozen.read_text() == "#!/bin/sh\nbroken\n"
+    plan_before = (run_dir / "plan.json").read_bytes()
+    manifest_before = json.loads((run_dir / "capsule.json").read_text())["hash_manifest_sha256"]
+
+    (contract / "profiles" / "load.py").write_text("#!/bin/sh\nfixed\n", encoding="utf-8")
+    repair = store.repair_capsule_contracts(
+        run_dir, contract,
+        reason="executor defect", now=datetime(2026, 7, 30, 8, 30, tzinfo=timezone.utc),
+    )
+
+    assert frozen.read_text() == "#!/bin/sh\nfixed\n"
+    assert (run_dir / "plan.json").read_bytes() == plan_before, "repair moved the cleanup target"
+    assert store.verify_capsule(run_dir)["scenario_slug"] == "adaptive"
+    assert repair["previous_hash_manifest_sha256"] == manifest_before
+    assert repair["hash_manifest_sha256"] != manifest_before
+    recorded = json.loads((run_dir / "capsule-repair.json").read_text())["repairs"]
+    assert len(recorded) == 1 and recorded[0]["reason"] == "executor defect"
+
+
+def test_capsule_repair_refuses_a_run_whose_plan_was_altered(tmp_path) -> None:
+    # Repair is allowed to change *how* we undo the injection, never *what* we
+    # undo. A run whose plan no longer matches its capsule is a different run
+    # wearing this run's id, and re-arming it with working code would be worse
+    # than leaving it stuck.
+    store, run_dir, contract = _dirty_run_capsule(tmp_path, executor_body="#!/bin/sh\nbroken\n")
+    plan = json.loads((run_dir / "plan.json").read_text())
+    plan["scenario"]["id"] = "F21-Q"
+    (run_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="plan was modified"):
+        store.repair_capsule_contracts(
+            run_dir, contract, reason="tampered", now=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        )
+
+
+def test_capsule_repair_is_recorded_cumulatively(tmp_path) -> None:
+    store, run_dir, contract = _dirty_run_capsule(tmp_path, executor_body="#!/bin/sh\nv1\n")
+    for index, body in enumerate(("#!/bin/sh\nv2\n", "#!/bin/sh\nv3\n"), start=1):
+        (contract / "profiles" / "load.py").write_text(body, encoding="utf-8")
+        store.repair_capsule_contracts(
+            run_dir, contract, reason=f"attempt {index}",
+            now=datetime(2026, 7, 30, 8, index, tzinfo=timezone.utc),
+        )
+    recorded = json.loads((run_dir / "capsule-repair.json").read_text())["repairs"]
+    assert [item["reason"] for item in recorded] == ["attempt 1", "attempt 2"]
+    # Each repair must chain onto the manifest the previous one left behind.
+    assert recorded[1]["previous_hash_manifest_sha256"] == recorded[0]["hash_manifest_sha256"]
+    assert store.verify_capsule(run_dir)
+
+
+def test_refused_capsule_repair_leaves_the_capsule_exactly_as_it_was(tmp_path) -> None:
+    # A repair that is going to be refused must not have already swapped the
+    # contracts. Checking the plan only at the end still raises, but by then the
+    # tree and capsule.json have been rewritten and the run is half-repaired:
+    # frozen code that no longer matches the manifest anyone audited. The refusal
+    # has to happen before the first write.
+    store, run_dir, contract = _dirty_run_capsule(tmp_path, executor_body="#!/bin/sh\noriginal\n")
+    frozen = run_dir / "capsule" / "contracts" / "profiles" / "load.py"
+    capsule_before = (run_dir / "capsule.json").read_bytes()
+    manifest_before = (run_dir / "capsule" / "hashes.json").read_bytes()
+
+    plan = json.loads((run_dir / "plan.json").read_text())
+    plan["scenario"]["id"] = "F21-Q"
+    (run_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    (contract / "profiles" / "load.py").write_text("#!/bin/sh\nreplacement\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError):
+        store.repair_capsule_contracts(
+            run_dir, contract, reason="refused", now=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        )
+
+    assert frozen.read_text() == "#!/bin/sh\noriginal\n", "refused repair still swapped the executor"
+    assert (run_dir / "capsule.json").read_bytes() == capsule_before
+    assert (run_dir / "capsule" / "hashes.json").read_bytes() == manifest_before
+    assert not (run_dir / "capsule-repair.json").exists()
