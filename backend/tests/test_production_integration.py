@@ -826,3 +826,65 @@ def test_refused_capsule_repair_leaves_the_capsule_exactly_as_it_was(tmp_path) -
     assert (run_dir / "capsule.json").read_bytes() == capsule_before
     assert (run_dir / "capsule" / "hashes.json").read_bytes() == manifest_before
     assert not (run_dir / "capsule-repair.json").exists()
+
+
+def test_failed_cleanup_is_retried_at_the_dispatcher_layer(tmp_path) -> None:
+    # There are two caches on the cleanup path and both used to treat a failure
+    # as final: this one, and profile-control's on-disk results map. This layer
+    # short-circuits *before* the profile-control call, so fixing only the lower
+    # one changes nothing — on 2026-07-30 a repaired capsule with a fixed
+    # executor still got the original failure handed back, twice, because the
+    # attempt never left this method.
+    plan = {
+        "scenario": {"id": "F21-P", "slug": "adaptive"},
+        "live_allowed": True,
+        "plan_digest": "c" * 64,
+        "profile_instances": [{"profile_id": "load.north_south", "parameters": {}}],
+    }
+    contract = _capsule_contract(tmp_path, plan)
+    control = contract / "profile-control.py"
+
+    outcomes = [
+        {"succeeded": False, "effect_ended_at": None, "reason": "GATEWAY_URL: command not found"},
+        {"succeeded": True, "effect_ended_at": "2026-07-30T09:00:00+00:00", "reason": None},
+    ]
+    calls: list[list[str]] = []
+
+    def process_runner(argv, **kwargs):
+        argv = list(argv)
+        if argv[0] == str(control):
+            calls.append(argv)
+            payload = outcomes[min(len(calls) - 1, len(outcomes) - 1)]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"normalized_plan": plan}), ""
+        )
+
+    applier = TrustedDispatcherApplier(
+        "adaptive",
+        primary_profile="load.north_south",
+        logical_profile_id="load.north_south",
+        companion_profiles=[],
+        dispatcher=contract / "run-scenario.sh",
+        profile_control=control,
+        process_runner=process_runner,
+    )
+
+    def request():
+        return CleanupRequest(
+            run_id="F21-P-run-dirty", scenario_id="F21-P", fencing_token=124,
+            profile_id="load.north_south",
+            idempotency_key="manual-cleanup:F21-P-run-dirty:124",
+            requested_at=datetime(2026, 7, 30, 9, tzinfo=timezone.utc),
+        )
+
+    first = applier.cleanup(request())
+    assert first.succeeded is False and len(calls) == 1
+
+    second = applier.cleanup(request())
+    assert len(calls) == 2, "the retry never reached profile-control"
+    assert second.succeeded is True
+
+    third = applier.cleanup(request())
+    assert len(calls) == 2, "a settled cleanup was re-invoked"
+    assert third.succeeded is True

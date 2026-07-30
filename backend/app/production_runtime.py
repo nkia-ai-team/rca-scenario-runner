@@ -755,7 +755,15 @@ class TrustedDispatcherApplier:
 
     def cleanup(self, request: CleanupRequest) -> CleanupResult:
         existing = self._cleaned.get(request.idempotency_key)
-        if existing is not None:
+        # Only a cleanup that actually succeeded is a final answer. Caching a
+        # failure here turns the first attempt into the only one, and because
+        # DIRTY is global that pins every scenario behind one stuck run. The
+        # same rule lives in profile-control.py; this layer sits above it and
+        # short-circuits before the call, so fixing only the lower one leaves
+        # the deadlock in place — measured on 2026-07-30, when a repaired
+        # capsule and a fixed executor still could not get a second attempt.
+        # Cleanup is idempotent by construction, so re-running costs nothing.
+        if existing is not None and existing.succeeded:
             return existing
         plan = self._plan()
         digest = plan["plan_digest"]
