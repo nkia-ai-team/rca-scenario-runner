@@ -12,9 +12,18 @@ import pytest
 from app.adaptive import ControllerPhase
 from app.adaptive_runtime import ApplyRequest, CleanupRequest, EligibilityRequest
 from app.capture_orchestration import CaptureRequest, CaptureScheduler, ScenarioMetadata
-from app.live_probes import INDEX_PRESENT_CONTRACT, INDEX_PRESENT_SQL
+from app import live_probes
+from app.live_probes import (
+    BASELINE_PAID_ORDERS_SQL,
+    BLOCKED_SESSION_SQL,
+    INDEX_PRESENT_CONTRACT,
+    INDEX_PRESENT_SQL,
+    PAYMENT_DUPLICATE_SINCE_T1_SQL,
+    TAGGED_SESSION_SQL,
+)
 from app.observations import ApprovedQueryRegistry
 from app.production_runtime import (
+    PARAMETERLESS_DATABASE_PROBES,
     ProductionCaptureInvoker,
     RunArtifactStore,
     TrustedDispatcherApplier,
@@ -117,6 +126,73 @@ def test_production_index_probe_executes_only_fixed_parameterized_contract(monke
         "-c lucida.index_table=products "
         "-c lucida.index_name=idx_products_name"
     )
+
+
+def test_every_probe_sql_live_probes_issues_is_approved_by_the_dispatch() -> None:
+    """test_live_probes fakes database_client, so the approved-SQL dispatch is never
+    exercised there — which is how five probes shipped dead. Five of eight were
+    unreachable on 2026-07-30, baseline-business-success (required by 44 of 44 live
+    scenarios) among them. Compare the two sets directly instead."""
+    issued = {
+        name: value
+        for name, value in vars(live_probes).items()
+        if name.endswith("_SQL") and isinstance(value, str)
+    }
+    approved = set(PARAMETERLESS_DATABASE_PROBES) | {
+        TAGGED_SESSION_SQL,
+        BLOCKED_SESSION_SQL,
+        INDEX_PRESENT_SQL,
+        PAYMENT_DUPLICATE_SINCE_T1_SQL,
+    }
+
+    unapproved = sorted(name for name, sql in issued.items() if sql not in approved)
+
+    assert unapproved == []
+
+
+def test_baseline_business_success_reaches_psql_and_reads_the_paid_order_count(
+    monkeypatch, tmp_path
+) -> None:
+    """The refusal surfaced as a bare False through _safe_bool, so the check read as
+    "checkout is broken" while commerce was serving 192 PAID orders per five minutes
+    against a threshold of 5."""
+    calls: list[tuple[list[str], dict]] = []
+
+    def process(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 0, "192\n", "")
+
+    monkeypatch.setenv("COMMERCE_DB_PASSWORD", "secret")
+    probes = _configured_live_probes(
+        run_id="run-baseline",
+        scenario_id="F08-P",
+        clock=Clock(),
+        process_runner=process,
+    )
+    probes.paths = probes.paths.__class__(
+        coordinator=tmp_path / "coordinator.json",
+        runs=tmp_path / "runs",
+        baseline_status=tmp_path / "baseline.json",
+        loadgen_summary=tmp_path / "loadgen.json",
+        capture_root=tmp_path / "runs",
+    )
+
+    evidence = probes.inspect(
+        EligibilityRequest(
+            run_id="run-baseline",
+            scenario_id="F08-P",
+            checks=["baseline-business-success"],
+            clean_window_sec=1800,
+            requested_at=NOW,
+        )
+    )
+
+    assert evidence.check_results["baseline-business-success"] is True
+    psql_calls = [(argv, kwargs) for argv, kwargs in calls if argv[0] == "psql"]
+    argv, kwargs = psql_calls[0]
+    assert argv == ["psql", "-At", "-c", BASELINE_PAID_ORDERS_SQL]
+    assert kwargs["env"]["PGDATABASE"] == "commerce"
+    assert kwargs["env"]["PGOPTIONS"] == ""
 
 
 def test_profile_control_uses_scenario_id_confirmation_and_composite_order(tmp_path) -> None:

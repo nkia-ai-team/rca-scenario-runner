@@ -43,9 +43,14 @@ from app.observations import (
     PrometheusAdapter,
 )
 from app.live_probes import (
+    BASELINE_PAID_ORDERS_SQL,
     BLOCKED_SESSION_SQL,
+    COMMERCE_OUTBOX_UNPUBLISHED_SQL,
     INDEX_PRESENT_SQL,
+    INVENTORY_ZERO_STOCK_SQL,
     PAYMENT_DUPLICATE_SINCE_T1_SQL,
+    PG_SLOW_ACTIVE_QUERY_SQL,
+    RESTOCK_MOVEMENT_SQL,
     LiveProbeSet,
     TAGGED_SESSION_SQL,
 )
@@ -61,6 +66,25 @@ TRUSTED_CATALOG = TRUSTED_CONTRACT_ROOT / "catalog.json"
 TRUSTED_SCENARIO_METADATA = TRUSTED_CONTRACT_ROOT / "registry" / "scenario-metadata.json"
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+# Approved database probes whose SQL is fully self-contained: there is no
+# parameter to bind through PGOPTIONS, so approval is the whole contract.
+#
+# 2026-07-30: all five were reaching the dispatch's "not approved" branch, and
+# LiveProbes wraps its checks in _safe_bool — so the refusal surfaced as a plain
+# False instead of an error. baseline-business-success, which 44 of 44 live
+# scenarios require in preflight, could therefore never pass; the first live run
+# after the judging-contract repair was blocked on it while commerce was serving
+# 192 PAID orders per five minutes against a threshold of 5. The four
+# observation probes below were dead the same way, F04-H's unpublished-outbox
+# evidence among them.
+PARAMETERLESS_DATABASE_PROBES = {
+    BASELINE_PAID_ORDERS_SQL: "paid_count",
+    COMMERCE_OUTBOX_UNPUBLISHED_SQL: "unpublished_count",
+    PG_SLOW_ACTIVE_QUERY_SQL: "slow_active_count",
+    INVENTORY_ZERO_STOCK_SQL: "zero_stock_count",
+    RESTOCK_MOVEMENT_SQL: "restock_count",
+}
 
 
 class SystemClock:
@@ -474,6 +498,9 @@ def _configured_live_probes(
                 raise RuntimeError("payment duplicate probe t1 is invalid") from error
             pgoptions = f"-c lucida.payment_t1={parameters[0]}"
             result_field = "duplicate_count"
+        elif sql in PARAMETERLESS_DATABASE_PROBES and not parameters:
+            pgoptions = ""
+            result_field = PARAMETERLESS_DATABASE_PROBES[sql]
         else:
             raise RuntimeError("database probe query is not approved")
         environment = _trusted_environment()
