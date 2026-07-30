@@ -51,15 +51,6 @@
         "service_name"
       ]
     },
-    "prometheus.apm_service_error_rate": {
-      "adapter": "prometheus",
-      "template_id": "apm-agent-error-rate-v1",
-      "freshness_sec": 60,
-      "update_interval_sec": 60,
-      "allowed_parameters": [
-        "service_name"
-      ]
-    },
     "prometheus.container_cpu_throttled_time": {
       "adapter": "prometheus",
       "template_id": "kcm-pod-cpu-throttled-time-v1",
@@ -647,6 +638,15 @@
     "prometheus.jvm_old_gen_after_gc_ratio": {
       "adapter": "prometheus",
       "template_id": "otel-jvm-old-gen-after-gc-ratio-v1",
+      "freshness_sec": 60,
+      "update_interval_sec": 60,
+      "allowed_parameters": [
+        "service_name"
+      ]
+    },
+    "clickhouse.service_error_rate": {
+      "adapter": "clickhouse",
+      "template_id": "trace-service-error-rate-v1",
       "freshness_sec": 60,
       "update_interval_sec": 60,
       "allowed_parameters": [

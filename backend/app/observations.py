@@ -21,6 +21,7 @@ APPROVED_ADAPTERS = frozenset({
     "host_probe",
     "business_probe",
     "capture_status",
+    "clickhouse",
 })
 FORBIDDEN_SCENARIO_KEYS = frozenset({"promql", "promql_template", "query", "query_text"})
 DEFAULT_REGISTRY_PATH = Path(__file__).with_name("observation_queries.json")
@@ -110,7 +111,8 @@ class ApprovedQueryRegistry:
             self._queries[query_id] = dict(raw)
         if registered_adapters != APPROVED_ADAPTERS:
             raise ObservationContractError(
-                "query registry must cover exactly the seven approved adapters"
+                "query registry must cover exactly the approved adapters: "
+                f"missing {sorted(APPROVED_ADAPTERS - registered_adapters)}"
             )
 
     @classmethod
@@ -227,6 +229,10 @@ class BusinessProbeAdapter(ReadOnlyObservationAdapter):
 
 class CaptureStatusAdapter(ReadOnlyObservationAdapter):
     adapter_id = "capture_status"
+
+
+class ClickHouseAdapter(ReadOnlyObservationAdapter):
+    adapter_id = "clickhouse"
 
 
 class ObservationPoller:

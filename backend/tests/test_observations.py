@@ -13,6 +13,7 @@ from app.observations import (
     ApprovedQueryRegistry,
     BusinessProbeAdapter,
     CaptureStatusAdapter,
+    ClickHouseAdapter,
     DatabaseAdapter,
     HttpProbeAdapter,
     HostProbeAdapter,
@@ -36,6 +37,7 @@ ADAPTER_CLASSES = {
     "host_probe": HostProbeAdapter,
     "business_probe": BusinessProbeAdapter,
     "capture_status": CaptureStatusAdapter,
+    "clickhouse": ClickHouseAdapter,
 }
 QUERY_BY_ADAPTER = {
     "loadgen_summary": "loadgen.achieved_rps",
@@ -46,6 +48,7 @@ QUERY_BY_ADAPTER = {
     "host_probe": "host.scenario_clean",
     "business_probe": "business.checkout_invariant",
     "capture_status": "capture.export_complete",
+    "clickhouse": "clickhouse.service_error_rate",
 }
 
 
@@ -57,6 +60,7 @@ def _parameters(adapter_id: str) -> dict[str, str]:
         "host_probe": {"scenario_id": "F02-H"},
         "business_probe": {"business_key": "order-1"},
         "capture_status": {"run_id": "run-1"},
+        "clickhouse": {"service_name": "commerce-payment"},
     }.get(adapter_id, {})
 
 

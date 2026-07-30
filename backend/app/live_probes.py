@@ -72,6 +72,44 @@ TARGET_HEALTH_URL = "http://192.168.122.77:30080/health"
 PROMETHEUS_URL = os.environ.get(
     "PROMETHEUS_URL", "http://192.168.230.119:18428/api/v1/query"
 )
+# Error rate is read from the trace table rather than from the APM rollup.
+# 2026-07-30, same 60-minute window: agg_service_golden_signals reported 323
+# requests for commerce-gateway against 6,321 root spans in otel_traces_local,
+# and 1-4 requests for commerce-order / commerce-payment / food-delivery-payment
+# against 226-288. The rollup is an AggregatingMergeTree whose req_count and
+# error_count are plain UInt64 columns, so same-minute insert blocks discard all
+# but one row — the loss factor runs 20x to 288x and varies per service. The
+# surviving block held ~1 request, which made every threshold (2/5/10/30%) decide
+# on whether that single sampled request happened to fail. The traces themselves
+# are intact and lag only ~3s, so we count the real denominator here.
+CLICKHOUSE_URL = os.environ.get("CLICKHOUSE_URL", "http://192.168.230.119:18123/")
+CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "lucida")
+CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
+# 60s trailing window: it matches the update interval the timing contracts were
+# verified against, and one window carries no rows in common with the next.
+#
+# The error test is the HTTP response status, not the span status. Measured over
+# 48h: SERVER spans never carry status_code='ERROR' in this testbed — every one
+# of the 3,204 ERROR spans in the last hour sat on CLIENT or INTERNAL spans,
+# because the Spring instrumentation records the downstream failure on the
+# outbound span and the inbound span keeps status UNSET. A span-status test would
+# have returned a constant 0, which is the dead-observation class this change
+# exists to remove. `http.response.status_code >= 500` is also what the scenarios
+# mean by an error: 502 dominates the 48h 5xx history (10,063 of 10,430).
+#
+# Verified against the 2026-07-28 23:55 commerce-payment outage window:
+# food-delivery-order 96.3636% (53/55), food-delivery-dispatch 35.2941% (18/51).
+CLICKHOUSE_TEMPLATES = {
+    "trace-service-error-rate-v1": (
+        "SELECT if(count() = 0, 0, round(100.0 * countIf("
+        "toUInt16OrZero(span_attributes['http.response.status_code']) >= 500"
+        ") / count(), 4)) AS value "
+        "FROM lucida.otel_traces_local "
+        "WHERE service_name = '%s' AND span_kind = 'SERVER' "
+        "AND timestamp > now() - INTERVAL 60 SECOND "
+        "FORMAT JSON"
+    ),
+}
 
 APPROVED_CHECK_IDS = frozenset(
     {
@@ -623,6 +661,7 @@ class LiveProbeSet:
                 "loadgen_summary": self._loadgen_observation,
                 "http_probe": self._http_observation,
                 "prometheus": self._prometheus_observation,
+                "clickhouse": self._clickhouse_observation,
                 "kubernetes": self._kubernetes_observation,
                 "database": self._database_observation,
                 "host_probe": self._host_observation,
@@ -873,6 +912,43 @@ class LiveProbeSet:
             numeric,
             datetime.fromtimestamp(timestamp_value, timezone.utc),
             f"prometheus:{query.template_id}",
+        )
+
+    def _clickhouse_observation(self, query: ApprovedQuery) -> tuple[float, datetime, str]:
+        if query.template_id not in CLICKHOUSE_TEMPLATES:
+            raise LiveProbeError("unsupported clickhouse query")
+        if set(query.parameters) != {"service_name"}:
+            raise LiveProbeError("clickhouse query requires the fixed service parameter")
+        service = query.parameters["service_name"]
+        if service not in APPROVED_APM_SERVICES:
+            raise LiveProbeError("clickhouse service_name is not allowlisted")
+        # The allowlist is the boundary that keeps scenario input out of the SQL,
+        # exactly as APPROVED_SERVICES does for PromQL.
+        sql = CLICKHOUSE_TEMPLATES[query.template_id] % service
+        response = self.http_client(
+            "POST",
+            CLICKHOUSE_URL,
+            body=sql.encode("utf-8"),
+            headers={
+                "X-ClickHouse-User": CLICKHOUSE_USER,
+                "X-ClickHouse-Key": CLICKHOUSE_PASSWORD,
+                "Content-Type": "text/plain; charset=utf-8",
+            },
+            timeout=10.0,
+        )
+        payload = _response_json(response)
+        rows = payload.get("data")
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise LiveProbeError("clickhouse query requires exactly one row")
+        numeric = float(rows[0]["value"])
+        if not math.isfinite(numeric) or numeric < 0 or numeric > 100:
+            raise LiveProbeError("clickhouse query returned an invalid percentage")
+        # The window is trailing and evaluated server-side, so the observation is
+        # current as of the request rather than of some upstream batch boundary.
+        return (
+            numeric,
+            _aware(self.clock()),
+            f"clickhouse:{query.template_id}",
         )
 
     def _kubernetes_observation(self, query: ApprovedQuery) -> tuple[Any, datetime, str]:

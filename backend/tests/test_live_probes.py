@@ -29,6 +29,7 @@ from app.live_probes import (
     KAFKA_LAG_CONTRACT,
     PAYMENT_DUPLICATE_SINCE_T1_SQL,
     KUBECONFIG,
+    CLICKHOUSE_URL,
     PROMETHEUS_URL,
     TAGGED_SESSION_SQL,
     TARGET_HEALTH_URL,
@@ -57,6 +58,7 @@ class Fakes:
         self.http_calls: list[tuple[str, str, dict]] = []
         self.database_calls: list[tuple[str, tuple[str, ...], dict]] = []
         self.paid_orders = 120
+        self.clickhouse_value = 96.3636
 
     def process(self, argv, **kwargs):
         argv = list(argv)
@@ -202,6 +204,8 @@ class Fakes:
                 "status": 200,
                 "json": {"data": {"result": [{"value": [NOW.timestamp(), "0.321"]}]}},
             }
+        if url == CLICKHOUSE_URL:
+            return {"status": 200, "json": {"data": [{"value": self.clickhouse_value}]}}
         raise AssertionError(url)
 
     def database(self, sql, parameters, **kwargs):
@@ -664,6 +668,65 @@ def test_f04r_replica_and_kafka_lag_probes_use_exact_targets(tmp_path) -> None:
     assert rejected["quality"] == "error" and rejected["value"] is None
 
 
+def test_service_error_rate_reads_the_trace_table_not_the_apm_rollup(tmp_path) -> None:
+    """The denominator has to be the real request count.
+
+    agg_service_golden_signals kept ~1 of every 20-288 requests (2026-07-30), so
+    every percentage gate was decided by whether that one sampled request had
+    failed. This probe counts SERVER spans directly.
+    """
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+
+    observed = probes.observe(
+        registry.bind(
+            {
+                "query_id": "clickhouse.service_error_rate",
+                "parameters": {"service_name": "food-delivery-order"},
+            }
+        )
+    )
+
+    assert observed["quality"] == "good"
+    assert observed["value"] == 96.3636
+    method, url, kwargs = next(
+        call for call in fakes.http_calls if call[1] == CLICKHOUSE_URL
+    )
+    assert method == "POST"
+    sql = kwargs["body"].decode()
+    assert "service_name = 'food-delivery-order'" in sql
+    assert "span_kind = 'SERVER'" in sql
+    # SERVER spans never carry status_code='ERROR' here, so the error test must be
+    # the HTTP status; a span-status test would pin this metric at 0 forever.
+    assert "http.response.status_code" in sql and ">= 500" in sql
+    assert kwargs["headers"]["X-ClickHouse-User"]
+
+    # Percentages only: a rollup that returned a fraction would silently make
+    # every threshold 100x too strict.
+    fakes.clickhouse_value = 140.0
+    rejected = probes.observe(
+        registry.bind(
+            {
+                "query_id": "clickhouse.service_error_rate",
+                "parameters": {"service_name": "food-delivery-order"},
+            }
+        )
+    )
+    assert rejected["quality"] == "error" and rejected["value"] is None
+
+    # Scenario input never reaches the SQL: the service allowlist is the boundary.
+    unlisted = probes.observe(
+        registry.bind(
+            {
+                "query_id": "clickhouse.service_error_rate",
+                "parameters": {"service_name": "commerce-shipping"},
+            }
+        )
+    )
+    assert unlisted["quality"] == "error" and unlisted["value"] is None
+
+
 def test_f12h_fixed_apm_kcm_and_cpu_limit_queries(tmp_path) -> None:
     fakes = Fakes()
     probes = _probes(tmp_path, fakes)
@@ -672,10 +735,6 @@ def test_f12h_fixed_apm_kcm_and_cpu_limit_queries(tmp_path) -> None:
         {
             "query_id": "prometheus.apm_service_p95",
             "parameters": {"service_name": "commerce-product"},
-        },
-        {
-            "query_id": "prometheus.apm_service_error_rate",
-            "parameters": {"service_name": "commerce-order"},
         },
         {
             "query_id": "prometheus.container_cpu_throttled_time",
@@ -705,7 +764,6 @@ def test_f12h_fixed_apm_kcm_and_cpu_limit_queries(tmp_path) -> None:
     ]
     assert rendered == [
         'max without(grade) (apm.agent.otel.java.percentile95{service_name="commerce-product"})',
-        'max without(grade) (apm.agent.otel.java.error_rate{service_name="commerce-order"})',
         'max without(grade) (kcm.pod.cpu_throttled_time{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"})',
         'max without(grade) (kcm.pod.network_rx_error{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"}) + max without(grade) (kcm.pod.network_tx_error{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"})',
     ]
@@ -756,7 +814,7 @@ def test_restaurant_apm_p95_and_error_rate_are_approved_live_observations(tmp_pa
             "parameters": {"service_name": "food-delivery-restaurant"},
         },
         {
-            "query_id": "prometheus.apm_service_error_rate",
+            "query_id": "clickhouse.service_error_rate",
             "parameters": {"service_name": "food-delivery-restaurant"},
         },
     ]

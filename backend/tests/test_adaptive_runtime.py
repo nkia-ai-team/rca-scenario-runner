@@ -34,6 +34,7 @@ from app.observations import (
     ApprovedQueryRegistry,
     BusinessProbeAdapter,
     CaptureStatusAdapter,
+    ClickHouseAdapter,
     DatabaseAdapter,
     HttpProbeAdapter,
     HostProbeAdapter,
@@ -193,6 +194,7 @@ def _poller(
         "host_probe": HostProbeAdapter,
         "business_probe": BusinessProbeAdapter,
         "capture_status": CaptureStatusAdapter,
+        "clickhouse": ClickHouseAdapter,
     }
 
     calls: dict[str, int] = {}

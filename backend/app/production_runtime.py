@@ -33,6 +33,7 @@ from app.observations import (
     ApprovedQueryRegistry,
     BusinessProbeAdapter,
     CaptureStatusAdapter,
+    ClickHouseAdapter,
     DatabaseAdapter,
     HttpProbeAdapter,
     HostProbeAdapter,
@@ -390,6 +391,7 @@ def production_runtime(
         "host_probe": HostProbeAdapter(reader, clock=clock.now),
         "business_probe": BusinessProbeAdapter(reader, clock=clock.now),
         "capture_status": CaptureStatusAdapter(reader, clock=clock.now),
+        "clickhouse": ClickHouseAdapter(reader, clock=clock.now),
     }
     evaluation = scenario.controller.adaptive.mode.value == "evaluation"
     session_profile_id = approved if evaluation else profile_id
