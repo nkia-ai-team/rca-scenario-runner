@@ -772,6 +772,16 @@ class LiveProbeSet:
             for run_dir in self.paths.runs.iterdir():
                 if not run_dir.is_dir() or run_dir.name == exclude_run_id:
                     continue
+                # Not every directory under the runs root is a run. The topology
+                # collector keeps its per-cycle store in cycle-topology/ here, and
+                # _run_intervals' fail-safe treats a directory it cannot read a
+                # timeline from as an open interval — so from 2026-07-26 that one
+                # directory silently blocked the clean-window gate for every
+                # scenario, forever. The fail-safe is right for a run whose
+                # timeline is missing; it must not apply to something that never
+                # was one.
+                if not _is_run_directory(run_dir):
+                    continue
                 # Excused failed attempt (mode-aware retry, 2026-07-20): its short,
                 # cleanly-recovered residue is accepted inside the shortened window.
                 if (run_dir / "clean-window-excused.json").is_file():
@@ -1726,6 +1736,23 @@ class SnapshotProducer:
         _atomic_json(self.evidence_path, evidence.model_dump(mode="json"))
         _atomic_json(self.observation_path, document)
         return evidence, document
+
+
+# Written when a run is created or as it progresses; a real run carries at least
+# one even if it crashed before recording a timeline.
+RUN_DIRECTORY_MARKERS = (
+    "plan.json",
+    "lease.json",
+    "capsule.json",
+    "state.json",
+    "result.json",
+    "timeline.json",
+    "cleanup.json",
+)
+
+
+def _is_run_directory(run_dir: Path) -> bool:
+    return any((run_dir / marker).is_file() for marker in RUN_DIRECTORY_MARKERS)
 
 
 def _run_intervals(run_dir: Path) -> list[tuple[datetime, datetime]]:

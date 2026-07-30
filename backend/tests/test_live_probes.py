@@ -1278,6 +1278,33 @@ def test_readable_no_effect_attempt_does_not_poison_clean_window(tmp_path) -> No
     assert evidence.overlapping_run_ids == []
 
 
+def test_non_run_directory_under_runs_root_does_not_block_clean_window(tmp_path) -> None:
+    """The topology collector keeps cycle-topology/ in the runs root. It carries no
+    run artifacts, so _run_intervals' unknown-open-interval fail-safe matched it and
+    blocked every scenario from 2026-07-26 on — four days with no run in sight."""
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    (probes.paths.runs / "cycle-topology" / "cycle-12-24986d92-0").mkdir(parents=True)
+
+    evidence = probes.inspect(_eligibility(checks=["clean-window"]))
+
+    assert evidence.check_results["clean-window"] is True
+    assert evidence.overlapping_run_ids == []
+
+
+def test_run_directory_without_a_timeline_still_blocks_clean_window(tmp_path) -> None:
+    """The fail-safe above must survive: a run that crashed before recording a
+    timeline still carries plan.json, and it cannot prove the window was clean."""
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    _write(probes.paths.runs / "crashed-run" / "plan.json", {"schema_version": 1})
+
+    evidence = probes.inspect(_eligibility(checks=["clean-window"]))
+
+    assert evidence.check_results["clean-window"] is False
+    assert evidence.overlapping_run_ids == ["crashed-run"]
+
+
 def test_live_loadgen_fallback_reads_only_tagged_remote_artifact(tmp_path) -> None:
     fakes = Fakes()
     probes = _probes(tmp_path, fakes)
