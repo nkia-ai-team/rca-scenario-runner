@@ -145,8 +145,16 @@ PROMETHEUS_TEMPLATES = {
     "apm-agent-error-rate-v1": (
         'max without(grade) (apm.agent.otel.java.error_rate{service_name="%s"})'
     ),
+    # The bare sum() this used until 2026-07-30 also summed `grade`, which the
+    # APM pipeline fans every series out across (13 copies of one measurement —
+    # see the daemon-thread note below). Pending sits at 0 at rest so the 13x
+    # inflation was invisible, but it only leaves 0 during the very faults these
+    # gates judge: F21-Q's `pool-is-the-bottleneck > 2` would have disqualified
+    # the run on a single genuinely-pending connection. Collapse grade first,
+    # then sum across pools/instances as before.
     "otel-hikari-pending-v1": (
-        'sum(db.client.connections.pending_requests{service_name="%s"})'
+        'sum(max without(grade) '
+        '(db.client.connections.pending_requests{service_name="%s"}))'
     ),
     # Parameterized on 2026-07-28. It used to hardcode testbed-product, which
     # made the throttling signal exist for F12-H and for nothing else — F09-P
@@ -178,10 +186,21 @@ PROMETHEUS_TEMPLATES = {
     # VictoriaMetrics 119:18428 over 24h: non-daemon sits flat at 4-5 and never
     # moves, while daemon runs ~40 at rest and climbs to ~80 under load. A gate
     # of "busy threads >= 180" against the non-daemon count could never fire.
+    #
+    # 2026-07-30: that ~40 was the per-grade truth, but the query summed `grade`
+    # away — the APM pipeline emits 13 identical copies of every series under
+    # distinct grade ids, so the gate read ~570 instead of ~44. Everything
+    # downstream inverted: success (>=180) held at rest, must_rule_out (<60)
+    # could never fire, and recovery (<60) could never complete. States DO
+    # partition the thread set, so they are still summed; grade and the instance
+    # labels are collapsed with max (max-threads is per JVM — with replicas we
+    # want the worst instance, not their sum). Measured after the fix: 42-45 at
+    # rest for core-banking-api, 39-43 for food-delivery-order.
     "otel-jvm-daemon-thread-count-v1": (
-        'sum without(grade,target_id,host_name,process_pid,os_description,os_type,'
-        'host_arch,jvm_thread_state) (apm.agent.otel.java.jvm.thread.count'
-        '{service_name="%s",jvm_thread_daemon="true"})'
+        'max without(grade,target_id,host_name,process_pid,os_description,'
+        'os_type,host_arch) (sum without(jvm_thread_state) '
+        '(apm.agent.otel.java.jvm.thread.count'
+        '{service_name="%s",jvm_thread_daemon="true"}))'
     ),
 }
 APPROVED_SERVICES = frozenset({"commerce-gateway", "commerce-order", "commerce-payment"})

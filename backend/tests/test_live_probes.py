@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ from app.live_probes import (
     PAYMENT_DUPLICATE_SINCE_T1_SQL,
     KUBECONFIG,
     CLICKHOUSE_URL,
+    PROMETHEUS_TEMPLATES,
     PROMETHEUS_URL,
     TAGGED_SESSION_SQL,
     TARGET_HEALTH_URL,
@@ -862,10 +864,38 @@ def test_jvm_daemon_thread_count_is_approved_for_f21_targets(tmp_path) -> None:
     assert rejected["quality"] == "error" and rejected["value"] is None
     rendered = parse_qs(fakes.http_calls[-1][2]["body"].decode())["query"][0]
     assert rendered == (
-        "sum without(grade,target_id,host_name,process_pid,os_description,os_type,"
-        'host_arch,jvm_thread_state) (apm.agent.otel.java.jvm.thread.count'
-        '{service_name="core-banking-api",jvm_thread_daemon="true"})'
+        "max without(grade,target_id,host_name,process_pid,os_description,"
+        "os_type,host_arch) (sum without(jvm_thread_state) "
+        "(apm.agent.otel.java.jvm.thread.count"
+        '{service_name="core-banking-api",jvm_thread_daemon="true"}))'
     )
+
+
+def test_no_prometheus_template_sums_the_grade_label() -> None:
+    # `grade` is not a dimension of the measurement — the APM pipeline emits one
+    # identical copy of every series per grade id (13 of them on 2026-07-30).
+    # Summing across it multiplies the value by the grade cardinality, which is
+    # neither constant nor knowable from the query. Two templates shipped this
+    # way and both judged live scenarios with inflated numbers before it was
+    # caught (F21-P/Q thread count, F21-Q Hikari pending). Collapse grade with
+    # max — never sum, and never leave it to a bare sum() that takes everything.
+    offenders = []
+    for template_id, promql in PROMETHEUS_TEMPLATES.items():
+        if "grade" not in promql:
+            # No grade anywhere: only safe if nothing aggregates blindly either.
+            if re.search(r"\bsum\s*\(", promql) or re.search(r"\bsum\s+without\s*\(", promql):
+                offenders.append((template_id, "aggregates without collapsing grade"))
+            continue
+        for labels in re.findall(r"\bsum\s+without\s*\(([^)]*)\)", promql):
+            if "grade" in {label.strip() for label in labels.split(",")}:
+                offenders.append((template_id, "sums the grade label"))
+        # A bare sum() swallows every label including grade unless an inner
+        # aggregation has already collapsed it.
+        for match in re.finditer(r"\bsum\s*\(", promql):
+            inner = promql[match.end():]
+            if not re.match(r"\s*max\s+without\s*\(\s*grade", inner):
+                offenders.append((template_id, "bare sum() over an un-collapsed grade"))
+    assert offenders == [], f"templates that let grade inflate the value: {offenders}"
 
 
 def test_f06g_pulse_and_payment_duplicate_observations_are_run_scoped(tmp_path) -> None:
