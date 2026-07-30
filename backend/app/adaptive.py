@@ -127,6 +127,10 @@ class ObservedValue(StrictModel):
     # Failure detail (exit code + stderr tail) for quality="error" signals;
     # absent on healthy observations.
     error: str | None = None
+    # Seconds between genuinely new values at the source (0 = re-queried every
+    # tick). Carried from the approved query so the controller can tell a second
+    # observation apart from a second *reading of the same* observation.
+    update_interval_sec: int = 0
 
     @property
     def usable(self) -> bool:
@@ -146,6 +150,9 @@ class ControllerState(StrictModel):
     level_id: str | None = None
     last_elapsed_sec: int = 0
     streaks: dict[str, int] = Field(default_factory=dict)
+    # elapsed_sec of the tick that last advanced each gate's streak. A tick that
+    # re-reads the same source sample holds the streak instead of advancing it.
+    streak_marks: dict[str, int] = Field(default_factory=dict)
     action: ControllerAction | None = None
     reason: str | None = None
     dirty: bool = False
@@ -195,15 +202,27 @@ def advance(
     raw_ruleout = _matches(spec.must_rule_out, observation.signals)
     raw_success = _matches(spec.success, observation.signals)
     raw_escalate = _matches(spec.escalate, observation.signals)
-    streaks = _updated_streaks(
+    streaks, streak_marks = _updated_streaks(
         state.streaks,
+        state.streak_marks,
+        observation.elapsed_sec,
+        {
+            "abort": _independence_sec(spec.abort, observation.signals),
+            "must_rule_out": _independence_sec(spec.must_rule_out, observation.signals),
+            "success": _independence_sec(spec.success, observation.signals),
+            "escalate": _independence_sec(spec.escalate, observation.signals),
+        },
         abort=raw_abort,
         must_rule_out=raw_ruleout,
         success=raw_success,
         escalate=raw_escalate,
     )
     current = state.model_copy(
-        update={"last_elapsed_sec": observation.elapsed_sec, "streaks": streaks},
+        update={
+            "last_elapsed_sec": observation.elapsed_sec,
+            "streaks": streaks,
+            "streak_marks": streak_marks,
+        },
         deep=True,
     )
 
@@ -343,11 +362,69 @@ def _condition_result(
     return actual != expected
 
 
-def _updated_streaks(streaks: dict[str, int], **results: bool | None) -> dict[str, int]:
+def _independence_sec(
+    condition_set: ConditionSet | None,
+    signals: dict[str, ObservedValue],
+) -> int:
+    """Seconds a gate must wait before its evidence can renew.
+
+    An ``all`` gate is only as independent as its slowest signal: confirming a
+    condition that reads a 60s metric three times inside one minute reads one
+    sample three times, which is one piece of evidence, not three.
+
+    An ``any`` gate renews as fast as the quickest condition actually carrying
+    it. Taking the maximum here would have delayed F12-H's abort by 45s whenever
+    the entry point went dark, because an unrelated 60s prometheus condition sat
+    in the same set — safety gates must not inherit an idle signal's cadence.
+    """
+    if condition_set is None:
+        return 0
+    intervals = [
+        signals[condition.signal].update_interval_sec
+        for condition in condition_set.conditions
+        if condition.signal in signals
+        and (
+            condition_set.match == "all"
+            or _condition_result(condition, signals) is True
+        )
+    ]
+    if not intervals:
+        return 0
+    return max(intervals) if condition_set.match == "all" else min(intervals)
+
+
+def _updated_streaks(
+    streaks: dict[str, int],
+    marks: dict[str, int],
+    elapsed_sec: int,
+    independence: dict[str, int],
+    **results: bool | None,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Advance each gate's streak, counting independent samples rather than ticks.
+
+    Three outcomes per gate: a false/unknown result resets it, a true result on
+    fresh evidence advances it, and a true result that can only be re-reading the
+    previous sample holds it where it is. Holding rather than advancing is what
+    makes ``consecutive_ticks`` mean consecutive *observations* — before this the
+    tick interval (15s) outpaced every prometheus metric (60s), so a three-tick
+    confirmation could be satisfied inside a single sample.
+    """
     updated = dict(streaks)
+    updated_marks = dict(marks)
     for name, result in results.items():
-        updated[name] = updated.get(name, 0) + 1 if result is True else 0
-    return updated
+        if result is not True:
+            updated[name] = 0
+            updated_marks.pop(name, None)
+            continue
+        previous = updated.get(name, 0)
+        mark = updated_marks.get(name)
+        if previous == 0 or mark is None:
+            updated[name] = 1
+            updated_marks[name] = elapsed_sec
+        elif elapsed_sec - mark >= independence.get(name, 0):
+            updated[name] = previous + 1
+            updated_marks[name] = elapsed_sec
+    return updated, updated_marks
 
 
 def _confirmed(
@@ -399,6 +476,7 @@ def _escalate_or_fail(
             "level_id": next_level.id,
             "last_elapsed_sec": 0,
             "streaks": {},
+            "streak_marks": {},
             "action": ControllerAction.ESCALATE,
             "reason": reason,
         },

@@ -280,18 +280,24 @@ async def test_calibration_escalates_after_fresh_consecutive_ticks_and_cleans_up
     clock.advance(20)
     await runtime.tick()
     assert len(applier.applies) == 1
+    # The gate reads loadgen_summary, a 30s rolling window: a second confirmation
+    # has to sit a full window later or it re-reads the sample that produced the
+    # first one. Ticking again at +10s deliberately does not escalate.
     clock.advance(10)
+    await runtime.tick()
+    assert len(applier.applies) == 1
+    clock.advance(20)
     session = await runtime.tick()
     assert session.controller_state and session.controller_state.level_id == "high"
     assert len(applier.applies) == 2
     assert len(applier.transition_cleanups) == 1
-    assert session.level_changes[0].effect_ended_at == START + timedelta(seconds=30)
-    assert session.level_changes[1].applied_at == START + timedelta(seconds=31)
+    assert session.level_changes[0].effect_ended_at == START + timedelta(seconds=50)
+    assert session.level_changes[1].applied_at == START + timedelta(seconds=51)
 
     values["loadgen.achieved_rps"] = 100
     clock.advance(10)
     await runtime.tick()
-    clock.advance(10)
+    clock.advance(30)
     session = await runtime.tick()
 
     assert session.status == SessionStatus.CLEAN
@@ -301,7 +307,7 @@ async def test_calibration_escalates_after_fresh_consecutive_ticks_and_cleans_up
     assert session.t2 == clock.now()
     evidence = session.trusted_evidence()
     assert evidence["t1"] == "2026-07-16T08:00:00Z"
-    assert evidence["t2"] == "2026-07-16T08:00:51Z"
+    assert evidence["t2"] == "2026-07-16T08:01:31Z"
     assert evidence["cleanup"] == {"status": "succeeded"}
     assert evidence["recovery"] == {"status": "succeeded"}
 
@@ -399,7 +405,9 @@ async def test_cleanup_failure_marks_dirty_and_session_restores_without_reapply(
     await runtime.begin()
     clock.advance(20)
     await runtime.tick()
-    clock.advance(10)
+    # +30s: the second confirmation must read a new loadgen window (see the
+    # escalation test above).
+    clock.advance(30)
     session = await runtime.tick()
 
     assert session.status == SessionStatus.DIRTY

@@ -92,12 +92,87 @@ def _spec(*, mode: AdaptiveMode = AdaptiveMode.CALIBRATION) -> AdaptiveSpec:
     )
 
 
-def _safe_signals(*, error_rate=0.0, health=True, db_lock=False) -> dict:
+def _safe_signals(*, error_rate=0.0, health=True, db_lock=False, update_interval_sec=0) -> dict:
     return {
-        "error_rate": _value(error_rate),
+        "error_rate": {**_value(error_rate), "update_interval_sec": update_interval_sec},
         "health": _value(health),
         "db_lock": _value(db_lock),
     }
+
+
+def test_consecutive_ticks_counts_samples_not_reads_of_the_same_sample() -> None:
+    """A 60s metric cannot confirm a two-tick gate inside one minute.
+
+    The tick interval (15s) is shorter than every prometheus metric's update
+    interval (60s, measured 2026-07-30), so counting ticks let a gate reach
+    ``consecutive_ticks`` by reading one sample repeatedly. 24 of the 44 live
+    scenarios were confirming on a single sample.
+    """
+    spec = _spec(mode=AdaptiveMode.EVALUATION)
+    slow = start(spec)
+    slow = advance(spec, slow, Observation(elapsed_sec=15, signals=_safe_signals(
+        error_rate=0.2, update_interval_sec=60)))
+    assert slow.streaks["success"] == 1
+    slow = advance(spec, slow, Observation(elapsed_sec=30, signals=_safe_signals(
+        error_rate=0.2, update_interval_sec=60)))
+    assert slow.streaks["success"] == 1, "re-reading the same 60s sample is not new evidence"
+    assert slow.phase is not ControllerPhase.SUCCEEDED
+    # One update interval later the source has genuinely produced a new value.
+    slow = advance(spec, slow, Observation(elapsed_sec=75, signals=_safe_signals(
+        error_rate=0.2, update_interval_sec=60)))
+    assert slow.phase is ControllerPhase.SUCCEEDED
+
+    # A signal the adapter re-queries every tick is independent every tick.
+    fast = start(spec)
+    fast = advance(spec, fast, Observation(elapsed_sec=15, signals=_safe_signals(error_rate=0.2)))
+    fast = advance(spec, fast, Observation(elapsed_sec=30, signals=_safe_signals(error_rate=0.2)))
+    assert fast.phase is ControllerPhase.SUCCEEDED
+
+
+def test_any_gate_renews_at_the_pace_of_the_condition_carrying_it() -> None:
+    """An idle slow condition must not slow down a live fast one.
+
+    F12-H aborts on ``any`` of {entry unreachable (polled every tick), pod
+    network errors (60s)}. Pacing the set by its slowest member would hold the
+    abort for 60s while the entry point was already dark.
+    """
+    base = _spec(mode=AdaptiveMode.EVALUATION).model_dump()
+    base["abort"] = {
+        "match": "any",
+        "conditions": [
+            # Polled every tick, and dark right now.
+            {"id": "entry-unreachable", "signal": "health", "operator": "eq", "value": False},
+            # A 60s metric that is sitting quiet — it must not set the pace.
+            {"id": "network-errors", "signal": "db_lock", "operator": "eq", "value": True},
+        ],
+        "consecutive_ticks": 2,
+    }
+    spec = AdaptiveSpec.model_validate(base)
+    signals = {
+        "error_rate": _value(0.0),
+        "health": {**_value(False), "update_interval_sec": 0},
+        "db_lock": {**_value(False), "update_interval_sec": 60},
+    }
+    state = start(spec)
+    state = advance(spec, state, Observation(elapsed_sec=5, signals=signals))
+    assert state.streaks["abort"] == 1
+    state = advance(spec, state, Observation(elapsed_sec=20, signals=signals))
+    assert state.phase is ControllerPhase.ABORTED
+
+
+def test_streak_resets_rather_than_holds_when_the_condition_stops_matching() -> None:
+    """Holding a streak across a stale read must not survive a genuine miss."""
+    spec = _spec(mode=AdaptiveMode.EVALUATION)
+    state = start(spec)
+    state = advance(spec, state, Observation(elapsed_sec=15, signals=_safe_signals(
+        error_rate=0.2, update_interval_sec=60)))
+    assert state.streaks["success"] == 1
+    state = advance(spec, state, Observation(elapsed_sec=30, signals=_safe_signals(
+        error_rate=0.0, update_interval_sec=60)))
+    assert state.streaks["success"] == 0
+    state = advance(spec, state, Observation(elapsed_sec=45, signals=_safe_signals(
+        error_rate=0.2, update_interval_sec=60)))
+    assert state.streaks["success"] == 1
 
 
 def test_schema_matches_calibration_and_evaluation_contract() -> None:
