@@ -283,6 +283,24 @@ def _oracle_string_literal(value: str) -> str:
     if not value or not all(32 <= ord(ch) < 127 for ch in value):
         raise LiveProbeError("Oracle tag is not printable ASCII")
     return "||".join(f"chr({ord(ch)})" for ch in value)
+
+
+def _oracle_sqlplus(query: str) -> str:
+    """Build the sh -lc argument for a single-value Oracle probe.
+
+    The container switch prints "Session altered.", so the display settings must
+    already be in force when it runs. All four Oracle probes had the two lines the
+    other way round, which put that sentence ahead of the digits and made the
+    fullmatch check reject every reading — measured 2026-07-30: the probes had never
+    once returned a value. Emitting the order from one place keeps the next probe
+    from reintroducing it.
+    """
+    return (
+        "printf 'set pages 0 feedback off heading off\\n"
+        "alter session set container=FREEPDB1;\\n"
+        f"{query}\\n"
+        "exit;\\n' | sqlplus -s / as sysdba"
+    )
 MYSQL_INDEX_CONTRACT = {
     "database": "fooddelivery", "table": "menus", "index": "idx_menus_category"
 }
@@ -1251,10 +1269,10 @@ class LiveProbeSet:
             result = self._kubectl(
                 "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
                 "sh", "-lc",
-                "printf 'alter session set container=FREEPDB1;\\n"
-                "set pages 0 feedback off heading off\\n"
-                "select count(*) from v$session where client_identifier="
-                f"{_oracle_string_literal(tag)};\\nexit;\\n' | sqlplus -s / as sysdba",
+                _oracle_sqlplus(
+                    "select count(*) from v$session where client_identifier="
+                    f"{_oracle_string_literal(tag)};"
+                ),
             )
             raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
@@ -1280,7 +1298,9 @@ class LiveProbeSet:
             result = self._kubectl(
                 "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
                 "sh", "-lc",
-                "printf 'alter session set container=FREEPDB1;\\nset pages 0 feedback off heading off\\nselect count(*) from banking.outbox_events where published_at is null;\\nexit;\\n' | sqlplus -s / as sysdba",
+                _oracle_sqlplus(
+                    "select count(*) from banking.outbox_events where published_at is null;"
+                ),
             )
             raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
@@ -1374,13 +1394,15 @@ class LiveProbeSet:
             result = self._kubectl(
                 "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
                 "sh", "-lc",
-                "printf 'alter session set container=FREEPDB1;\\n"
-                "set pages 0 feedback off heading off\\n"
-                "select count(*) from banking.transfers t join banking.accounts a "
-                "on a.id in (t.from_account, t.to_account) "
-                "where a.status in (''FROZEN'',''CLOSED'') and t.status=''COMPLETED'' "
-                f"and t.created_at >= to_timestamp(''{since}'', ''YYYY-MM-DD HH24:MI:SS'');\\n"
-                "exit;\\n' | sqlplus -s / as sysdba",
+                _oracle_sqlplus(
+                    "select count(*) from banking.transfers t join banking.accounts a "
+                    "on a.id in (t.from_account, t.to_account) "
+                    f"where a.status in ({_oracle_string_literal('FROZEN')},"
+                    f"{_oracle_string_literal('CLOSED')}) "
+                    f"and t.status={_oracle_string_literal('COMPLETED')} "
+                    f"and t.created_at >= to_timestamp({_oracle_string_literal(since)}, "
+                    f"{_oracle_string_literal('YYYY-MM-DD HH24:MI:SS')});"
+                ),
             )
             raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
@@ -1408,18 +1430,19 @@ class LiveProbeSet:
             result = self._kubectl(
                 "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
                 "sh", "-lc",
-                "printf 'alter session set container=FREEPDB1;\\n"
-                "set pages 0 feedback off heading off\\n"
-                "select count(*) from banking.transfers t "
-                "where t.status=''COMPLETED'' "
-                # sys_extract_utc: created_at is stored UTC-naive, so comparing it
-                # against a plain systimestamp would shift the window by the DB
-                # host's offset.
-                f"and t.created_at >= sys_extract_utc(systimestamp) - numtodsinterval({window}, ''MINUTE'') "
-                f"and t.created_at < sys_extract_utc(systimestamp) - numtodsinterval({grace}, ''SECOND'') "
-                "and not exists (select 1 from banking.ledger_entries le "
-                "where le.transfer_ref = t.transfer_ref);\\n"
-                "exit;\\n' | sqlplus -s / as sysdba",
+                _oracle_sqlplus(
+                    "select count(*) from banking.transfers t "
+                    f"where t.status={_oracle_string_literal('COMPLETED')} "
+                    # sys_extract_utc: created_at is stored UTC-naive, so comparing it
+                    # against a plain systimestamp would shift the window by the DB
+                    # host's offset.
+                    f"and t.created_at >= sys_extract_utc(systimestamp) - "
+                    f"numtodsinterval({window}, {_oracle_string_literal('MINUTE')}) "
+                    f"and t.created_at < sys_extract_utc(systimestamp) - "
+                    f"numtodsinterval({grace}, {_oracle_string_literal('SECOND')}) "
+                    "and not exists (select 1 from banking.ledger_entries le "
+                    "where le.transfer_ref = t.transfer_ref);"
+                ),
             )
             raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):

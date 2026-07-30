@@ -10,6 +10,35 @@ from app.observations import ApprovedQueryRegistry
 NOW = datetime(2026, 7, 17, 3, 0, tzinfo=timezone.utc)
 
 
+def fake_sqlplus(script: str) -> str:
+    """Emulate sqlplus closely enough to catch preamble-ordering mistakes.
+
+    Real sqlplus acknowledges the container switch with "Session altered." and
+    indents the value. Returning a bare number instead is what let all four Oracle
+    probes ship with the display settings applied *after* the switch: the digits-only
+    check rejected every real reading while these tests stayed green (2026-07-30).
+    """
+    printed: list[str] = []
+    silenced = False
+    for statement in script.split("\\n"):
+        # The first statement still carries the shell wrapper: printf '<statement>
+        statement = statement.strip().removeprefix("printf '").strip()
+        if statement.startswith("set pages"):
+            silenced = True
+        elif statement.startswith("alter session") and not silenced:
+            printed += ["", "Session altered.", ""]
+        elif statement.startswith("select"):
+            # A '' pair inside the shell's single-quoted printf closes and reopens
+            # the string, so it reaches Oracle as nothing at all: ''COMPLETED''
+            # arrives bare and ''YYYY-MM-DD HH24:MI:SS'' turns :MI into a bind
+            # variable. Two probes shipped that way (2026-07-30) — string literals
+            # have to go through _oracle_string_literal to survive the transport.
+            if "''" in statement:
+                return 'ORA-00904: "SECOND": invalid identifier\n'
+            printed.append("\t 1")
+    return "\n".join(printed) + "\n"
+
+
 class FakeProcess:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], dict]] = []
@@ -24,7 +53,7 @@ class FakeProcess:
                 b"",
             )
         if "testbed-oracle-0" in argv:
-            return subprocess.CompletedProcess(argv, 0, "1\n", "")
+            return subprocess.CompletedProcess(argv, 0, fake_sqlplus(argv[-1]), "")
         if "testbed-mysql-0" in argv:
             return subprocess.CompletedProcess(argv, 0, "0\n", "")
         raise AssertionError(argv)
@@ -96,6 +125,27 @@ def test_host_queries_use_only_measured_worker_and_fixed_probe_script() -> None:
             assert argv[-3:] == [scenario_id, mode, target]
             assert kwargs["input"].startswith(b"#!/usr/bin/env bash")
             assert "StrictHostKeyChecking=yes" in argv
+
+
+ORACLE_PROBES = {
+    "database.oracle_tagged_session_count": {"client_identifier": "rca-F01-P-oracle-lock"},
+    "database.outbox_unpublished_count": {"namespace": "rca-testbed-banking"},
+    "database.integrity_violation_count": {"since": "2026-07-30 05:00:00"},
+    "database.ledger_unmatched_transfer_count": {"window_minutes": 5, "grace_seconds": 60},
+}
+
+
+def test_every_oracle_probe_silences_sqlplus_before_switching_container() -> None:
+    """All four shipped with the two preamble lines reversed and so had never
+    returned a value. Assert the invariant for every probe, not just the one that
+    happened to be exercised."""
+    for query_id, parameters in ORACLE_PROBES.items():
+        fake = FakeProcess()
+        result = observe(fake, query_id, parameters)
+        assert result["quality"] == "good", (query_id, result)
+        assert result["value"] == 1, (query_id, result)
+        script = fake.calls[0][0][-1]
+        assert script.index("set pages") < script.index("alter session"), query_id
 
 
 def test_filesystem_query_rejects_non_storage_target_and_unknown_scenario() -> None:
