@@ -69,7 +69,19 @@ PREFLIGHT_WINDOW_LEAD = timedelta(minutes=10)
 # inter-scenario clean window is replaced by a minimum 30m gap between the
 # previous t2 and the next t1, with the 2-layer preflight gate deciding
 # cleanliness of the [t1-10m, t1] window.
-CLEAN_WINDOW = timedelta(minutes=30)
+#
+# 30m is the dataset-grade default and what a capture run must use: the eval
+# case carries a pre-injection normal segment, and a previous fault's tail inside
+# it is contamination (charter L3), not noise.
+#
+# SCENARIO_CLEAN_WINDOW_MIN lowers the floor for a validation pass whose captures
+# are discarded — there the preflight gate, which measures cleanliness instead of
+# assuming it, is the real guard and simply waits longer when the system has not
+# settled. Do not lower it for a capture run, and note that the gate's eight
+# signals watch gateway p95/5xx, pool residue, alarms and incidents — not Kafka
+# consumer backlog, JVM heap after a GC-pressure scenario, or a filled disk. Those
+# tails outlive a short gap and cost more in spurious failures than they save.
+CLEAN_WINDOW = timedelta(minutes=int(os.environ.get("SCENARIO_CLEAN_WINDOW_MIN", "30")))
 # Mode-aware retry wait (2026-07-20): a calibration retry after a short, cleanly
 # recovered failure does not need the full evaluation-grade 2h lead-in purity.
 RETRY_CLEAN_WINDOW_CALIBRATION = timedelta(minutes=30)
