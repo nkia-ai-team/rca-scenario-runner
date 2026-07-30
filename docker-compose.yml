@@ -83,6 +83,11 @@ services:
       - COMMERCE_DB_PASSWORD=${COMMERCE_DB_PASSWORD:-}
       - PG_PASSWORD=${PG_PASSWORD:-}
       - CH_PASSWORD=${CH_PASSWORD:-}
+      # clickhouse.service_error_rate reads the trace table for the 13 scenarios
+      # whose gates moved off the APM rollup. Same credential as the capture
+      # scripts — mapped, not copied, so there is one secret in .env.
+      - CLICKHOUSE_USER=${CH_USER:-lucida}
+      - CLICKHOUSE_PASSWORD=${CH_PASSWORD:-}
       - MODEL_SNAPSHOT_SSH_TARGET=${MODEL_SNAPSHOT_SSH_TARGET:-}
       # trainer-reset(golden) 활성화 (2026-07-21)
       - GOLDEN_RESET_ENABLED=${GOLDEN_RESET_ENABLED:-}
