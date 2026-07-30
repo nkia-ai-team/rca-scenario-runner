@@ -888,3 +888,59 @@ def test_failed_cleanup_is_retried_at_the_dispatcher_layer(tmp_path) -> None:
     third = applier.cleanup(request())
     assert len(calls) == 2, "a settled cleanup was re-invoked"
     assert third.succeeded is True
+
+
+def _rewrite_dispatcher_plan(contract: Path, plan: dict) -> None:
+    dispatcher = contract / "run-scenario.sh"
+    dispatcher.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '" + json.dumps({"normalized_plan": plan}) + "'\n",
+        encoding="utf-8",
+    )
+    dispatcher.chmod(0o755)
+
+
+def test_capsule_repair_recompiles_the_plan_so_cleanup_can_still_load_it(tmp_path) -> None:
+    # Freezing plan.json across a repair looks safe and is not: the plan is
+    # compiled *from* the contracts, so a stale copy stops matching a recompile
+    # and _plan() raises "capsule compiled plan differs from its normalized plan"
+    # before cleanup starts. Measured on the real F21-P capsule: the recompile
+    # differed in exactly two fields, executor_sha256 and the plan_digest derived
+    # from it, with every target field byte-identical.
+    store, run_dir, contract = _dirty_run_capsule(tmp_path, executor_body="#!/bin/sh\nbroken\n")
+    stored = json.loads((run_dir / "plan.json").read_text())
+
+    moved = json.loads(json.dumps(stored))
+    moved["plan_digest"] = "d" * 64
+    _rewrite_dispatcher_plan(contract, moved)
+    (contract / "profiles" / "load.py").write_text("#!/bin/sh\nfixed\n", encoding="utf-8")
+
+    store.repair_capsule_contracts(
+        run_dir, contract, reason="executor defect",
+        now=datetime(2026, 7, 30, 9, tzinfo=timezone.utc),
+    )
+    repaired = json.loads((run_dir / "plan.json").read_text())
+    assert repaired["plan_digest"] == "d" * 64, "plan.json was left at the pre-repair digest"
+    assert json.loads((run_dir / "capsule.json").read_text())["plan_sha256"] == file_sha256(
+        run_dir / "plan.json"
+    ), "capsule.json still points at the old plan hash"
+    store.verify_capsule(run_dir)
+
+
+def test_capsule_repair_refuses_when_a_target_field_moves(tmp_path) -> None:
+    # executor_sha256 and plan_digest are the mechanism and may move. Anything
+    # else — scenario, parameters, approved levels — is the target, and a repair
+    # that changes it would clean up something other than what was injected.
+    store, run_dir, contract = _dirty_run_capsule(tmp_path, executor_body="#!/bin/sh\nbroken\n")
+    stored = json.loads((run_dir / "plan.json").read_text())
+
+    moved = json.loads(json.dumps(stored))
+    moved["scenario"]["id"] = "F21-Q"
+    _rewrite_dispatcher_plan(contract, moved)
+
+    with pytest.raises(RuntimeError, match="change the cleanup target"):
+        store.repair_capsule_contracts(
+            run_dir, contract, reason="target moved",
+            now=datetime(2026, 7, 30, 9, tzinfo=timezone.utc),
+        )
+    assert json.loads((run_dir / "plan.json").read_text()) == stored
+    assert not (run_dir / "capsule-repair.json").exists()

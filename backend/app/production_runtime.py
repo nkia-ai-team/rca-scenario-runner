@@ -224,8 +224,25 @@ class RunArtifactStore:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
+    @staticmethod
+    def _target_fields(plan: dict[str, Any]) -> dict[str, Any]:
+        """The plan with the mechanism fingerprints masked out.
+
+        `executor_sha256` identifies the code that performs the injection and its
+        undo; `plan_digest` is a hash over the whole plan and therefore moves with
+        it. Everything else — scenario, profile parameters, approved levels — is
+        the target, and a repair that changes any of it is not a repair.
+        """
+        masked = json.loads(json.dumps(plan))
+        masked.pop("plan_digest", None)
+        for instance in masked.get("profile_instances", []):
+            if isinstance(instance, dict):
+                instance.pop("executor_sha256", None)
+        return masked
+
     def repair_capsule_contracts(
-        self, run_dir: Path, contract_root: Path, *, reason: str, now: datetime
+        self, run_dir: Path, contract_root: Path, *, reason: str, now: datetime,
+        process_runner: ProcessRunner = subprocess.run,
     ) -> dict[str, Any]:
         """Re-materialize a dirty run's contract tree from the live trusted root.
 
@@ -240,8 +257,15 @@ class RunArtifactStore:
 
         Repair therefore replaces the mechanism while holding the target fixed:
 
-        - `plan.json` is not touched and must still match `capsule.json`'s
-          `plan_sha256`. If what we are undoing changed, this is not a repair.
+        - The plan is recompiled from the repaired tree and every field that
+          describes the target must come back byte-identical. Only the mechanism
+          fingerprints may move: each instance's `executor_sha256`, and
+          `plan_digest`, which is derived from them. Leaving plan.json frozen
+          instead does not work — the plan is *compiled from* the contracts, so a
+          stale copy stops matching a recompile and `_plan()` refuses the run
+          before cleanup ever starts. Naming the two fields that may move is also
+          a stronger check than comparing bytes: it says what a repair is allowed
+          to be.
         - The previous hash manifest is preserved in `capsule-repair.json` with
           the reason and timestamp, so the swap is recorded rather than hidden.
         - Repair is explicit, never automatic on cleanup failure. A capsule that
@@ -255,6 +279,7 @@ class RunArtifactStore:
             raise RuntimeError("trusted contract root must be a real directory")
         contracts = run_dir / "capsule" / "contracts"
         previous_manifest_sha256 = capsule["hash_manifest_sha256"]
+        previous_plan_sha256 = capsule["plan_sha256"]
 
         staging = Path(tempfile.mkdtemp(prefix=f".{run_dir.name}.repair.", dir=self.root))
         try:
@@ -274,9 +299,24 @@ class RunArtifactStore:
             atomic_json(staging / "hashes.json", {"schema_version": 1, "files": hashes})
             manifest_sha256 = file_sha256(staging / "hashes.json")
 
+            # Compile from the staged tree, before anything is swapped in, so a
+            # repair that would move the target is refused without having written
+            # a byte. A half-repaired run is worse than a stuck one.
+            stored_plan = json.loads((run_dir / "plan.json").read_text(encoding="utf-8"))
+            repaired_plan = compile_trusted_plan(
+                capsule["scenario_slug"],
+                dispatcher=rebuilt / "run-scenario.sh",
+                process_runner=process_runner,
+            )
+            if self._target_fields(repaired_plan) != self._target_fields(stored_plan):
+                raise RuntimeError("capsule repair would change the cleanup target")
+            atomic_json(staging / "plan.json", repaired_plan)
+            plan_sha256 = file_sha256(staging / "plan.json")
+
             shutil.rmtree(contracts)
             os.replace(rebuilt, contracts)
             os.replace(staging / "hashes.json", run_dir / "capsule" / "hashes.json")
+            os.replace(staging / "plan.json", run_dir / "plan.json")
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
@@ -290,12 +330,14 @@ class RunArtifactStore:
             "contract_root": str(contract_root.resolve()),
             "previous_hash_manifest_sha256": previous_manifest_sha256,
             "hash_manifest_sha256": manifest_sha256,
+            "previous_plan_sha256": previous_plan_sha256,
+            "plan_sha256": plan_sha256,
         }
         record["repairs"].append(repair)
         atomic_json(record_path, record)
         atomic_json(
             run_dir / "capsule.json",
-            {**capsule, "hash_manifest_sha256": manifest_sha256},
+            {**capsule, "hash_manifest_sha256": manifest_sha256, "plan_sha256": plan_sha256},
         )
         # The plan is deliberately re-verified after the rewrite: a repair that
         # moved the target would be a different run wearing this run's id.
