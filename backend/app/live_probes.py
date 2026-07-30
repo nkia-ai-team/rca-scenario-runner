@@ -1596,16 +1596,29 @@ class LiveProbeSet:
                 if not isinstance(value, bool):
                     raise LiveProbeError("mock flap fault state is invalid")
             return value, observed_at, f"mock-flap:{query.query_id}"
-        if query.query_id != "business.checkout_invariant" or set(query.parameters) - {"business_key"}:
+        if query.query_id != "business.checkout_invariant" or set(query.parameters) - {
+            "business_key", "domain"
+        }:
             raise LiveProbeError("unsupported business query")
         key = query.parameters.get("business_key", "checkout")
         if key not in APPROVED_BUSINESS_KEYS:
             raise LiveProbeError("business key is not allowlisted")
-        document = self._loadgen_live_document()
+        # Same split the loadgen observations already had: without a domain this
+        # reads the scenario's own k6 output, which exists only while that scenario
+        # runs. business_ok is published in the resident baseline document too, and
+        # this probe was the one instrument left out of the 07-29 change — so F08-H
+        # and F11-R were the only success gates a no-fault sweep could not read.
+        domain = query.parameters.get("domain")
+        document = (
+            self._baseline_live_document(domain) if domain else self._loadgen_live_document()
+        )
         business_ok = document.get("business_ok")
         if not isinstance(business_ok, bool):
             raise LiveProbeError("checkout business outcome is unavailable")
-        return business_ok, _parse_time(document["observed_at"]), "k6:checkout-business-outcome"
+        source = (
+            f"k6:baseline:{domain}:business_ok" if domain else "k6:checkout-business-outcome"
+        )
+        return business_ok, _parse_time(document["observed_at"]), source
 
     def _f15r_flap_state(self, query: ApprovedQuery) -> dict[str, Any]:
         if dict(query.parameters) != {"scenario_id": "F15-R"}:

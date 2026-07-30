@@ -311,7 +311,8 @@
       "freshness_sec": 60,
       "update_interval_sec": 0,
       "allowed_parameters": [
-        "business_key"
+        "business_key",
+        "domain"
       ]
     },
     "mock.transient_consumed_count": {

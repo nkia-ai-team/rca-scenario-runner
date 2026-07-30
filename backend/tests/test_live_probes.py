@@ -1069,6 +1069,31 @@ def test_loadgen_domain_parameter_reads_the_resident_baseline_document(tmp_path)
     assert unscoped["value"] == 0.125 and unscoped["source"] == "k6:checkout_5xx_rate"
 
 
+def test_business_invariant_also_reads_the_resident_baseline_document(tmp_path) -> None:
+    """The one instrument the 07-29 split left behind.
+
+    business.checkout_invariant kept reading only the scenario's own k6 output, so
+    F08-H and F11-R were the only success gates a no-fault sweep could not evaluate
+    — every other gate could be checked against the baseline before burning a run.
+    """
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    _write_baseline(probes, "food-delivery", business_ok=False)
+
+    scoped = probes.observe(
+        registry.bind(
+            {"query_id": "business.checkout_invariant", "parameters": {"domain": "food-delivery"}}
+        )
+    )
+    unscoped = probes.observe(registry.bind({"query_id": "business.checkout_invariant"}))
+
+    assert scoped["quality"] == "good" and scoped["value"] is False
+    assert scoped["source"] == "k6:baseline:food-delivery:business_ok"
+    # Unparameterised callers keep the behaviour they had.
+    assert unscoped["value"] is True and unscoped["source"] == "k6:checkout-business-outcome"
+
+
 def test_baseline_document_must_be_fresh_named_and_free_of_scenario_identity(tmp_path) -> None:
     fakes = Fakes()
     probes = _probes(tmp_path, fakes)
