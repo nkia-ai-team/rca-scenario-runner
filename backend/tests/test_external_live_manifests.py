@@ -318,3 +318,72 @@ def test_every_live_controller_observation_binds_against_the_runner_registry():
             except Exception as error:
                 problems.append(f"{scenario_id}/{observation['id']}: {error}")
     assert not problems, "\n".join(problems)
+
+
+def test_every_live_controller_observation_passes_the_probe_allowlists():
+    """Binding at the query registry is not enough: the live probes re-check the
+    resolved parameters against their own allowlists (APPROVED_APM_SERVICES,
+    THROTTLE_TARGETS, APPROVED_NODE_TARGETS, ...) just before issuing the query.
+
+    F21-P's 2026-07-31 calibration run is why this exists. Its throttle
+    observation bound cleanly against the registry and was rejected at probe
+    time because the banking target was missing from THROTTLE_TARGETS, so the
+    scenario spent an entire live run unable to observe its own injected cause.
+    The sibling test above would not have caught it.
+    """
+    from pathlib import Path
+
+    from app.live_probes import LiveProbeError, LiveProbeSet
+    from app.observations import ApprovedQueryRegistry
+
+    controllers_path = Path(__file__).resolve().parents[2].parent / (
+        "testbed-services/scripts/scenarios/registry/controllers.json"
+    )
+    catalog_path = Path(__file__).resolve().parents[2].parent / (
+        "testbed-services/scripts/scenarios/catalog.json"
+    )
+    if not controllers_path.is_file() or not catalog_path.is_file():
+        pytest.skip("external scenario registry is not checked out")
+
+    ready = {
+        row["id"]
+        for row in json.loads(catalog_path.read_text())["scenarios"]
+        if row["readiness"] == "ready"
+    }
+    controllers = json.loads(controllers_path.read_text())["controllers"]
+    registry = ApprovedQueryRegistry.from_path()
+
+    class _Reached(Exception):
+        """Raised by the stub transport once parameter validation has passed."""
+
+    def _stub(*args, **kwargs):
+        raise _Reached()
+
+    probes = LiveProbeSet(
+        http_client=_stub,
+        database_client=_stub,
+        database_credentials={},
+    )
+    # Only the adapters that gate on a parameter allowlist; the others need a
+    # live host or a subprocess and are covered by their own tests.
+    guarded = {"prometheus": probes._prometheus_observation, "clickhouse": probes._clickhouse_observation}
+
+    problems = []
+    for scenario_id in sorted(ready & set(controllers)):
+        for observation in controllers[scenario_id]["observations"]:
+            probe = guarded.get(observation.get("adapter"))
+            if probe is None:
+                continue
+            spec = {"query_id": observation["query_id"]}
+            if observation.get("parameters"):
+                spec["parameters"] = observation["parameters"]
+            try:
+                probe(registry.bind(spec))
+            except _Reached:
+                continue
+            except LiveProbeError as error:
+                problems.append(f"{scenario_id}/{observation['id']}: {error}")
+            except Exception:
+                # Anything past validation (transport, parsing) is out of scope.
+                continue
+    assert not problems, "\n".join(problems)

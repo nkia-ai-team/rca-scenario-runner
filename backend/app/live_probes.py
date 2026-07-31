@@ -225,6 +225,12 @@ APPROVED_GC_SERVICES = frozenset({"commerce-order"})
 THROTTLE_TARGETS = {
     ("rca-testbed-commerce", "testbed-product", "product-service"),
     ("rca-testbed-commerce", "testbed-inventory", "inventory-service"),
+    # F21-P (2026-07-31): the injected cause itself — transfer is the only
+    # service being throttled, so this is the observation that proves the fault
+    # landed. It was missing on the first calibration run and the observation
+    # read error for the whole injection; the scenario could not show its own
+    # cause. test_observation_targets_are_allowlisted now fails on any such gap.
+    ("rca-testbed-banking", "testbed-transfer", "transfer-service"),
 }
 # F19-P: Hikari pending gauge (OTel semconv db.client.connections.pending_requests,
 # live-verified 2026-07-24 on VictoriaMetrics 119:18428).
