@@ -303,11 +303,20 @@ def finalize_cleanup(state: ControllerState, *, cleanup_succeeded: bool) -> Cont
     if not state.terminal:
         raise ValueError("cleanup can only finalize a terminal controller state")
     if not cleanup_succeeded:
+        # "cleanup_failed" says the recovery attempt failed; the terminal reason
+        # already there says why the run failed at all. Replacing it threw the
+        # latter away — F01-R run 0104bd01 (2026-07-31) reached its artifacts as
+        # a bare "cleanup_failed", so the apply's stderr, which the apply path
+        # deliberately preserves, was destroyed one layer above. Keep the prefix
+        # so reason matches on "cleanup_failed" still hold.
+        reason = "cleanup_failed"
+        if state.reason:
+            reason = f"{reason} after {state.reason}"
         return state.model_copy(
             update={
                 "phase": ControllerPhase.DIRTY,
                 "action": ControllerAction.MARK_DIRTY,
-                "reason": "cleanup_failed",
+                "reason": reason,
                 "dirty": True,
             },
             deep=True,

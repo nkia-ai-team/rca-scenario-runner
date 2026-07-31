@@ -26,6 +26,7 @@ from app.adaptive_runtime import (
     CleanupResult,
     EligibilityEvidence,
     EligibilityRequest,
+    stderr_detail,
 )
 from app.capture_orchestration import CaptureJob, MODEL_PATH
 from app.observations import (
@@ -858,7 +859,7 @@ class TrustedDispatcherApplier:
                 fencing_token=request.fencing_token,
                 idempotency_key=request.idempotency_key,
                 succeeded=False,
-                reason=f"trusted_dispatcher:{type(error).__name__}",
+                reason=f"trusted_dispatcher:{type(error).__name__}{stderr_detail(error)}",
             )
         self._cleaned[request.idempotency_key] = result
         return result

@@ -35,6 +35,18 @@ from app.observations import (
 )
 
 
+def stderr_detail(error: BaseException, *, limit: int = 160) -> str:
+    """Reason suffix carrying a failed subprocess's stderr tail, or "" if none.
+
+    A reason of only the exception class name cannot be diagnosed from the run
+    artifacts — the operator sees "CalledProcessError" and has to reproduce the
+    call by hand to learn anything (F09-P run 2333e298, F01-R run 0104bd01).
+    Whitespace is collapsed so the tail stays one line inside a reason string.
+    """
+    tail = " ".join(str(getattr(error, "stderr", "") or "").split())[-limit:]
+    return f":{tail}" if tail else ""
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -538,10 +550,7 @@ class AdaptiveRuntime:
                 update={"level_changes": [*self.session.level_changes, change]}, deep=True
             )
         except Exception as error:
-            # CalledProcessError stderr must survive into the recorded reason —
-            # type-name-only reasons made F09-P run 2333e298 undiagnosable from artifacts.
-            stderr_tail = " ".join(str(getattr(error, "stderr", "") or "").split())[-160:]
-            detail = f":{stderr_tail}" if stderr_tail else ""
+            detail = stderr_detail(error)
             failed = state.model_copy(
                 update={
                     "phase": ControllerPhase.ABORTED,
@@ -576,7 +585,7 @@ class AdaptiveRuntime:
                 fencing_token=request.fencing_token,
                 idempotency_key=request.idempotency_key,
                 succeeded=False,
-                reason=f"cleanup_exception:{type(error).__name__}",
+                reason=f"cleanup_exception:{type(error).__name__}{stderr_detail(error)}",
             )
         if result.effect_ended_at is not None:
             self._close_latest_effect(_aware(result.effect_ended_at))

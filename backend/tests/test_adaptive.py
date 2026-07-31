@@ -411,6 +411,25 @@ def test_cleanup_failure_creates_dirty_outcome() -> None:
         finalize_cleanup(dirty, cleanup_succeeded=True)
 
 
+def test_cleanup_failure_keeps_the_reason_the_run_actually_failed_for() -> None:
+    """A failed cleanup must not erase why the run aborted.
+
+    Both facts are needed to act: the abort reason names the defect, and
+    "cleanup_failed" says the testbed is still dirty. Keeping only the latter
+    forces the operator to reproduce the call by hand to learn anything.
+    """
+    aborted = ControllerState(
+        phase=ControllerPhase.ABORTED,
+        action=ControllerAction.ABORT,
+        level_index=0,
+        level_id="low",
+        reason="profile_apply_failed:CalledProcessError:kubectl wait timed out",
+    )
+    dirty = finalize_cleanup(aborted, cleanup_succeeded=False)
+    assert dirty.reason.startswith("cleanup_failed")
+    assert "profile_apply_failed:CalledProcessError:kubectl wait timed out" in dirty.reason
+
+
 def test_transition_is_side_effect_free_and_repeatable() -> None:
     spec = _spec()
     original = start(spec)

@@ -332,6 +332,55 @@ def test_profile_control_absence_fails_before_live_effect(tmp_path) -> None:
     assert len(calls) == 1 and "--plan" in calls[0]
 
 
+def test_failed_cleanup_records_the_dispatcher_stderr_not_just_its_class(tmp_path) -> None:
+    """cleanup.json is the only trace a dirty run leaves of why recovery failed.
+
+    A bare "trusted_dispatcher:CalledProcessError" cannot be acted on — F01-R run
+    0104bd01 (2026-07-31) stopped the 44-scenario batch and the operator had to
+    re-issue the call by hand to see anything at all.
+    """
+    plan = {
+        "live_allowed": True,
+        "scenario": {"id": "F07-H", "slug": "f07-h-north-south-surge"},
+        "plan_digest": "a" * 64,
+        "profile_instances": [
+            {"profile_id": "load.north_south", "parameters": {"target_rps": 80}}
+        ],
+    }
+    profile_control = tmp_path / "profile-control.py"
+    profile_control.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+    def process(argv, **_kwargs):
+        if "--plan" in argv:
+            return _completed({"normalized_plan": plan})
+        raise subprocess.CalledProcessError(
+            1, argv, output="", stderr="kubectl wait timed out\nwaiting for pod/lock-holder\n"
+        )
+
+    applier = TrustedDispatcherApplier(
+        "f07-h-north-south-surge",
+        primary_profile="load.north_south",
+        dispatcher=tmp_path / "run-scenario.sh",
+        profile_control=profile_control,
+        process_runner=process,
+    )
+    result = applier.cleanup(
+        CleanupRequest(
+            run_id="run-1",
+            scenario_id="F07-H",
+            fencing_token=1,
+            profile_id="load.north_south",
+            idempotency_key="cleanup-key",
+            requested_at=NOW,
+        )
+    )
+    assert result.succeeded is False
+    assert "CalledProcessError" in result.reason
+    assert "kubectl wait timed out" in result.reason
+    # collapsed to one line so it stays readable inside a reason string
+    assert "\n" not in result.reason
+
+
 def test_trusted_run_artifacts_are_atomic_restricted_and_hashable(tmp_path) -> None:
     store = RunArtifactStore(tmp_path / "runs")
     run_dir = store.create("run-001", {"scenario_id": "F07-H", "controller": {}})
