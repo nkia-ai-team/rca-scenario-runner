@@ -118,6 +118,34 @@ def make_cycle_queue(tmp_path: Path, *, cycle_ids=CYCLE_IDS, health_probe=None):
     return queue, runner, coordinator, scheduler, clock
 
 
+def test_cycle_covers_the_same_approved_catalogue_as_the_v2_queue(tmp_path: Path) -> None:
+    """One approved list, both queues.
+
+    The cycle order used to be a hardcoded tuple of the first seven v3 subjects.
+    The registry grew to 44 and nothing reconciled the two, so a v3 capture of
+    "the catalogue" would have run seven, reported success, and left 37 out with
+    no signal that anything was missing. Promotion must reach both queues.
+    """
+    queue, _, _, _, _ = make_cycle_queue(tmp_path, cycle_ids=())
+
+    assert queue._cycle_contract()[0] == queue._queue_contract()[0]
+
+
+def test_cycle_subset_must_come_from_the_approved_list(tmp_path: Path) -> None:
+    """A typo in CYCLE_SCENARIOS must refuse, not capture something unasked for."""
+    queue, _, _, _, _ = make_cycle_queue(tmp_path, cycle_ids=("F01-R", "F01-TYPO"))
+
+    with pytest.raises(RuntimeError, match="not in the approved list"):
+        queue._cycle_contract()
+
+    approved = queue._queue_contract()[0]
+    (tmp_path / "subset").mkdir()
+    narrowed, _ = make_cycle_queue(tmp_path / "subset", cycle_ids=(approved[1],))[
+        0
+    ]._cycle_contract()
+    assert narrowed == [approved[1]]
+
+
 async def _advance_to_injection(queue, runner, clock, *, scenario_id, start=True):
     """start -> cycle_reset -> cycle_normal -> cycle_buffer -> running."""
     if start:

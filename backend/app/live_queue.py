@@ -103,24 +103,16 @@ TRANSIENT_AUTO_RETRY_PREFIXES = ("profile_apply_failed:",)
 #   cycle_reset -> cycle_normal(2h) -> cycle_buffer(10m) -> running[t1,t2]
 #     -> cycle_cooldown(30m) -> waiting_capture([cycle_start, t2+30m]).
 # Enabled only when CYCLE_MODE=1; otherwise the v2 daily-segment queue above is
-# preserved unchanged. The 13 re-capture scenarios are the first v3 subjects.
-# F02-R is excluded from the original 13 captures: its injection was proven
-# physically ineffective (2,016-row table, no symptom), so its ground truth is
-# false (2026-07-24 redesign CUT, user-confirmed).
-# The four G negatives (F01-G, F03-G, F05-G, F11-G) and F09-P left on
-# 2026-07-27: the golden audit parked all five. The G four are no-incident
-# cases, which the quality charter §1 abolished outright; F09-P's success rules
-# were all self-fulfilling and its throttling signal does not exist. Anything
-# they already produced is not usable as evaluation data.
-CYCLE_SCENARIO_ORDER = (
-    "F01-H",
-    "F01-R",
-    "F04-R",
-    "F06-R",
-    "F07-H",
-    "F08-H",
-    "F11-R",
-)
+# preserved unchanged.
+#
+# Which scenarios a cycle run covers is NOT decided here. Both queues read the
+# one approved list in the controller registry, so a scenario promoted (or
+# retired) is promoted for both. This used to be a hardcoded tuple of the first
+# seven v3 subjects, which silently became a second, staler answer to "the
+# catalogue" as the registry grew to 44 — a v3 capture would have covered seven
+# and reported success, with nothing in the repo able to notice the other 37
+# were missing. CYCLE_SCENARIOS still narrows a run for a targeted recapture,
+# but only to scenarios the registry has already approved.
 def _cycle_duration(env_name: str, default: timedelta) -> timedelta:
     """Contract v3 phase length, overridable in seconds for shortened smoke
     cycles (capture derives its window from phases.json, so shortened cycles
@@ -291,7 +283,7 @@ class LiveScenarioQueue:
         restore_script: Path | None = None,
         restore_runner: "ProcessRunner | None" = None,
         cycle_mode: bool = False,
-        cycle_scenario_ids: tuple[str, ...] = CYCLE_SCENARIO_ORDER,
+        cycle_scenario_ids: tuple[str, ...] = (),
         cycle_health_probe: "Callable[[], str | None] | None" = None,
         topology_collector_factory: "Callable[[Path], object] | None" = None,
     ) -> None:
@@ -1272,16 +1264,29 @@ class LiveScenarioQueue:
         path.write_text(f"{bundle_dir}\n", encoding="utf-8")
 
     def _cycle_contract(self) -> tuple[list[str], str]:
-        """Freeze the v3 re-capture scenario list and its digest."""
-        ids = list(self.cycle_scenario_ids)
-        if not ids:
-            raise RuntimeError("cycle queue has no scenario list")
-        if len(ids) != len(set(ids)):
+        """Freeze the v3 cycle's scenario list and its digest.
+
+        Sourced from the same approved registry the v2 queue freezes, so both
+        modes cover the same catalogue and inherit its manifest validation.
+        CYCLE_SCENARIOS narrows it to a subset for a targeted recapture; ids
+        outside the approved list are refused rather than run, since a typo
+        there would otherwise produce a capture nobody asked for.
+        """
+        approved, digest = self._queue_contract()
+        if not self.cycle_scenario_ids:
+            return approved, digest
+        selected = list(self.cycle_scenario_ids)
+        if len(selected) != len(set(selected)):
             raise RuntimeError("cycle queue scenario ids must be unique")
-        for scenario_id in ids:
+        unknown = [item for item in selected if item not in set(approved)]
+        if unknown:
+            raise RuntimeError(f"cycle scenarios are not in the approved list: {sorted(unknown)}")
+        for scenario_id in selected:
             load_scenario_metadata(self.runner.scenario_metadata_path, scenario_id)
-        encoded = json.dumps(ids, separators=(",", ":")).encode()
-        return ids, hashlib.sha256(encoded).hexdigest()
+        # Bind the digest to both the approved catalogue and the chosen subset:
+        # either changing means a different run.
+        encoded = json.dumps(selected, separators=(",", ":")).encode()
+        return selected, hashlib.sha256(digest.encode() + encoded).hexdigest()
 
     def _preflight_gate(
         self, state: LiveQueueState, scenario_id: str
@@ -1735,14 +1740,12 @@ def get_live_queue() -> LiveScenarioQueue:
                     query_url=query_url,
                 )
 
-        # CYCLE_SCENARIOS overrides the frozen 12-scenario order for targeted
+        # CYCLE_SCENARIOS narrows a cycle run to a subset for targeted
         # single/subset recaptures (e.g. F01-G recalibration) without a code
-        # change. Comma-separated ids; unset keeps CYCLE_SCENARIO_ORDER.
+        # change. Comma-separated ids; unset covers the whole approved registry.
         cycle_scenarios_env = os.environ.get("CYCLE_SCENARIOS", "").strip()
-        cycle_scenario_ids = (
-            tuple(s.strip() for s in cycle_scenarios_env.split(",") if s.strip())
-            if cycle_scenarios_env
-            else CYCLE_SCENARIO_ORDER
+        cycle_scenario_ids = tuple(
+            item.strip() for item in cycle_scenarios_env.split(",") if item.strip()
         )
         _queue = LiveScenarioQueue(
             runner,
