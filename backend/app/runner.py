@@ -22,6 +22,7 @@ from app.capture_orchestration import (
     CaptureEvidence,
     CaptureRequest,
     CaptureScheduler,
+    capture_enabled,
     load_scenario_metadata,
 )
 from app.production_runtime import (
@@ -881,6 +882,13 @@ class ScenarioRunner:
         if not controller_succeeded:
             # Keep failed attempts in the run diagnostics only. Publishing them
             # beside accepted cases makes them indistinguishable to consumers.
+            self.artifact_store.write_result(run_dir, session.trusted_evidence())
+            return
+        if not capture_enabled():
+            # Smoke pass: no case is exported, but the run still has to publish
+            # its result — the queue reads result.json as the evidence that the
+            # run finished, and without it every scenario stops the batch with
+            # "controller evidence missing".
             self.artifact_store.write_result(run_dir, session.trusted_evidence())
             return
         case_token = re.sub(r"[^a-z0-9]+", "-", session.scenario_id.lower()).strip("-")

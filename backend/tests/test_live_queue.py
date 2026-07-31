@@ -112,6 +112,36 @@ def make_queue(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_capture_off_advances_without_an_export(tmp_path: Path, monkeypatch) -> None:
+    """A smoke pass must not spend the whole post-judging tail on a discarded case.
+
+    With SCENARIO_CAPTURE=off no capture job is ever scheduled, so the queue has
+    to advance on the run's own evidence. Waiting for a job that will never
+    appear — or pausing on "capture was not scheduled" — stops the batch on
+    every single scenario.
+    """
+    monkeypatch.setenv("SCENARIO_CAPTURE", "off")
+    queue, runner, _, scheduler, clock = make_queue(tmp_path)
+    await queue.start()
+
+    state = await queue.tick()
+    run_id = state.current_run_id
+    runner.current = runner.current.model_copy(
+        update={"status": "succeeded", "finished_at": clock.now(), "exit_code": 0}
+    )
+    # no scheduler.jobs entry, and no capture-complete.json on disk
+    assert run_id not in scheduler.jobs
+    state = await queue.tick()
+    assert state.phase == "waiting_capture"
+
+    runner.current = None
+    state = await queue.tick()
+    assert state.next_index == 1
+    assert state.completed_run_ids == [run_id]
+    assert state.reason is None
+
+
+@pytest.mark.asyncio
 async def test_fixed_sequence_waits_for_capture_and_two_hour_clean_window(tmp_path: Path) -> None:
     queue, runner, _, scheduler, clock = make_queue(tmp_path)
     state = await queue.start()

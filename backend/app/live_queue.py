@@ -23,7 +23,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.adaptive import ControllerPhase
 from app.adaptive_runtime import ControllerSession, SessionStatus
-from app.capture_orchestration import CaptureJob, load_scenario_metadata, parse_utc
+from app.capture_orchestration import (
+    CaptureJob,
+    capture_enabled,
+    load_scenario_metadata,
+    parse_utc,
+)
 from app.preflight import (
     AiJudge,
     PreflightVerdict,
@@ -707,7 +712,7 @@ class LiveScenarioQueue:
                 return state
             return self._pause(state, evidence_error)
         job = self._capture_job(state.current_run_id)
-        if job is None:
+        if job is None and capture_enabled():
             return self._pause(state, f"capture was not scheduled: {state.current_run_id}")
         state = state.model_copy(
             update={"phase": "waiting_capture", "updated_at": self._format(self.clock.now())}
@@ -717,15 +722,18 @@ class LiveScenarioQueue:
 
     def _tick_capture(self, state: LiveQueueState) -> LiveQueueState:
         assert state.current_run_id is not None
-        job = self._capture_job(state.current_run_id)
-        if job is None:
-            return self._pause(state, f"capture job disappeared: {state.current_run_id}")
-        if job.status == "failed":
-            return self._pause(state, f"capture failed: {state.current_run_id}: {job.failure}")
-        if job.status != "completed":
-            return state
-        if not (self.runner.artifact_store.root / state.current_run_id / "capture-complete.json").is_file():
-            return self._pause(state, f"capture completion evidence missing: {state.current_run_id}")
+        # With capture off there is no export to wait on or to prove: the run's
+        # own evidence, already checked above, is the whole result of the pass.
+        if capture_enabled():
+            job = self._capture_job(state.current_run_id)
+            if job is None:
+                return self._pause(state, f"capture job disappeared: {state.current_run_id}")
+            if job.status == "failed":
+                return self._pause(state, f"capture failed: {state.current_run_id}: {job.failure}")
+            if job.status != "completed":
+                return state
+            if not (self.runner.artifact_store.root / state.current_run_id / "capture-complete.json").is_file():
+                return self._pause(state, f"capture completion evidence missing: {state.current_run_id}")
         self._thaw_trainer()
         completed = [*state.completed_run_ids, state.current_run_id]
         next_index = state.next_index + 1
@@ -740,7 +748,11 @@ class LiveScenarioQueue:
                     }
                 )
             )
-        t2 = parse_utc(job.t2, field="t2")
+        # The gap to the next scenario is measured from this run's t2. Read it
+        # through _previous_t2, which falls back to the run's own state.json —
+        # with capture off there is no job to carry it. Fail safe if neither is
+        # readable: measuring from now is never shorter than measuring from t2.
+        t2 = self._previous_t2(state.current_run_id) or self.clock.now()
         state = state.model_copy(
             update={
                 "phase": "waiting_clean_window",

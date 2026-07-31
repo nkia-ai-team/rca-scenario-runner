@@ -807,6 +807,86 @@ async def test_aborted_evaluation_is_not_published_as_an_eval_case(tmp_path) -> 
     assert "case_id" not in result
 
 
+async def test_capture_off_skips_the_export_but_still_publishes_the_result(
+    tmp_path, monkeypatch
+) -> None:
+    """Skipping the export must not skip the run's own result.
+
+    result.json is what the queue reads as evidence that the run finished; a
+    succeeded run without it stops the batch on "controller evidence missing".
+    No case_id either — nothing was published, so claiming one would point at a
+    directory that does not exist.
+    """
+    monkeypatch.setenv("SCENARIO_CAPTURE", "off")
+
+    class Invoker:
+        def snapshot_model(self, job, *, idempotency_key):
+            return None
+
+        def dump_stores(self, job, *, idempotency_key):
+            return None
+
+    dispatcher = tmp_path / "run-scenario.sh"
+    catalog = tmp_path / "catalog.json"
+    dispatcher.write_text("trusted", encoding="utf-8")
+    catalog.write_text("{}", encoding="utf-8")
+    metadata_path = tmp_path / "scenario-metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "scenarios": {"F07-E": scenario_metadata().model_dump(mode="json")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    scheduler = CaptureScheduler(
+        tmp_path / "capture.json", clock=Clock(), invoker=Invoker()
+    )
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir = store.create("run-smoke", {"controller": {}})
+    runner = ScenarioRunner(
+        tmp_path,
+        tmp_path / "logs",
+        artifact_store=store,
+        capture_scheduler=scheduler,
+        dispatcher_path=dispatcher,
+        catalog_path=catalog,
+        scenario_metadata_path=metadata_path,
+    )
+    session = SimpleNamespace(
+        run_id="run-smoke",
+        scenario_id="F07-E",
+        profile_id="load.north_south",
+        approved_profile_id="load.north_south",
+        t1=datetime(2026, 7, 16, 10, 0, tzinfo=timezone.utc),
+        t2=datetime(2026, 7, 16, 10, 20, tzinfo=timezone.utc),
+        controller_state=SimpleNamespace(phase=ControllerPhase.SUCCEEDED),
+        spec=SimpleNamespace(
+            capture=SimpleNamespace(enabled=True),
+            adaptive=SimpleNamespace(mode=SimpleNamespace(value="evaluation")),
+        ),
+        trusted_evidence=lambda: {
+            "mode": "evaluation",
+            "outcome": "succeeded",
+            "dirty": False,
+            "t1": "2026-07-16T10:00:00Z",
+            "t2": "2026-07-16T10:20:00Z",
+            "profile": {"kind": "fixed", "id": "load.north_south"},
+            "approved_profile_id": "load.north_south",
+            "cleanup": {"status": "succeeded"},
+            "recovery": {"status": "succeeded"},
+        },
+    )
+    runner._schedule_capture(session, run_dir)
+    await runner.stop_capture_worker()
+
+    assert scheduler.snapshot().jobs == {}
+    result = json.loads((run_dir / "result.json").read_text())
+    assert result["outcome"] == "succeeded"
+    assert "case_id" not in result
+
+
 def test_append_tick_writes_jsonl_inside_trusted_root(tmp_path) -> None:
     store = RunArtifactStore(tmp_path / "runs")
     run_dir = tmp_path / "runs" / "run-1"
