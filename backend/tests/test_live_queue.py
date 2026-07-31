@@ -580,6 +580,29 @@ def test_protection_window_defers_injection_starts_around_kst_midnight():
     assert LiveScenarioQueue._protection_window_reason(at_kst(2, 30)) is None
 
 
+def test_protection_window_can_be_switched_off_for_a_validation_pass(monkeypatch):
+    """A pass that discards its captures should not lose ~3h of every 24h.
+
+    Only the explicit "off" releases the window — an unset or unrelated value
+    must keep the dataset-grade default, since forgetting the switch would
+    silently poison the shared daily normal prefix.
+    """
+    from datetime import datetime, timezone
+
+    from app.live_queue import LiveScenarioQueue
+
+    midnight_kst = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)  # 00:00 KST
+
+    monkeypatch.delenv("SCENARIO_PROTECTION_WINDOW", raising=False)
+    assert LiveScenarioQueue._protection_window_reason(midnight_kst) is not None
+
+    monkeypatch.setenv("SCENARIO_PROTECTION_WINDOW", "on")
+    assert LiveScenarioQueue._protection_window_reason(midnight_kst) is not None
+
+    monkeypatch.setenv("SCENARIO_PROTECTION_WINDOW", "OFF")
+    assert LiveScenarioQueue._protection_window_reason(midnight_kst) is None
+
+
 def test_functional_readiness_is_opt_in_and_gates_on_capture_self_check(tmp_path, monkeypatch):
     from datetime import datetime, timezone
     from types import SimpleNamespace

@@ -55,6 +55,19 @@ QUEUE_POLL_INTERVAL_SEC = 5
 # dump has landed at 02:30 KST.
 PROTECTION_WINDOW_START_KST = dt_time(23, 20)
 PROTECTION_WINDOW_END_KST = dt_time(2, 30)
+
+
+def _protection_window_enabled() -> bool:
+    """Whether the daily clean-window protection defers injection starts.
+
+    The window exists to keep the shared 00:00-02:00 KST normal prefix pristine
+    for dataset-grade captures. A validation pass discards its captures, so
+    there the window buys nothing and costs ~3h of every 24h of queue time.
+    SCENARIO_PROTECTION_WINDOW=off releases it for such a pass; the default and
+    any other value keep the protection. Read per call so a long-lived queue
+    picks up the setting without a restart, and so tests can flip it.
+    """
+    return os.environ.get("SCENARIO_PROTECTION_WINDOW", "on").strip().lower() != "off"
 # Functional readiness (capture self-check, lucida login, preflight signals)
 # proves live connectivity, so a green result is trusted for a short TTL; any
 # failure is re-probed on the next call for fast recovery.
@@ -1438,7 +1451,12 @@ class LiveScenarioQueue:
         Starts are blocked from 23:20 KST (worst-case injection 30m + recovery
         would cross midnight and poison the day's shared normal prefix) until
         02:30 KST (the 02:20 host cron has landed the dump by then).
+
+        Returns None unconditionally when the protection is switched off — see
+        _protection_window_enabled.
         """
+        if not _protection_window_enabled():
+            return None
         kst = now.astimezone(ZoneInfo("Asia/Seoul")).time()
         if kst >= PROTECTION_WINDOW_START_KST or kst < PROTECTION_WINDOW_END_KST:
             return (
