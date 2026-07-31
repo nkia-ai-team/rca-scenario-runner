@@ -815,30 +815,46 @@ class TrustedDispatcherApplier:
             if not self.profile_control.is_file():
                 raise RuntimeError("trusted per-profile control API is unavailable")
             response = None
+            failures: list[str] = []
             intended = self._intended_profiles()
             cleanup_order = [self.primary_profile, *reversed(self.companion_profiles)]
             for profile_id in [item for item in cleanup_order if not intended or item in intended]:
                 operation_key = f"{request.idempotency_key}:{profile_id}"
                 self._journal(operation_key, profile_id, "cleanup", "intent")
-                completed = self.process_runner(
-                    [
-                        str(self.profile_control), "--scenario", self.scenario_slug,
-                        "--profile", profile_id, "--action", "cleanup",
-                        "--run-id", request.run_id, "--fencing-token", str(request.fencing_token),
-                        "--idempotency-key", operation_key,
-                        "--plan-digest", digest, "--confirm", confirmation,
-                    ],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    env=_trusted_environment(),
-                )
-                current = json.loads(completed.stdout)
+                # Every intended profile gets its attempt, whatever the ones
+                # before it did. Abandoning the rest after the first failure left
+                # F01-R run 0104bd01's companion surge running its full 15m, and
+                # the next attempt's preflight then refused (correctly) because a
+                # tagged k6 was still up: one failed cleanup became two failed
+                # scenarios. The profiles are independent effects, so a failure to
+                # undo one says nothing about the others.
+                try:
+                    completed = self.process_runner(
+                        [
+                            str(self.profile_control), "--scenario", self.scenario_slug,
+                            "--profile", profile_id, "--action", "cleanup",
+                            "--run-id", request.run_id, "--fencing-token", str(request.fencing_token),
+                            "--idempotency-key", operation_key,
+                            "--plan-digest", digest, "--confirm", confirmation,
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        env=_trusted_environment(),
+                    )
+                    current = json.loads(completed.stdout)
+                except Exception as error:
+                    failures.append(f"{profile_id}:{type(error).__name__}{stderr_detail(error)}")
+                    continue
                 self._journal(operation_key, profile_id, "cleanup", "complete")
                 if current["succeeded"] is not True:
-                    response = current
-                    break
+                    failures.append(f"{profile_id}:{current.get('reason') or 'refused'}")
+                    continue
                 response = current
+            if failures:
+                # Still fails closed — the run stays dirty — but every effect that
+                # could be undone has been, and the reason names each that could not.
+                return self._record_cleanup_failure(request, "; ".join(failures))
             assert response is not None
             effect_ended_at = (
                 datetime.fromisoformat(response["effect_ended_at"].replace("Z", "+00:00"))
@@ -854,13 +870,20 @@ class TrustedDispatcherApplier:
                 reason=response.get("reason"),
             )
         except Exception as error:  # fail closed at the dispatcher boundary
-            result = CleanupResult(
-                run_id=request.run_id,
-                fencing_token=request.fencing_token,
-                idempotency_key=request.idempotency_key,
-                succeeded=False,
-                reason=f"trusted_dispatcher:{type(error).__name__}{stderr_detail(error)}",
+            return self._record_cleanup_failure(
+                request, f"trusted_dispatcher:{type(error).__name__}{stderr_detail(error)}"
             )
+        self._cleaned[request.idempotency_key] = result
+        return result
+
+    def _record_cleanup_failure(self, request: CleanupRequest, reason: str) -> CleanupResult:
+        result = CleanupResult(
+            run_id=request.run_id,
+            fencing_token=request.fencing_token,
+            idempotency_key=request.idempotency_key,
+            succeeded=False,
+            reason=reason,
+        )
         self._cleaned[request.idempotency_key] = result
         return result
 

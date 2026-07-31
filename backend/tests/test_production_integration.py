@@ -381,6 +381,62 @@ def test_failed_cleanup_records_the_dispatcher_stderr_not_just_its_class(tmp_pat
     assert "\n" not in result.reason
 
 
+def test_a_failing_primary_cleanup_still_undoes_the_companion(tmp_path) -> None:
+    """One un-undoable effect must not leave the others injected.
+
+    F01-R run 0104bd01 (2026-07-31): db.lock cleanup failed first in the order,
+    so the companion surge was never stopped and ran its full 15m. The next
+    attempt's preflight refused on the still-tagged k6 — one failed cleanup cost
+    two scenarios. The profiles are independent effects.
+    """
+    plan = {
+        "live_allowed": True,
+        "scenario": {"id": "F01-R", "slug": "f01-r-pg-lock-checkout"},
+        "plan_digest": "a" * 64,
+        "profile_instances": [
+            {"profile_id": "db.lock", "parameters": {"hold_seconds": 600}},
+            {"profile_id": "load.north_south", "parameters": {"target_rps": 35}},
+        ],
+    }
+    profile_control = tmp_path / "profile-control.py"
+    profile_control.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    cleaned: list[str] = []
+
+    def process(argv, **_kwargs):
+        if "--plan" in argv:
+            return _completed({"normalized_plan": plan})
+        profile = argv[argv.index("--profile") + 1]
+        cleaned.append(profile)
+        if profile == "db.lock":
+            raise subprocess.CalledProcessError(1, argv, output="", stderr="lock pod stuck")
+        return _completed(
+            {"succeeded": True, "effect_ended_at": "2026-07-16T11:05:00Z", "reason": None}
+        )
+
+    applier = TrustedDispatcherApplier(
+        "f01-r-pg-lock-checkout",
+        primary_profile="db.lock",
+        companion_profiles=["load.north_south"],
+        dispatcher=tmp_path / "run-scenario.sh",
+        profile_control=profile_control,
+        process_runner=process,
+    )
+    result = applier.cleanup(
+        CleanupRequest(
+            run_id="run-1",
+            scenario_id="F01-R",
+            fencing_token=1,
+            profile_id="db.lock",
+            idempotency_key="cleanup-key",
+            requested_at=NOW,
+        )
+    )
+    assert cleaned == ["db.lock", "load.north_south"]
+    # still fails closed, and names the effect that survived
+    assert result.succeeded is False
+    assert "db.lock" in result.reason and "lock pod stuck" in result.reason
+
+
 def test_trusted_run_artifacts_are_atomic_restricted_and_hashable(tmp_path) -> None:
     store = RunArtifactStore(tmp_path / "runs")
     run_dir = store.create("run-001", {"scenario_id": "F07-H", "controller": {}})
