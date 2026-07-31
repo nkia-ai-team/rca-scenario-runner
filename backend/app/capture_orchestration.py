@@ -30,21 +30,8 @@ POST_WINDOW = timedelta(minutes=20)
 MODEL_PATH = "/var/lib/lucida/ai-models/stream-anomaly/global/v1/model.json"
 
 
-def capture_enabled() -> bool:
-    """Whether accepted runs are exported as eval cases.
-
-    A smoke pass asks one question — does the scenario reach its thresholds and
-    recover — and throws the case away. Exporting it anyway costs the whole tail
-    after judging: POST_WINDOW before the export may even start, then the export
-    itself (~50m and 3.6GB for F01-R, 2026-07-31), and it adds a failure surface
-    that pauses the queue for a reason the scenario is not responsible for.
-
-    SCENARIO_CAPTURE=off skips the export for such a pass. The default and any
-    other value keep it, because a silently uncaptured evaluation run is an
-    unrecoverable loss — the fault window is gone once it passes.
-    Read per call so a long-lived queue picks it up without a restart.
-    """
-    return os.environ.get("SCENARIO_CAPTURE", "on").strip().lower() != "off"
+# Whether an accepted run is exported at all is a property of the pass, not of
+# the capture machinery: see app.pass_mode.capture_enabled.
 
 
 class StrictModel(BaseModel):

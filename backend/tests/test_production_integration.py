@@ -817,7 +817,7 @@ async def test_capture_off_skips_the_export_but_still_publishes_the_result(
     No case_id either — nothing was published, so claiming one would point at a
     directory that does not exist.
     """
-    monkeypatch.setenv("SCENARIO_CAPTURE", "off")
+    monkeypatch.setenv("SCENARIO_PASS", "smoke")
 
     class Invoker:
         def snapshot_model(self, job, *, idempotency_key):

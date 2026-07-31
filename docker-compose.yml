@@ -68,13 +68,12 @@ services:
       - CAPTURE_STATE_PATH=/app/state/capture-jobs.json
       - LIVE_QUEUE_STATE_PATH=/app/state/live-queue.json
       - LIVE_CONTROLLER_REGISTRY_PATH=/opt/lucida/scenario-contracts/registry/controllers.json
-      # 배치 페이스 두 손잡이. 기본값은 데이터셋 등급(30분 간격 + 야간 보호창 유지)이라
-      # .env를 건드리지 않으면 캡처 런의 조건이 그대로다. 캡처를 버리는 검증 패스에서만
-      # .env에서 15 / off로 내린다 — 그 경우 진짜 가드는 시간이 아니라 사전검사다.
+      # 패스 종류. smoke면 케이스를 만들고 지키는 일(내보내기·간격·격리검사·야간창·
+      # 골든리셋)이 함께 꺼진다 — 판정에 관여하는 것은 무엇도 바뀌지 않는다.
+      # 근거와 규칙은 backend/app/pass_mode.py. 기본값은 dataset.
+      - SCENARIO_PASS=${SCENARIO_PASS:-dataset}
+      # dataset 패스의 시나리오 간격. 30분 아래로는 내려가지 않는다(캡처 창이 겹친다).
       - SCENARIO_CLEAN_WINDOW_MIN=${SCENARIO_CLEAN_WINDOW_MIN:-30}
-      - SCENARIO_PROTECTION_WINDOW=${SCENARIO_PROTECTION_WINDOW:-on}
-      # 세 번째 손잡이: 케이스 내보내기. 스모크 패스에서만 .env로 off.
-      - SCENARIO_CAPTURE=${SCENARIO_CAPTURE:-on}
       - TRUSTED_RUNS_ROOT=/var/lib/lucida/scenario-runs
       - CAPTURE_SCRIPT=/opt/lucida/capture-eval-case.sh
       - ASSEMBLE_SCRIPT=/opt/lucida/assemble-eval-case.sh

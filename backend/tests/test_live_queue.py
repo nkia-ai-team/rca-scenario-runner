@@ -52,10 +52,12 @@ class Runner:
         self.is_busy = False
         self.current = None
         self.started = []
+        self.skipped_isolation = []
         self.capture_worker_starts = 0
 
-    async def start(self, *, scenario_id: str, mode: str):
+    async def start(self, *, scenario_id: str, mode: str, skip_isolation_checks: bool = False):
         self.started.append((scenario_id, mode))
+        self.skipped_isolation.append(skip_isolation_checks)
         self.current = RunInfo(
             run_id=f"run-{scenario_id}",
             scenario_id=scenario_id,
@@ -115,12 +117,11 @@ def make_queue(tmp_path: Path):
 async def test_capture_off_advances_without_an_export(tmp_path: Path, monkeypatch) -> None:
     """A smoke pass must not spend the whole post-judging tail on a discarded case.
 
-    With SCENARIO_CAPTURE=off no capture job is ever scheduled, so the queue has
-    to advance on the run's own evidence. Waiting for a job that will never
-    appear — or pausing on "capture was not scheduled" — stops the batch on
-    every single scenario.
+    In a smoke pass no capture job is ever scheduled, so the queue has to advance
+    on the run's own evidence. Waiting for a job that will never appear — or
+    pausing on "capture was not scheduled" — stops the batch on every scenario.
     """
-    monkeypatch.setenv("SCENARIO_CAPTURE", "off")
+    monkeypatch.setenv("SCENARIO_PASS", "smoke")
     queue, runner, _, scheduler, clock = make_queue(tmp_path)
     await queue.start()
 
@@ -139,6 +140,33 @@ async def test_capture_off_advances_without_an_export(tmp_path: Path, monkeypatc
     assert state.next_index == 1
     assert state.completed_run_ids == [run_id]
     assert state.reason is None
+
+
+@pytest.mark.asyncio
+async def test_smoke_pass_releases_the_capture_window_isolation_gates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The gates enforce capture-window separation, so they must follow the pass.
+
+    They are the runner's own eligibility checks, independent of the queue's
+    gap: on 2026-07-31 F06-R was blocked with check_failed:clean-window +
+    scenario_overlap 15m after the previous t2, while the queue believed it had
+    waited long enough. A pass that captures nothing has no windows to separate,
+    and the preflight gate — which measures cleanliness instead of assuming a
+    gap — still runs either way.
+    """
+    monkeypatch.setenv("SCENARIO_PASS", "smoke")
+    queue, runner, _, _, _ = make_queue(tmp_path)
+    await queue.start()
+    await queue.tick()
+    assert runner.skipped_isolation == [True]
+
+    monkeypatch.setenv("SCENARIO_PASS", "dataset")
+    (tmp_path / "dataset").mkdir()
+    queue2, runner2, _, _, _ = make_queue(tmp_path / "dataset")
+    await queue2.start()
+    await queue2.tick()
+    assert runner2.skipped_isolation == [False]
 
 
 @pytest.mark.asyncio
@@ -610,12 +638,12 @@ def test_protection_window_defers_injection_starts_around_kst_midnight():
     assert LiveScenarioQueue._protection_window_reason(at_kst(2, 30)) is None
 
 
-def test_protection_window_can_be_switched_off_for_a_validation_pass(monkeypatch):
+def test_protection_window_is_released_only_by_the_smoke_pass(monkeypatch):
     """A pass that discards its captures should not lose ~3h of every 24h.
 
-    Only the explicit "off" releases the window — an unset or unrelated value
-    must keep the dataset-grade default, since forgetting the switch would
-    silently poison the shared daily normal prefix.
+    Only the declared smoke pass releases the window — unset or any other value
+    keeps the dataset-grade default, since forgetting it would silently poison
+    the shared daily normal prefix that every case of that day is built on.
     """
     from datetime import datetime, timezone
 
@@ -623,13 +651,13 @@ def test_protection_window_can_be_switched_off_for_a_validation_pass(monkeypatch
 
     midnight_kst = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)  # 00:00 KST
 
-    monkeypatch.delenv("SCENARIO_PROTECTION_WINDOW", raising=False)
+    monkeypatch.delenv("SCENARIO_PASS", raising=False)
     assert LiveScenarioQueue._protection_window_reason(midnight_kst) is not None
 
-    monkeypatch.setenv("SCENARIO_PROTECTION_WINDOW", "on")
+    monkeypatch.setenv("SCENARIO_PASS", "dataset")
     assert LiveScenarioQueue._protection_window_reason(midnight_kst) is not None
 
-    monkeypatch.setenv("SCENARIO_PROTECTION_WINDOW", "OFF")
+    monkeypatch.setenv("SCENARIO_PASS", "smoke")
     assert LiveScenarioQueue._protection_window_reason(midnight_kst) is None
 
 

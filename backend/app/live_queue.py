@@ -23,11 +23,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.adaptive import ControllerPhase
 from app.adaptive_runtime import ControllerSession, SessionStatus
-from app.capture_orchestration import (
-    CaptureJob,
+from app.capture_orchestration import CaptureJob, load_scenario_metadata, parse_utc
+from app.pass_mode import (
     capture_enabled,
-    load_scenario_metadata,
-    parse_utc,
+    golden_reset_enabled,
+    inter_scenario_gap,
+    isolation_checks_enabled,
+    protection_window_enabled,
 )
 from app.preflight import (
     AiJudge,
@@ -60,19 +62,6 @@ QUEUE_POLL_INTERVAL_SEC = 5
 # dump has landed at 02:30 KST.
 PROTECTION_WINDOW_START_KST = dt_time(23, 20)
 PROTECTION_WINDOW_END_KST = dt_time(2, 30)
-
-
-def _protection_window_enabled() -> bool:
-    """Whether the daily clean-window protection defers injection starts.
-
-    The window exists to keep the shared 00:00-02:00 KST normal prefix pristine
-    for dataset-grade captures. A validation pass discards its captures, so
-    there the window buys nothing and costs ~3h of every 24h of queue time.
-    SCENARIO_PROTECTION_WINDOW=off releases it for such a pass; the default and
-    any other value keep the protection. Read per call so a long-lived queue
-    picks up the setting without a restart, and so tests can flip it.
-    """
-    return os.environ.get("SCENARIO_PROTECTION_WINDOW", "on").strip().lower() != "off"
 # Functional readiness (capture self-check, lucida login, preflight signals)
 # proves live connectivity, so a green result is trusted for a short TTL; any
 # failure is re-probed on the next call for fast recovery.
@@ -88,18 +77,14 @@ PREFLIGHT_WINDOW_LEAD = timedelta(minutes=10)
 # previous t2 and the next t1, with the 2-layer preflight gate deciding
 # cleanliness of the [t1-10m, t1] window.
 #
-# 30m is the dataset-grade default and what a capture run must use: the eval
-# case carries a pre-injection normal segment, and a previous fault's tail inside
-# it is contamination (charter L3), not noise.
+# 30m is not a preference: the capture window is [t1-10m, t2+20m], so anything
+# under POST_WINDOW + PRE_WINDOW overlaps the neighbouring case, and each
+# manifest's baseline.clean_window enforces it again with a ge=1800 floor.
+# Lowering only this value does not shorten a dataset pass — it just moves the
+# rejection to the runner's isolation gates (measured 2026-07-31: 15m blocked
+# every start with check_failed:clean-window + scenario_overlap).
 #
-# SCENARIO_CLEAN_WINDOW_MIN lowers the floor for a validation pass whose captures
-# are discarded — there the preflight gate, which measures cleanliness instead of
-# assuming it, is the real guard and simply waits longer when the system has not
-# settled. Do not lower it for a capture run, and note that the gate's eight
-# signals watch gateway p95/5xx, pool residue, alarms and incidents — not Kafka
-# consumer backlog, JVM heap after a GC-pressure scenario, or a filled disk. Those
-# tails outlive a short gap and cost more in spurious failures than they save.
-CLEAN_WINDOW = timedelta(minutes=int(os.environ.get("SCENARIO_CLEAN_WINDOW_MIN", "30")))
+# The gap is a property of the pass, so it lives in app.pass_mode.
 # Mode-aware retry wait (2026-07-20): a calibration retry after a short, cleanly
 # recovered failure does not need the full evaluation-grade 2h lead-in purity.
 RETRY_CLEAN_WINDOW_CALIBRATION = timedelta(minutes=30)
@@ -537,7 +522,7 @@ class LiveScenarioQueue:
                     }
                 )
             elif previous_t2 is not None:
-                resume_window = CLEAN_WINDOW
+                resume_window = inter_scenario_gap()
                 if state.current_scenario_id and current_run_id:
                     resume_window = self._retry_clean_window(
                         state.current_scenario_id, current_run_id
@@ -643,7 +628,15 @@ class LiveScenarioQueue:
             except Exception as error:
                 return self._pause(state, f"golden restore failed for {scenario_id}: {error}")
             try:
-                run = await self.runner.start(scenario_id=scenario_id, mode="run")
+                # The clean-window / scenario_overlap gates enforce capture-window
+                # separation, so a pass that captures nothing has nothing for them
+                # to protect. The preflight gate above still ran, and it measures
+                # cleanliness rather than assuming a gap.
+                run = await self.runner.start(
+                    scenario_id=scenario_id,
+                    mode="run",
+                    skip_isolation_checks=not isolation_checks_enabled(),
+                )
             except Exception as error:
                 return self._pause(state, f"start failed for {scenario_id}: {error}")
             if verdict is not None:
@@ -761,7 +754,7 @@ class LiveScenarioQueue:
                 "first_gate_passed": first_gate,
                 "current_scenario_id": None,
                 "current_run_id": None,
-                "clean_window_not_before": self._format(t2 + CLEAN_WINDOW),
+                "clean_window_not_before": self._format(t2 + inter_scenario_gap()),
                 "updated_at": self._format(self.clock.now()),
             }
         )
@@ -1467,7 +1460,7 @@ class LiveScenarioQueue:
         Returns None unconditionally when the protection is switched off — see
         _protection_window_enabled.
         """
-        if not _protection_window_enabled():
+        if not protection_window_enabled():
             return None
         kst = now.astimezone(ZoneInfo("Asia/Seoul")).time()
         if kst >= PROTECTION_WINDOW_START_KST or kst < PROTECTION_WINDOW_END_KST:
@@ -1532,26 +1525,26 @@ class LiveScenarioQueue:
         try:
             registry = json.loads(Path(self.scenario_registry_path).read_text(encoding="utf-8"))
             if registry["controllers"][scenario_id].get("mode") != "calibration":
-                return CLEAN_WINDOW
+                return inter_scenario_gap()
             result = json.loads(
                 (self.runner.artifact_store.root / run_id / "result.json").read_text(encoding="utf-8")
             )
             if result.get("dirty") is not False:
-                return CLEAN_WINDOW
+                return inter_scenario_gap()
             if result.get("cleanup", {}).get("status") != "succeeded":
-                return CLEAN_WINDOW
+                return inter_scenario_gap()
             changes = result.get("level_changes") or []
             starts = [c.get("applied_at") for c in changes if c.get("applied_at")]
             ends = [c.get("effect_ended_at") for c in changes if c.get("effect_ended_at")]
             if not starts or len(ends) != len(starts):
-                return CLEAN_WINDOW
+                return inter_scenario_gap()
             span = parse_utc(max(ends), field="effect_ended_at") - parse_utc(
                 min(starts), field="applied_at"
             )
             if span > RETRY_SHORT_INJECTION:
-                return CLEAN_WINDOW
+                return inter_scenario_gap()
         except Exception:
-            return CLEAN_WINDOW
+            return inter_scenario_gap()
         marker = self.runner.artifact_store.root / run_id / "clean-window-excused.json"
         marker.write_text(
             json.dumps(
@@ -1758,8 +1751,10 @@ def get_live_queue() -> LiveScenarioQueue:
             manifest_root=manifest_root,
             preflight_probe=preflight_probe,
             functional_readiness_enabled=True,
-            golden_reset_enabled=os.environ.get("GOLDEN_RESET_ENABLED", "").lower()
-            in {"1", "true", "yes", "on"},
+            golden_reset_enabled=golden_reset_enabled(
+                os.environ.get("GOLDEN_RESET_ENABLED", "").lower()
+                in {"1", "true", "yes", "on"}
+            ),
             cycle_mode=cycle_mode,
             cycle_scenario_ids=cycle_scenario_ids,
             topology_collector_factory=topology_collector_factory,

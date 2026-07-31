@@ -22,9 +22,9 @@ from app.capture_orchestration import (
     CaptureEvidence,
     CaptureRequest,
     CaptureScheduler,
-    capture_enabled,
     load_scenario_metadata,
 )
+from app.pass_mode import capture_enabled
 from app.production_runtime import (
     TRUSTED_CAPTURE_SCRIPT,
     TRUSTED_CATALOG,
