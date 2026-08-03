@@ -288,6 +288,54 @@ async def test_external_dirty_cleanup_clears_only_after_profile_recovery(
     assert runner.get_current().dirty is (not cleanup_succeeds)
 
 
+async def test_refused_capsule_repair_leaves_a_readable_reason(tmp_path, monkeypatch) -> None:
+    """#21 (2026-08-03 batch): a refused capsule repair surfaced as HTTP 200
+    with no capsule-repair.json and no error anywhere — the reason lived only
+    in the process-local log ring. The refusal must land as a file next to the
+    run it refused to repair."""
+    selected = manifest("evaluation")
+    monkeypatch.setattr("app.runner.get_scenario", lambda _: None)
+    monkeypatch.setattr("app.runner.get_manifest", lambda _: selected)
+
+    coordinator = GlobalCoordinator(tmp_path / "coordinator.json")
+    runner_time = datetime.now(timezone.utc)
+    lease = coordinator.acquire(
+        run_id="dirty-run",
+        scenario_id=selected.id,
+        now=runner_time,
+        lease_sec=30,
+    )
+    coordinator.mark_dirty(
+        run_id=lease.run_id,
+        fencing_token=lease.fencing_token,
+        reason="initial cleanup failed",
+        now=runner_time,
+    )
+    store = RunArtifactStore(tmp_path / "runs")
+    (store.root / lease.run_id).mkdir(parents=True)
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("capsule repair would change the cleanup target")
+
+    monkeypatch.setattr(store, "repair_capsule_contracts", refuse)
+    runner = ScenarioRunner(
+        tmp_path,
+        tmp_path / "logs",
+        coordinator=coordinator,
+        artifact_store=store,
+    )
+    await runner.start(selected.id, "cleanup", repair_capsule=True)
+    assert runner._task is not None
+    await runner._task
+
+    assert coordinator.snapshot().dirty_run is not None
+    record = json.loads(
+        (store.root / lease.run_id / "manual-cleanup-error.json").read_text()
+    )
+    assert record["repair_capsule"] is True
+    assert "capsule repair would change the cleanup target" in record["error"]
+
+
 def test_every_live_controller_observation_binds_against_the_runner_registry():
     """Cross-repo contract: testbed-services controllers may only reference
     observation queries this runner can actually serve. This is the permanent
@@ -360,6 +408,7 @@ def test_every_live_controller_observation_passes_the_probe_allowlists():
         raise _Reached()
 
     probes = LiveProbeSet(
+        process_runner=_stub,
         http_client=_stub,
         database_client=_stub,
         database_credentials={},
@@ -370,11 +419,16 @@ def test_every_live_controller_observation_passes_the_probe_allowlists():
     # before the subprocess, and everything past validation is swallowed below.
     # Leaving it out is how the Oracle session tag drifted out of sync with the
     # manifests unnoticed until it wedged the live queue (2026-08-03).
+    # `kubernetes` is the same shape: APPROVED_K8S_TARGETS is checked before
+    # kubectl runs. It was the one allowlist surface with no guard, which is how
+    # F14-P's recovery selector (banking/testbed-ledger) stayed unapproved
+    # through the whole 2026-08-03 batch and aged every run into DIRTY.
     guarded = {
         "prometheus": probes._prometheus_observation,
         "clickhouse": probes._clickhouse_observation,
         "database": probes._database_observation,
         "loadgen_summary": probes._loadgen_observation,
+        "kubernetes": probes._kubernetes_observation,
     }
 
     problems = []

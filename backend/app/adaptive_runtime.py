@@ -75,6 +75,11 @@ class EligibilityEvidence(StrictModel):
     source: str = Field(min_length=1)
     quality: str = Field(pattern="^good$")
     check_results: dict[str, bool]
+    # A check that raised is recorded here as "ExceptionType: message" next to
+    # its False in check_results. Without this, a probe exception and a genuine
+    # negative were indistinguishable ("no detail"), which is how F08-G burned
+    # a live attempt on a transient error in the 2026-08-03 batch.
+    check_errors: dict[str, str] = Field(default_factory=dict)
     clean_window_start: datetime
     clean_window_end: datetime
     overlapping_run_ids: list[str] = Field(default_factory=list)
@@ -335,6 +340,15 @@ class AdaptiveRuntime:
         reasons = _eligibility_reasons(
             request, evidence, skip_isolation_checks=self.session.skip_isolation_checks
         )
+        if reasons and _blocked_only_by_probe_errors(request, evidence, reasons):
+            # Every failing check failed by raising, not by observing an unmet
+            # precondition — retry once before blocking. F08-G lost a live
+            # attempt to exactly this in the 2026-08-03 batch: a transient
+            # probe error read as a plain False and the manual rerun passed.
+            evidence = await _maybe_await(self.eligibility_probe.inspect(request))
+            reasons = _eligibility_reasons(
+                request, evidence, skip_isolation_checks=self.session.skip_isolation_checks
+            )
         self.session = self.session.model_copy(
             update={
                 "eligibility": evidence,
@@ -688,6 +702,28 @@ class AdaptiveRuntime:
         return _aware(self.clock.now())
 
 
+def _blocked_only_by_probe_errors(
+    request: EligibilityRequest,
+    evidence: EligibilityEvidence,
+    reasons: list[str],
+) -> bool:
+    """True when every blocking reason traces back to a check that raised.
+
+    A check observing an unmet precondition (a genuine False, a structural
+    reason like clean_window_too_short) must block without retry — repeating
+    the question does not change the answer. Only exception-driven failures
+    are worth one more look.
+    """
+    if not all(reason.startswith(("check_failed:", "check_error:")) for reason in reasons):
+        return False
+    failing = [
+        check
+        for check in request.checks
+        if evidence.check_results.get(check) is not True
+    ]
+    return bool(failing) and all(check in evidence.check_errors for check in failing)
+
+
 def _eligibility_reasons(
     request: EligibilityRequest,
     evidence: EligibilityEvidence,
@@ -708,6 +744,14 @@ def _eligibility_reasons(
         if evidence.check_results.get(check) is not True
         and not (skip_isolation_checks and check == "clean-window")
     ]
+    # A failed check that actually raised carries its exception alongside, so a
+    # blocked session states what broke instead of a bare check name.
+    reasons.extend(
+        f"check_error:{check}:{evidence.check_errors[check]}"
+        for check in request.checks
+        if check in evidence.check_errors
+        and not (skip_isolation_checks and check == "clean-window")
+    )
     window = (window_end - window_start).total_seconds()
     if not skip_isolation_checks:
         if window < request.clean_window_sec:

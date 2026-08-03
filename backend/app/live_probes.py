@@ -245,6 +245,9 @@ APPROVED_NODE_TARGETS = frozenset({"tb-w1", "tb-w2", "tb-w3"})
 APPROVED_BUSINESS_KEYS = frozenset({"checkout", "order-1"})
 APPROVED_K8S_TARGETS = {
     ("rca-testbed-commerce", "api-gateway"): "app=testbed-gateway",
+    # F05-P names the gateway by its real Deployment name; the api-gateway key
+    # above predates it and is the container's name, kept for older manifests.
+    ("rca-testbed-commerce", "testbed-gateway"): "app=testbed-gateway",
     ("rca-testbed-commerce", "testbed-payment"): "app=testbed-payment",
     ("rca-testbed-commerce", "testbed-inventory"): "app=testbed-inventory",
     ("rca-testbed-commerce", "testbed-cart"): "app=testbed-cart",
@@ -270,6 +273,11 @@ APPROVED_K8S_TARGETS = {
     # F21-P watches the banking api pod while its Tomcat 200 thread pool
     # saturates (109 kubectl-verified 2026-07-24: app=testbed-api).
     ("rca-testbed-banking", "testbed-api"): "app=testbed-api",
+    # F14-P's recovery gate watches the ledger pod after its table-readonly
+    # injection clears. Missing here through the whole 2026-08-03 batch, so
+    # recovery could never be verified and the run always aged into DIRTY
+    # (kubectl-verified 2026-08-03: app=testbed-ledger).
+    ("rca-testbed-banking", "testbed-ledger"): "app=testbed-ledger",
     # F24-Q (+ F02-P live defect repair) watches the restaurant pod while its
     # Hikari/Tomcat pool saturates under load.north_south flood on NodePort
     # 30181 (109 k8s manifest-verified 2026-07-24: app=testbed-restaurant).
@@ -526,6 +534,11 @@ APPROVED_DEPLOYMENT_REPLICA_TARGETS = frozenset(
         ("rca-testbed-commerce", "testbed-product"),
         ("rca-testbed-banking", "testbed-transfer"),
         ("rca-testbed-commerce", "testbed-user"),
+        # F05-P watches gateway availableReplicas collapse while tb-w1 drains.
+        # Unlisted until the widened allowlist guard flagged it (2026-08-03) —
+        # the scenario skipped for other reasons in the batch, so this probe
+        # had never actually run.
+        ("rca-testbed-commerce", "testbed-gateway"),
     }
 )
 F05_PAYMENT_TARGET = {
@@ -565,6 +578,20 @@ F25_H_POSTGRES_TARGET = {
     "namespace": "rca-testbed-commerce",
     "deployment": "testbed-postgres",
     "container": "postgres",
+}
+# F05-P must_rule_out: a rising kafka restart count would mean the broker is
+# crashlooping rather than the node draining — restart-count query only.
+F05_KAFKA_TARGET = {
+    "namespace": "rca-testbed-commerce",
+    "deployment": "testbed-kafka",
+    "container": "kafka",
+}
+# F09-H must_rule_out: a rising order restart count would mean crashloop, not
+# the injected heap pressure — restart-count query only.
+F09_ORDER_TARGET = {
+    "namespace": "rca-testbed-commerce",
+    "deployment": "testbed-order",
+    "container": "order-service",
 }
 F05_PAYMENT_BASELINE_RESOURCES = {
     "requests": {"cpu": "200m", "memory": "512Mi"},
@@ -684,7 +711,17 @@ class LiveProbeSet:
             "baseline-business-success": self._baseline_business_succeeds,
             "target-health": self._target_healthy,
         }
-        results = {check: _safe_bool(checks[check]) for check in request.checks}
+        results: dict[str, bool] = {}
+        errors: dict[str, str] = {}
+        for check in request.checks:
+            try:
+                results[check] = checks[check]() is True
+            except Exception as error:
+                # Preserve the reason instead of collapsing it into a bare
+                # False — an exception here is a broken probe or a transient
+                # transport failure, not evidence the precondition is unmet.
+                results[check] = False
+                errors[check] = f"{type(error).__name__}: {error}"
         baseline_active = (
             results["baseline-traffic"]
             if "baseline-traffic" in results
@@ -695,6 +732,7 @@ class LiveProbeSet:
             source="live-probes:v1",
             quality="good",
             check_results=results,
+            check_errors=errors,
             clean_window_start=window_start,
             clean_window_end=_aware(request.requested_at),
             overlapping_run_ids=sorted(overlap_ids),
@@ -1035,6 +1073,10 @@ class LiveProbeSet:
                 target = F15_FOOD_PAYMENT_TARGET
             elif parameters == F17_TRANSFER_TARGET and query.query_id == "kubernetes.container_restart_count":
                 target = F17_TRANSFER_TARGET
+            elif parameters == F05_KAFKA_TARGET and query.query_id == "kubernetes.container_restart_count":
+                target = F05_KAFKA_TARGET
+            elif parameters == F09_ORDER_TARGET and query.query_id == "kubernetes.container_restart_count":
+                target = F09_ORDER_TARGET
             elif parameters == F20_FOOD_ORDER_TARGET and query.query_id in {
                 "kubernetes.container_memory_current_bytes",
                 "kubernetes.container_memory_limit_bytes",
@@ -1879,13 +1921,6 @@ def _run_intervals(run_dir: Path) -> list[tuple[datetime, datetime]]:
 
 def _intersects(left_start: datetime, left_end: datetime, right_start: datetime, right_end: datetime) -> bool:
     return left_start <= right_end and right_start <= left_end
-
-
-def _safe_bool(action: Callable[[], bool]) -> bool:
-    try:
-        return action() is True
-    except Exception:
-        return False
 
 
 def _read_json(path: Path) -> dict[str, Any]:

@@ -267,6 +267,75 @@ async def test_eligibility_probe_may_complete_after_request_time() -> None:
     assert len(applier.applies) == 1
 
 
+class ErringEligibility(FakeEligibility):
+    """Fails checks by exception for the first ``failures`` inspections.
+
+    Mirrors the F08-G 2026-08-03 batch shape: the probe raised, LiveProbes
+    recorded a False with the exception preserved in check_errors, and a plain
+    rerun passed.
+    """
+
+    def __init__(self, clock: FakeClock, *, failures: int = 1) -> None:
+        super().__init__(clock)
+        self.failures = failures
+
+    def inspect(self, request):
+        evidence = super().inspect(request)
+        if len(self.requests) > self.failures:
+            return evidence
+        failing = request.checks[0]
+        return evidence.model_copy(
+            update={
+                "check_results": {**evidence.check_results, failing: False},
+                "check_errors": {failing: "LiveProbeError: transient transport failure"},
+            }
+        )
+
+
+async def test_probe_exception_block_is_retried_once_before_blocking() -> None:
+    clock = FakeClock()
+    eligibility = ErringEligibility(clock, failures=1)
+    runtime, _, applier = _runtime(clock, {}, eligibility=eligibility)
+
+    session = await runtime.begin()
+
+    assert session.status == SessionStatus.ACTIVE
+    assert session.blocked_reasons == []
+    assert len(eligibility.requests) == 2
+    assert len(applier.applies) == 1
+
+
+async def test_persistent_probe_exception_blocks_with_the_reason_preserved() -> None:
+    clock = FakeClock()
+    eligibility = ErringEligibility(clock, failures=2)
+    runtime, _, applier = _runtime(clock, {}, eligibility=eligibility)
+
+    session = await runtime.begin()
+
+    assert session.status == SessionStatus.BLOCKED
+    assert len(eligibility.requests) == 2
+    failing = eligibility.requests[0].checks[0]
+    assert f"check_failed:{failing}" in session.blocked_reasons
+    assert (
+        f"check_error:{failing}:LiveProbeError: transient transport failure"
+        in session.blocked_reasons
+    )
+    assert not applier.applies
+
+
+async def test_genuinely_unmet_check_blocks_without_a_retry() -> None:
+    clock = FakeClock()
+    eligibility = FakeEligibility(clock, baseline_active=False)
+    runtime, _, _ = _runtime(clock, {}, eligibility=eligibility)
+
+    session = await runtime.begin()
+
+    assert session.status == SessionStatus.BLOCKED
+    # A genuine negative is an answer, not an error — asking again would not
+    # change it, so exactly one inspection happens.
+    assert len(eligibility.requests) == 1
+
+
 async def test_calibration_escalates_after_fresh_consecutive_ticks_and_cleans_up() -> None:
     clock = FakeClock()
     values = {
