@@ -406,19 +406,41 @@ case "$mode" in
  *) exit 2 ;;
 esac
 if [[ -n "$target" ]]; then used=$(df -P "$target" | awk 'NR==2{gsub(/%/,"",$5); print $5}'); fi
-# Disk busy percentage for the device backing $target, sampled from
-# /proc/diskstats io_ticks (ms spent with I/O in flight) over a 1s window.
-# Partitions report io_ticks unreliably, so resolve the parent disk first.
+# Disk busy percentage for the device backing $target, from /proc/diskstats
+# io_ticks (ms spent with I/O in flight). Partitions report io_ticks
+# unreliably, so resolve the parent disk first.
+# Averaged since the previous probe call (state file below): a 1s spot sample
+# swung 41..98 tick-to-tick under constant-rate fio and broke every
+# 3-consecutive-tick judgment while the device stayed saturated (batch #25,
+# F10-P). The interval average measures what the judgment actually asks --
+# "was the device busy over this tick" -- with no added probe latency. First
+# call, device change, or a stale (>120s) interval falls back to a 1s sample.
 if [[ -n "$target" ]]; then
   src=$(df -P "$target" | awk 'NR==2{print $1}')
   dev=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)
   [[ -z "$dev" ]] && dev=$(basename "$src")
-  t0=$(awk -v d="$dev" '$3==d{print $13}' /proc/diskstats)
-  sleep 1
+  iostate="$state_root/${scenario}.iosample"
+  now_ms=$(date +%s%3N)
   t1=$(awk -v d="$dev" '$3==d{print $13}' /proc/diskstats)
-  if [[ -n "$t0" && -n "$t1" && "$t1" -ge "$t0" ]]; then
-    io_util=$(( (t1 - t0) / 10 ))
-    (( io_util > 100 )) && io_util=100
+  pdev=""; pticks=""; pms=""
+  { [[ -s "$iostate" ]] && read -r pdev pticks pms < "$iostate"; } || true
+  if [[ -n "$t1" && "$pdev" == "$dev" && -n "$pticks" && -n "$pms" ]] \
+     && (( now_ms > pms )) && (( now_ms - pms <= 120000 )) && (( t1 >= pticks )); then
+    io_util=$(( (t1 - pticks) * 100 / (now_ms - pms) ))
+  elif [[ -n "$t1" ]]; then
+    t0=$t1
+    sleep 1
+    t1=$(awk -v d="$dev" '$3==d{print $13}' /proc/diskstats)
+    if [[ -n "$t1" && "$t1" -ge "$t0" ]]; then
+      io_util=$(( (t1 - t0) / 10 ))
+    fi
+    now_ms=$(date +%s%3N)
+  fi
+  (( io_util > 100 )) && io_util=100
+  if [[ -n "$t1" ]]; then
+    # state_root is created by the executors; a host where none ever ran must
+    # degrade to the 1s fallback, not fail the whole probe.
+    { printf '%s %s %s\n' "$dev" "$t1" "$now_ms" > "$iostate"; } 2>/dev/null || true
   fi
 fi
 clean=true; $active && clean=false; $artifact && clean=false
