@@ -366,7 +366,15 @@ def test_every_live_controller_observation_passes_the_probe_allowlists():
     )
     # Only the adapters that gate on a parameter allowlist; the others need a
     # live host or a subprocess and are covered by their own tests.
-    guarded = {"prometheus": probes._prometheus_observation, "clickhouse": probes._clickhouse_observation}
+    # `database` belongs here even though it shells out: its allowlist check runs
+    # before the subprocess, and everything past validation is swallowed below.
+    # Leaving it out is how the Oracle session tag drifted out of sync with the
+    # manifests unnoticed until it wedged the live queue (2026-08-03).
+    guarded = {
+        "prometheus": probes._prometheus_observation,
+        "clickhouse": probes._clickhouse_observation,
+        "database": probes._database_observation,
+    }
 
     problems = []
     for scenario_id in sorted(ready & set(controllers)):

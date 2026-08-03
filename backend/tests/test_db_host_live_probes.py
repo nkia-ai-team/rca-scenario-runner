@@ -79,7 +79,7 @@ def observe(fake: FakeProcess, query_id: str, parameters: dict):
 def test_oracle_and_mysql_queries_are_fixed_kubectl_reads() -> None:
     fake = FakeProcess()
     oracle = observe(fake, "database.oracle_tagged_session_count", {
-        "client_identifier": "rca-F01-P-oracle-lock"
+        "client_identifier": "dba-maintenance"
     })
     mysql = observe(fake, "database.mysql_index_present", {
         "database": "fooddelivery", "table": "menus", "index": "idx_menus_category"
@@ -128,7 +128,7 @@ def test_host_queries_use_only_measured_worker_and_fixed_probe_script() -> None:
 
 
 ORACLE_PROBES = {
-    "database.oracle_tagged_session_count": {"client_identifier": "rca-F01-P-oracle-lock"},
+    "database.oracle_tagged_session_count": {"client_identifier": "dba-maintenance"},
     "database.outbox_unpublished_count": {"namespace": "rca-testbed-banking"},
     "database.integrity_violation_count": {"since": "2026-07-30 05:00:00"},
     "database.ledger_unmatched_transfer_count": {"window_minutes": 5, "grace_seconds": 60},

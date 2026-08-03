@@ -295,10 +295,14 @@ APPROVED_SESSION_TAGS = frozenset({
     "rca-F15-G-inventory-lock",
     "rca-F15-T1-inventory-lock",
 })
+# The manifests stopped naming the scenario in the session tag — an `rca-F01-P-*`
+# identifier is a level-2 answer leak, so all three Oracle locks now impersonate a
+# plausible DBA session. This allowlist kept the old names and therefore rejected
+# every real tag with "Oracle session tag is not allowlisted", which left F01-P,
+# F08-G and F15-G unable to verify recovery and wedged the queue with a global
+# DIRTY (2026-08-03). The old names are dead: no manifest emits them.
 APPROVED_ORACLE_TAGS = frozenset({
-    "rca-F01-P-oracle-lock",
-    "rca-F08-G-oracle-lock",
-    "rca-F15-G-oracle-lock",
+    "dba-maintenance",
 })
 
 
