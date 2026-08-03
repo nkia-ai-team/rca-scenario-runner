@@ -418,7 +418,7 @@ class LiveScenarioQueue:
                 raise RuntimeError("live queue is already active")
             if current.phase == "paused":
                 raise RuntimeError("live queue is paused; fix the blocker and use resume")
-            readiness = self.readiness()
+            readiness = await asyncio.to_thread(self.readiness)
             if not readiness.ready:
                 raise RuntimeError(f"live queue readiness failed: {', '.join(readiness.missing)}")
             now = self._format(self.clock.now())
@@ -454,7 +454,7 @@ class LiveScenarioQueue:
             state = self.snapshot()
             if state.phase != "paused":
                 raise RuntimeError("only a paused live queue can be resumed")
-            readiness = self.readiness()
+            readiness = await asyncio.to_thread(self.readiness)
             if not readiness.ready:
                 raise RuntimeError(f"live queue readiness failed: {', '.join(readiness.missing)}")
             if state.cycle_mode:
@@ -565,8 +565,13 @@ class LiveScenarioQueue:
             if state.phase == "running":
                 return await self._tick_running(state)
             if state.phase == "waiting_capture":
-                return self._tick_capture(state)
-            return self._tick_clean_window(state)
+                return await asyncio.to_thread(self._tick_capture, state)
+            # The clean-window tick re-probes operational readiness, which
+            # shells out to the capture self-check (up to 120s). Both sync
+            # ticks are file/subprocess work with no event-loop resources, so
+            # they run on a thread — served inline they starved the coordinator
+            # heartbeat until an active lease expired (#31, 2026-08-03 batch).
+            return await asyncio.to_thread(self._tick_clean_window, state)
 
     def _append_promoted_if_available(self, state: LiveQueueState) -> LiveQueueState:
         """Discover valid append-only promotions without operator intervention.

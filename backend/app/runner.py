@@ -509,6 +509,23 @@ class ScenarioRunner:
                 success = True
         except Exception as error:
             self._append_log(f"[ERROR] External DIRTY cleanup failed: {error}")
+            # The in-memory log tail is the only place this used to land, and it
+            # dies with the process — #21 in the 2026-08-03 batch read as
+            # "HTTP 200, no capsule-repair.json, no error anywhere" while a
+            # refused capsule repair vanished here. Persist the reason next to
+            # the run so a refused escape hatch says why it refused.
+            with suppress(Exception):
+                atomic_json(
+                    self.artifact_store.root / dirty_run_id / "manual-cleanup-error.json",
+                    {
+                        "schema_version": 1,
+                        "source": "manual-dirty-cleanup",
+                        "claimant": claimant,
+                        "repair_capsule": repair_capsule,
+                        "error": f"{type(error).__name__}: {error}",
+                        "at": self.clock.now().isoformat(),
+                    },
+                )
         finally:
             if not success:
                 with suppress(RuntimeError):

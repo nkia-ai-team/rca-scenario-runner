@@ -661,6 +661,50 @@ def test_protection_window_is_released_only_by_the_smoke_pass(monkeypatch):
     assert LiveScenarioQueue._protection_window_reason(midnight_kst) is None
 
 
+async def test_clean_window_tick_runs_off_the_event_loop():
+    """#31 (2026-08-03 batch): the clean-window tick re-probes readiness, which
+    shells out to the capture self-check for up to 120s. Served inline it froze
+    the event loop and starved the coordinator heartbeat until the active run's
+    30s lease expired — every later operation then died on fencing rejection.
+    The sync ticks must run on a thread so heartbeats keep flowing."""
+    import asyncio
+    import time
+    from types import SimpleNamespace
+
+    from app.live_queue import LiveScenarioQueue
+
+    state = SimpleNamespace(phase="waiting_clean_window", cycle_mode=False)
+    stub = SimpleNamespace(
+        _lock=asyncio.Lock(),
+        snapshot=lambda: state,
+        runner=SimpleNamespace(
+            coordinator=SimpleNamespace(
+                snapshot=lambda: SimpleNamespace(dirty_run=None)
+            )
+        ),
+        _append_promoted_if_available=lambda s: s,
+        _tick_clean_window=lambda s: (time.sleep(0.5), s)[1],
+    )
+
+    beats = 0
+
+    async def heartbeat() -> None:
+        nonlocal beats
+        while True:
+            await asyncio.sleep(0.02)
+            beats += 1
+
+    task = asyncio.create_task(heartbeat())
+    try:
+        result = await LiveScenarioQueue.tick(stub)
+    finally:
+        task.cancel()
+    assert result is state
+    # Inline execution starves the loop completely (0 beats in 0.5s); off-loop
+    # execution keeps it beating. Require a comfortable margin, not the ideal.
+    assert beats >= 5
+
+
 def test_functional_readiness_is_opt_in_and_gates_on_capture_self_check(tmp_path, monkeypatch):
     from datetime import datetime, timezone
     from types import SimpleNamespace

@@ -1,3 +1,4 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -80,7 +81,11 @@ async def api_live_queue() -> LiveQueueState:
 
 @app.get("/api/live-queue/readiness", response_model=OperationalReadiness)
 async def api_live_queue_readiness() -> OperationalReadiness:
-    return get_live_queue().readiness()
+    # readiness() shells out to the capture self-check (up to 120s). Run on a
+    # thread: served inline it froze the event loop, starving the coordinator
+    # heartbeat until the active run's 30s lease expired and every subsequent
+    # operation died on fencing rejection (#31, 2026-08-03 batch — F15-T2).
+    return await asyncio.to_thread(get_live_queue().readiness)
 
 
 @app.post("/api/live-queue/start", response_model=LiveQueueState)
