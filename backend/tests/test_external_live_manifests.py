@@ -374,6 +374,7 @@ def test_every_live_controller_observation_passes_the_probe_allowlists():
         "prometheus": probes._prometheus_observation,
         "clickhouse": probes._clickhouse_observation,
         "database": probes._database_observation,
+        "loadgen_summary": probes._loadgen_observation,
     }
 
     problems = []
@@ -381,6 +382,11 @@ def test_every_live_controller_observation_passes_the_probe_allowlists():
         for observation in controllers[scenario_id]["observations"]:
             probe = guarded.get(observation.get("adapter"))
             if probe is None:
+                continue
+            if observation["adapter"] == "loadgen_summary" and not observation.get("parameters"):
+                # The unparameterized loadgen path reads the *running* scenario's own
+                # k6 output, so it needs a live run context this test cannot supply.
+                # The parameterized (domain) form is the one with an allowlist to check.
                 continue
             spec = {"query_id": observation["query_id"]}
             if observation.get("parameters"):
