@@ -613,6 +613,32 @@ class AdaptiveRuntime:
             effect_ended_at=result.effect_ended_at,
             reason=result.reason,
         )
+        # A run whose injection never applied has nothing to recover from.
+        # level_changes only gains an entry when apply() succeeds, so an empty
+        # list means the environment was never touched — yet such a run still
+        # entered the recovery gate and waited for conditions that describe the
+        # *aftermath of an injection*. Those can never be met, so the run always
+        # aged into DIRTY exactly recovery.timeout later and blocked the queue.
+        # Seen repeatedly in the 2026-08-03 batch wherever the executor refused
+        # the parameters (F03-H, F15-R, F05-P): the refusal was the real finding
+        # and it arrived buried under a 10-minute recovery_timeout.
+        never_injected = not self.session.level_changes
+        if result.succeeded and never_injected:
+            self.session = self.session.model_copy(
+                update={
+                    "controller_state": final_state,
+                    "cleanup": cleanup,
+                    "status": SessionStatus.CLEAN,
+                    "recovery": RecoveryEvidence(
+                        status="succeeded",
+                        started_at=result.effect_ended_at or now,
+                        verified_at=now,
+                        reason="no_injection_applied",
+                    ),
+                },
+                deep=True,
+            )
+            return
         self.session = self.session.model_copy(
             update={
                 "controller_state": final_state,

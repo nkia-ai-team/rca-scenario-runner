@@ -464,6 +464,41 @@ async def test_recovery_timeout_marks_dirty_after_successful_cleanup() -> None:
     assert session.controller_state and session.controller_state.reason == "recovery_timeout"
 
 
+async def test_run_whose_injection_never_applied_skips_the_recovery_gate() -> None:
+    # The recovery conditions describe the aftermath of an injection, so a run
+    # whose apply() was refused can never satisfy them: before this, such a run
+    # sat in RECOVERING for the full timeout and then went DIRTY, blocking the
+    # queue and burying the executor's refusal — the actual finding — under a
+    # generic recovery_timeout. Seen across F03-H, F15-R and F05-P in the
+    # 2026-08-03 batch.
+    class RefusingApplier(FakeApplier):
+        def apply(self, request: ApplyRequest) -> ApplyResult:
+            raise RuntimeError("profile control refused: parameters are not approved")
+
+    clock = FakeClock()
+    values = {
+        "loadgen.achieved_rps": 100,
+        "http.entry_health": 200,
+        "database.tagged_session_count": 0,
+    }
+    applier = RefusingApplier(clock)
+    runtime, _, _ = _runtime(clock, values, applier=applier)
+    await runtime.begin()
+
+    session = runtime.session
+    assert session.level_changes == []
+    assert session.cleanup and session.cleanup.succeeded
+    # Straight to CLEAN, with the reason recorded rather than a timeout.
+    assert session.status == SessionStatus.CLEAN
+    assert session.recovery and session.recovery.status == "succeeded"
+    assert session.recovery.reason == "no_injection_applied"
+
+    # And it must not linger: advancing past the recovery timeout changes nothing.
+    clock.advance(600)
+    session = await runtime.tick()
+    assert session.status == SessionStatus.CLEAN
+
+
 async def test_cleanup_failure_marks_dirty_and_session_restores_without_reapply() -> None:
     clock = FakeClock()
     values = {

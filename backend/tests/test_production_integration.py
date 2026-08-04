@@ -1196,3 +1196,51 @@ def test_readopt_takes_the_run_back_only_from_an_idle_coordinator(tmp_path):
             run_id="F15-T2-run-other", scenario_id="F15-T2", fencing_token=196,
             reason="readopted", now=now,
         )
+
+
+@pytest.mark.asyncio
+async def test_a_slow_apply_does_not_starve_the_heartbeat(tmp_path) -> None:
+    # F15-T2 carries start_offset_seconds=240 while the coordinator lease is 30s.
+    # When apply ran on the event loop the heartbeat could not tick for those four
+    # minutes, the lease expired, and every later operation was refused with
+    # "operation rejected by fencing token" — the scenario was structurally
+    # unrunnable. apply is offloaded now; this pins that so the blocking form
+    # cannot come back.
+    import asyncio
+    import time
+
+    from app.production_runtime import AsyncProfileApplier
+
+    class BlockingApplier:
+        def apply(self, request):
+            time.sleep(0.4)  # stands in for the 4-minute offset wait
+            return "applied"
+
+    applier = AsyncProfileApplier(BlockingApplier())
+    beats = 0
+    beats_when_apply_returned = None
+
+    async def do_apply() -> object:
+        nonlocal beats_when_apply_returned
+        result = await applier.apply(object())
+        # Counting beats at the END would pass either way — the starved
+        # heartbeat simply catches up once apply lets go of the loop. The
+        # question is how many beats landed *while apply was in flight*.
+        beats_when_apply_returned = beats
+        return result
+
+    async def heartbeat() -> None:
+        nonlocal beats
+        for _ in range(20):
+            await asyncio.sleep(0.02)
+            beats += 1
+
+    result, _ = await asyncio.gather(do_apply(), heartbeat())
+
+    assert result == "applied"
+    # ~0.4s of apply against a 0.02s heartbeat: concurrent gives well over 10.
+    # Running apply on the event loop gives exactly 0.
+    assert beats_when_apply_returned is not None
+    assert beats_when_apply_returned >= 10, (
+        f"heartbeat was starved during apply (beats={beats_when_apply_returned})"
+    )
