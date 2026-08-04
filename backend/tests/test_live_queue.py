@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.live_queue import LIVE_SCENARIO_ORDER, LiveScenarioQueue
+from app.live_queue import (
+    LIVE_SCENARIO_ORDER,
+    PREFLIGHT_MAX_ATTEMPTS,
+    LiveScenarioQueue,
+)
 from app.models import RunInfo
 
 
@@ -540,12 +544,17 @@ async def test_dirty_preflight_rechecks_every_five_minutes_then_skips(tmp_path: 
     state = await queue.tick()  # before recheck interval: no re-evaluation
     assert state.preflight_attempts == 1
 
-    clock.value += timedelta(minutes=5)
-    state = await queue.tick()  # attempt 2
-    assert state.preflight_attempts == 2
+    # Attempts 2..MAX-1 keep waiting: a dirty window after a destructive
+    # predecessor refills on its own, so the gate waits rather than forfeiting
+    # the case. Only the last attempt gives up.
+    for expected in range(2, PREFLIGHT_MAX_ATTEMPTS):
+        clock.value += timedelta(minutes=5)
+        state = await queue.tick()
+        assert state.preflight_attempts == expected
+        assert state.skipped_scenario_ids == []
 
     clock.value += timedelta(minutes=5)
-    state = await queue.tick()  # attempt 3 == MAX -> skip and advance
+    state = await queue.tick()  # attempt == MAX -> skip and advance
     assert runner.started == []
     assert state.skipped_scenario_ids == ["F01-R"]
     assert state.next_index == 1

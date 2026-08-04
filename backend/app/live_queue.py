@@ -70,7 +70,15 @@ FUNCTIONAL_READINESS_TTL_SEC = 300
 # leading [t1-10m, t1] window must be clean. A dirty verdict re-checks every 5m;
 # after PREFLIGHT_MAX_ATTEMPTS the scenario is skipped and the queue continues.
 PREFLIGHT_RECHECK_INTERVAL = timedelta(minutes=5)
-PREFLIGHT_MAX_ATTEMPTS = 3
+# 6, not 3 (2026-08-04). A destructive predecessor leaves the gate looking at an
+# empty window rather than a broken path: F25-H OOM-kills commerce PostgreSQL, so
+# for the minutes it takes to restart no order is recorded, and F23-R's
+# baseline-business-success saw 0/0/1 PAID over its leading 5m while the path
+# itself was healthy (15m total: 2093 PAID). That is a wait, not a skip — but
+# 3 x 5m expired before the window refilled and the run was lost. Six attempts
+# cover a stateful restart plus the refill; a genuinely dead path still fails,
+# just 15 minutes later, which is cheap next to forfeiting a dataset case.
+PREFLIGHT_MAX_ATTEMPTS = 6
 PREFLIGHT_WINDOW_LEAD = timedelta(minutes=10)
 # Scenario spacing contract v2 (spec-scenario-load R6, 2026-07-20): the old 2h
 # inter-scenario clean window is replaced by a minimum 30m gap between the
