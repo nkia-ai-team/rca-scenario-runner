@@ -11,6 +11,7 @@ import pytest
 from app.live_queue import (
     LIVE_SCENARIO_ORDER,
     PREFLIGHT_MAX_ATTEMPTS,
+    READINESS_PROBE_GRACE,
     LiveScenarioQueue,
 )
 from app.models import RunInfo
@@ -597,6 +598,90 @@ async def test_preflight_probe_failure_pauses_the_queue(tmp_path: Path) -> None:
     state = await queue.tick()
     assert state.phase == "paused"
     assert "preflight probe failed" in (state.reason or "")
+    assert runner.started == []
+
+
+def _wait_in_clean_window(queue, clock) -> None:
+    """Park the queue on the between-scenarios tick that re-probes readiness."""
+    queue._write(
+        queue.snapshot().model_copy(
+            update={
+                "phase": "waiting_clean_window",
+                "clean_window_not_before": queue._format(
+                    clock.value - timedelta(minutes=1)
+                ),
+            }
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_readiness_probe_hiccup_waits_out_the_grace_and_records_why(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The batch-level gate must survive a partial poll, and say what broke.
+
+    Every other queue test runs with functional_readiness_enabled False, so the
+    readiness gate — the layer that actually paused the 2026-08-04 batch — was
+    never exercised: production pauses there before the per-scenario gate is
+    reached. Enable it here and use the production failure shape (a partial poll,
+    which build_preflight_checks raises on by design), on the clean-window tick
+    between two scenarios — where the batch actually stopped.
+    """
+    class PartialProbe:
+        def collect(self, *, now):
+            return {"baseline_loadgen_alive": 1.0}  # the other 7 signals missing
+
+    script = tmp_path / "capture.sh"
+    script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    script.chmod(0o755)
+    monkeypatch.setattr("app.incident_close.open_incident_count", lambda **kw: 0)
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.required_paths = {**queue.required_paths, "capture_script": script}
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    await queue.start()
+    queue.functional_readiness_enabled = True
+    _wait_in_clean_window(queue, clock)
+
+    queue.preflight_probe = PartialProbe()
+    queue._functional_cache = None  # the green TTL has expired
+    state = await queue.tick()
+    assert state.phase == "waiting_clean_window", (
+        "a single partial poll must not end the batch"
+    )
+    assert runner.started == []
+
+    clock.value += READINESS_PROBE_GRACE + timedelta(seconds=5)
+    state = await queue.tick()
+    assert state.phase == "paused", "a probe broken past the grace must pause"
+    assert "preflight_signals" in (state.reason or "")
+    # The point of the fix: the reason carries the swallowed exception.
+    assert "missing required signals" in (state.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_readiness_pauses_at_once_when_a_non_probe_check_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The grace is for the probe alone — a real dependency failure still pauses."""
+    script = tmp_path / "capture.sh"
+    script.write_text("#!/usr/bin/env bash\necho boom >&2\nexit 1\n")
+    script.chmod(0o755)
+    monkeypatch.setattr("app.incident_close.open_incident_count", lambda **kw: 0)
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.required_paths = {**queue.required_paths, "capture_script": script}
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    await queue.start()
+    queue.functional_readiness_enabled = True
+    _wait_in_clean_window(queue, clock)
+    queue._functional_cache = None
+
+    state = await queue.tick()
+    assert state.phase == "paused"
+    assert "capture_self_check" in (state.reason or "")
+    assert "boom" in (state.reason or "")
     assert runner.started == []
 
 

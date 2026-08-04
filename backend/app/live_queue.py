@@ -80,6 +80,20 @@ PREFLIGHT_RECHECK_INTERVAL = timedelta(minutes=5)
 # just 15 minutes later, which is cheap next to forfeiting a dataset case.
 PREFLIGHT_MAX_ATTEMPTS = 6
 PREFLIGHT_WINDOW_LEAD = timedelta(minutes=10)
+# The readiness gate's probe is transport, not judgement (2026-08-04 batch): a
+# partial poll makes build_preflight_checks raise by design ("fails closed"), and
+# one such hiccup used to pause the whole 44-scenario queue on the first tick —
+# the per-scenario gate above already rechecks 6 x 5m for the same condition.
+# Give the batch-level gate the same slack: keep waiting while the probe alone is
+# the blocker, and pause only if it stays broken for this long.
+READINESS_PROBE_GRACE = timedelta(minutes=3)
+TRANSIENT_READINESS_CHECKS = frozenset({"preflight_signals"})
+
+
+def _tail(text: str, limit: int = 200) -> str:
+    """Last line of a failed probe's output, short enough to live in `reason`."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return lines[-1][:limit] if lines else "no output"
 # Scenario spacing contract v2 (spec-scenario-load R6, 2026-07-20): the old 2h
 # inter-scenario clean window is replaced by a minimum 30m gap between the
 # previous t2 and the next t1, with the 2-layer preflight gate deciding
@@ -262,6 +276,10 @@ class OperationalReadiness(StrictModel):
     ready: bool
     checks: dict[str, bool]
     missing: list[str]
+    # Why a functional check failed. The probes swallow their exception to keep a
+    # boolean contract; without the text a paused batch says only which check
+    # failed, never why (2026-08-04 batch: "preflight_signals" with no trace).
+    details: dict[str, str] = Field(default_factory=dict)
 
 
 class LiveScenarioQueue:
@@ -341,6 +359,9 @@ class LiveScenarioQueue:
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
         self._functional_cache: tuple[datetime, dict[str, bool]] | None = None
+        self._functional_details: dict[str, str] = {}
+        # First tick at which the probe alone blocked readiness; None while ready.
+        self._probe_grace_since: datetime | None = None
 
     def snapshot(self) -> LiveQueueState:
         if not self.state_path.is_file():
@@ -374,7 +395,27 @@ class LiveScenarioQueue:
         checks["runner_idle"] = not self.runner.is_busy
         checks.update(self._functional_readiness())
         missing = sorted(name for name, passed in checks.items() if not passed)
-        return OperationalReadiness(ready=not missing, checks=checks, missing=missing)
+        details = {
+            name: text
+            for name, text in self._functional_details.items()
+            if name in missing
+        }
+        return OperationalReadiness(
+            ready=not missing, checks=checks, missing=missing, details=details
+        )
+
+    @staticmethod
+    def _readiness_failure_reason(
+        readiness: OperationalReadiness, blockers: set[str]
+    ) -> str:
+        names = sorted(blockers)
+        reason = f"operational readiness failed: {', '.join(names)}"
+        why = "; ".join(
+            f"{name}: {readiness.details[name]}"
+            for name in names
+            if name in readiness.details
+        )
+        return f"{reason} ({why})" if why else reason
 
     def _functional_readiness(self) -> dict[str, bool]:
         """Prove — not assume — the full pipeline before any scenario is spent.
@@ -393,6 +434,7 @@ class LiveScenarioQueue:
             if fresh and all(cached.values()):
                 return dict(cached)
         checks: dict[str, bool] = {}
+        details: dict[str, str] = {}
         script = self.required_paths["capture_script"]
         try:
             result = subprocess.run(
@@ -400,23 +442,29 @@ class LiveScenarioQueue:
                 capture_output=True, text=True, timeout=120,
             )
             checks["capture_self_check"] = result.returncode == 0
-        except Exception:
+            if result.returncode != 0:
+                details["capture_self_check"] = _tail(result.stderr or result.stdout)
+        except Exception as error:
             checks["capture_self_check"] = False
+            details["capture_self_check"] = f"{type(error).__name__}: {error}"
         try:
             from app.incident_close import open_incident_count
 
             open_incident_count()
             checks["lucida_incident_api"] = True
-        except Exception:
+        except Exception as error:
             checks["lucida_incident_api"] = False
+            details["lucida_incident_api"] = f"{type(error).__name__}: {error}"
         if self.preflight_probe is not None:
             try:
                 observations = self.preflight_probe.collect(now=now)
                 build_preflight_checks(observations)
                 checks["preflight_signals"] = True
-            except Exception:
+            except Exception as error:
                 checks["preflight_signals"] = False
+                details["preflight_signals"] = f"{type(error).__name__}: {error}"
         self._functional_cache = (now, dict(checks))
+        self._functional_details = details
         return checks
 
     async def start(self) -> LiveQueueState:
@@ -801,8 +849,17 @@ class LiveScenarioQueue:
         if not readiness.ready:
             blockers = set(readiness.missing) - {"coordinator_clean", "runner_idle"}
             if blockers:
-                return self._pause(state, f"operational readiness failed: {', '.join(sorted(blockers))}")
+                now = self.clock.now()
+                if blockers <= TRANSIENT_READINESS_CHECKS:
+                    if self._probe_grace_since is None:
+                        self._probe_grace_since = now
+                    if now - self._probe_grace_since < READINESS_PROBE_GRACE:
+                        return state
+                return self._pause(
+                    state, self._readiness_failure_reason(readiness, blockers)
+                )
             return state
+        self._probe_grace_since = None
         state = state.model_copy(
             update={
                 "phase": "running",
