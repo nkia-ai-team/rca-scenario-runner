@@ -1392,7 +1392,7 @@ class LiveScenarioQueue:
         try:
             verdict = self._evaluate_preflight(now, waited_sec)
         except Exception as error:
-            return self._pause(state, f"preflight probe failed for {scenario_id}: {error}"), None
+            return self._probe_error_wait(state, scenario_id, error, now), None
         if verdict.is_clean:
             return None, verdict
         # Clean-slate sweep (2026-07-21 policy): when lingering incident
@@ -1405,7 +1405,7 @@ class LiveScenarioQueue:
             try:
                 verdict = self._evaluate_preflight(now, waited_sec)
             except Exception as error:
-                return self._pause(state, f"preflight probe failed for {scenario_id}: {error}"), None
+                return self._probe_error_wait(state, scenario_id, error, now), None
             if verdict.is_clean:
                 return None, verdict
 
@@ -1439,6 +1439,38 @@ class LiveScenarioQueue:
         )
         self._write(waiting)
         return waiting, None
+
+    def _probe_error_wait(
+        self, state: LiveQueueState, scenario_id: str, error: Exception, now: datetime
+    ) -> LiveQueueState:
+        """A probe that raised is transport, not a verdict — so wait, don't stop.
+
+        Sibling of the readiness-gate hole fixed the same day: a dirty verdict
+        already gets 6 x 5m of rechecks, but an exception ended the whole batch on
+        the first occurrence. 119 answers both gates, and it resets connections
+        under load (2026-08-04: ConnectionResetError here, again minutes later),
+        so the batch died on a blip that cleared by itself. Spend the same budget;
+        a probe still broken after it is an environment failure worth pausing on.
+        """
+        attempts = state.preflight_attempts + 1
+        detail = f"{type(error).__name__}: {error}"
+        if attempts >= PREFLIGHT_MAX_ATTEMPTS:
+            return self._pause(
+                state, f"preflight probe failed for {scenario_id}: {detail}"
+            )
+        waiting = state.model_copy(
+            update={
+                "preflight_attempts": attempts,
+                "preflight_retry_not_before": self._format(now + PREFLIGHT_RECHECK_INTERVAL),
+                "reason": (
+                    f"preflight probe failed for {scenario_id} ({detail}); "
+                    f"recheck {attempts}/{PREFLIGHT_MAX_ATTEMPTS}"
+                ),
+                "updated_at": self._format(now),
+            }
+        )
+        self._write(waiting)
+        return waiting
 
     def _evaluate_preflight(self, now: datetime, waited_sec: int) -> PreflightVerdict:
         assert self.preflight_probe is not None

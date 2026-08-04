@@ -586,17 +586,33 @@ async def test_preflight_clears_on_recheck_and_records_clean_after_wait(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_preflight_probe_failure_pauses_the_queue(tmp_path: Path) -> None:
+async def test_preflight_probe_failure_spends_the_recheck_budget_before_pausing(
+    tmp_path: Path,
+) -> None:
+    """A raising probe is transport, not a verdict (2026-08-04 batch).
+
+    119 answers this gate and resets connections under load; the batch used to
+    die on the first blip while a merely dirty verdict got 6 x 5m of rechecks.
+    Same budget for both, and a probe still broken at the end still pauses.
+    """
     class BrokenProbe:
         def collect(self, *, now):
-            return {"baseline_loadgen_alive": 1}  # missing required signals
+            raise ConnectionResetError(104, "Connection reset by peer")
 
-    queue, runner, _, _, _ = make_queue(tmp_path)
-    queue.preflight_probe = BrokenProbe()
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
     await queue.start()
+    queue.preflight_probe = BrokenProbe()
+
+    for attempt in range(1, PREFLIGHT_MAX_ATTEMPTS):
+        state = await queue.tick()
+        assert state.phase == "running", f"blip {attempt} must not end the batch"
+        assert state.preflight_attempts == attempt
+        assert "Connection reset by peer" in (state.reason or "")
+        clock.value += timedelta(minutes=5)
 
     state = await queue.tick()
-    assert state.phase == "paused"
+    assert state.phase == "paused", "a probe still broken after the budget pauses"
     assert "preflight probe failed" in (state.reason or "")
     assert runner.started == []
 
