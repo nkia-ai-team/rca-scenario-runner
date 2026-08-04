@@ -661,14 +661,18 @@ async def test_readiness_probe_hiccup_waits_out_the_grace_and_records_why(
 
 
 @pytest.mark.asyncio
-async def test_readiness_pauses_at_once_when_a_non_probe_check_fails(
+async def test_readiness_pauses_at_once_when_a_non_transient_check_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The grace is for the probe alone — a real dependency failure still pauses."""
+    """The grace is for the probes — a hard dependency failure still pauses now."""
     script = tmp_path / "capture.sh"
-    script.write_text("#!/usr/bin/env bash\necho boom >&2\nexit 1\n")
+    script.write_text("#!/usr/bin/env bash\nexit 0\n")
     script.chmod(0o755)
-    monkeypatch.setattr("app.incident_close.open_incident_count", lambda **kw: 0)
+
+    def broken(**kwargs):
+        raise RuntimeError("incident api down")
+
+    monkeypatch.setattr("app.incident_close.open_incident_count", broken)
 
     queue, runner, _, _, clock = make_queue(tmp_path)
     queue.required_paths = {**queue.required_paths, "capture_script": script}
@@ -680,8 +684,52 @@ async def test_readiness_pauses_at_once_when_a_non_probe_check_fails(
 
     state = await queue.tick()
     assert state.phase == "paused"
+    assert "lucida_incident_api" in (state.reason or "")
+    assert "incident api down" in (state.reason or "")
+    assert runner.started == []
+
+
+@pytest.mark.asyncio
+async def test_smoke_pass_does_not_gate_the_batch_on_the_unused_capture_chain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A smoke pass exports nothing, so a broken 119 must not stop it.
+
+    Both 2026-08-04 pauses were the capture chain on a busy AP server, during a
+    pass that never captures. The dataset pass still proves the chain — losing a
+    case to an unprovable export is the loss this check exists to prevent — but
+    it gets the same grace as the probe rather than an instant stop.
+    """
+    script = tmp_path / "capture.sh"
+    script.write_text("#!/usr/bin/env bash\necho '[ERROR] clickhouse' >&2\nexit 1\n")
+    script.chmod(0o755)
+    monkeypatch.setattr("app.incident_close.open_incident_count", lambda **kw: 0)
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.required_paths = {**queue.required_paths, "capture_script": script}
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    await queue.start()
+    queue.functional_readiness_enabled = True
+    _wait_in_clean_window(queue, clock)
+
+    monkeypatch.setenv("SCENARIO_PASS", "smoke")
+    queue._functional_cache = None
+    readiness = queue.readiness()
+    assert "capture_self_check" not in readiness.checks
+    assert readiness.ready, "a smoke pass must not depend on the capture chain"
+
+    monkeypatch.setenv("SCENARIO_PASS", "dataset")
+    queue._functional_cache = None
+    readiness = queue.readiness()
+    assert readiness.checks["capture_self_check"] is False
+
+    state = await queue.tick()
+    assert state.phase == "waiting_clean_window", "dataset waits out the grace"
+    clock.value += READINESS_PROBE_GRACE + timedelta(seconds=5)
+    queue._functional_cache = None
+    state = await queue.tick()
+    assert state.phase == "paused"
     assert "capture_self_check" in (state.reason or "")
-    assert "boom" in (state.reason or "")
     assert runner.started == []
 
 

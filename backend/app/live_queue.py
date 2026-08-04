@@ -87,7 +87,10 @@ PREFLIGHT_WINDOW_LEAD = timedelta(minutes=10)
 # Give the batch-level gate the same slack: keep waiting while the probe alone is
 # the blocker, and pause only if it stays broken for this long.
 READINESS_PROBE_GRACE = timedelta(minutes=3)
-TRANSIENT_READINESS_CHECKS = frozenset({"preflight_signals"})
+# capture_self_check joins the probe here for the same reason, but only ever
+# appears at all on a dataset pass (see _functional_readiness): a smoke pass
+# exports nothing, so the capture chain is not a dependency it can fail on.
+TRANSIENT_READINESS_CHECKS = frozenset({"preflight_signals", "capture_self_check"})
 
 
 def _tail(text: str, limit: int = 200) -> str:
@@ -435,18 +438,26 @@ class LiveScenarioQueue:
                 return dict(cached)
         checks: dict[str, bool] = {}
         details: dict[str, str] = {}
-        script = self.required_paths["capture_script"]
-        try:
-            result = subprocess.run(
-                [str(script), "--self-check"],
-                capture_output=True, text=True, timeout=120,
-            )
-            checks["capture_self_check"] = result.returncode == 0
-            if result.returncode != 0:
-                details["capture_self_check"] = _tail(result.stderr or result.stdout)
-        except Exception as error:
-            checks["capture_self_check"] = False
-            details["capture_self_check"] = f"{type(error).__name__}: {error}"
+        # A smoke pass exports nothing (capture_enabled gates the work itself),
+        # so proving the capture chain would only let an unused dependency stop
+        # the batch — which is what happened on 2026-08-04, twice over a busy
+        # 119. The pass rule allows exactly this: drop what only exists to make
+        # or keep cases, never anything that decides pass/fail.
+        if capture_enabled():
+            script = self.required_paths["capture_script"]
+            try:
+                result = subprocess.run(
+                    [str(script), "--self-check"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                checks["capture_self_check"] = result.returncode == 0
+                if result.returncode != 0:
+                    details["capture_self_check"] = _tail(
+                        result.stderr or result.stdout
+                    )
+            except Exception as error:
+                checks["capture_self_check"] = False
+                details["capture_self_check"] = f"{type(error).__name__}: {error}"
         try:
             from app.incident_close import open_incident_count
 
