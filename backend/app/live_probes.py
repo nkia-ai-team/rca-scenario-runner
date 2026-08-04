@@ -123,12 +123,31 @@ APPROVED_CHECK_IDS = frozenset(
         # missing-seed-account outage. See BASELINE_PAID_ORDERS_SQL.
         "baseline-business-success",
         "target-health",
+        # F05-P starves a worker node's memory and then measures the impact on
+        # the services that node hosts. If they are not on it, the scenario is
+        # a no-op that cannot fail loudly. The manifest has asked for this check
+        # since it was written; the runner never implemented it, so F05-P died
+        # at "unknown approved check ids" instead — which is how nobody noticed
+        # that the 2026-07-28 nodeSelector pinning had moved the whole commerce
+        # cohort off the node F05-P was hogging. See WORKER_COHORT_PLACEMENT.
+        "worker-cohort-placement",
     }
 )
 
 PROMETHEUS_TEMPLATES = {
+    # kcm.node.cpu_utilization is NOT host CPU busy-ness — it tracks the pod
+    # CPU *requests* scheduled onto the node, so it sits flat wherever the
+    # scheduler left it and never moves when the CPU actually saturates.
+    # Contrast experiment on tb-w3 (2026-08-04, 2 of 4 cores burned for 150s):
+    #   /proc/stat busy          8.6% idle -> 59.9% under burn
+    #   cpu_utilization          9.2%      -> 9.0%    (blind)
+    #   system_cpu_utilization  10.6%      -> 60.6%   (tracks, within 1pp)
+    #   cpu_usage/cpu_capacity  425m/4000  -> 2424m/4000 = 60.6%
+    # F09-R aborted on `node_cpu_util < 50` and F15-P required `>= 80` against
+    # the blind series. Its memory twin does NOT have this defect (measured the
+    # same day: mem_utilization 58.3 vs 57.2 real), so only CPU moves here.
     "kcm-node-cpu-utilization-v1": (
-        'max without(grade) (kcm.node.cpu_utilization{node="%s"})'
+        'max without(grade) (kcm.node.system_cpu_utilization{node="%s"})'
     ),
     # 실측(2026-07-21): 메트릭명은 mem_utilization(memory_ 아님), 단위 퍼센트,
     # grade 라벨 중복은 max로 붕괴.
@@ -159,9 +178,14 @@ PROMETHEUS_TEMPLATES = {
     # Parameterized on 2026-07-28. It used to hardcode testbed-product, which
     # made the throttling signal exist for F12-H and for nothing else — F09-P
     # throttles testbed-inventory and was rejected before it reached PromQL.
+    # 2026-08-04: `max without(grade)` collapses the 13 grade copies but keeps
+    # `pod`, so a Deployment mid-rollout answers with one series per pod and the
+    # single-series guard rejects the read. That is exactly when these scenarios
+    # are looking: F12-H's 100m rung kills the pod, so the observation went
+    # unusable at the only ticks that mattered. Collapse everything — across
+    # pods we want the worst one, which is what max already means here.
     "kcm-pod-cpu-throttled-time-v1": (
-        'max without(grade) (kcm.pod.cpu_throttled_time{namespace="%s",'
-        'pod=~"%s-.*"})'
+        'max (kcm.pod.cpu_throttled_time{namespace="%s",pod=~"%s-.*"})'
     ),
     # Old-gen occupancy immediately after a collection, as a fraction of the
     # pool limit. This is the GC-pressure signal: a heap that cannot be reclaimed
@@ -173,11 +197,14 @@ PROMETHEUS_TEMPLATES = {
         '/ max by (service_name) (apm.agent.otel.java.jvm.memory.limit'
         '{service_name="%s",jvm_memory_pool_name="Tenured Gen"})'
     ),
+    # Same single-series collapse as the throttle template above. This one also
+    # ignored its own declared parameters and hardcoded F12-H's target, so the
+    # namespace/deployment in the manifest were decorative — any other scenario
+    # asking this question would silently have been answered about
+    # testbed-product.
     "kcm-workload-network-error-rate-v1": (
-        'max without(grade) (kcm.pod.network_rx_error{namespace="rca-testbed-commerce",'
-        'pod=~"testbed-product-.*"}) + max without(grade) '
-        '(kcm.pod.network_tx_error{namespace="rca-testbed-commerce",'
-        'pod=~"testbed-product-.*"})'
+        'max (kcm.pod.network_rx_error{namespace="%s",pod=~"%s-.*"}) '
+        '+ max (kcm.pod.network_tx_error{namespace="%s",pod=~"%s-.*"})'
     ),
     # F21-Q/P: no Tomcat-thread-pool metric exists in the APM pipeline —
     # Tomcat's http-nio-*-exec worker threads are DAEMON threads, so the
@@ -242,6 +269,25 @@ APPROVED_HIKARI_SERVICES = frozenset(
     {"food-delivery-order", "core-banking-transfer", "commerce-order"}
 )
 APPROVED_NODE_TARGETS = frozenset({"tb-w1", "tb-w2", "tb-w3"})
+# scenario_id -> (node, namespace, workloads that must actually be running on it).
+# Server-side on purpose: the scenario may not nominate the node it is about to
+# be judged against, exactly as APPROVED_K8S_TARGETS keeps selectors out of
+# manifest reach. Placement moved once already (2026-07-28) and every scenario
+# that named a node by hand went stale silently.
+WORKER_COHORT_PLACEMENT = {
+    "F05-P": (
+        "tb-w1",
+        "rca-testbed-commerce",
+        (
+            "testbed-gateway",
+            "testbed-cart",
+            "testbed-inventory",
+            "testbed-redis",
+            "testbed-kafka",
+            "testbed-payment",
+        ),
+    ),
+}
 APPROVED_BUSINESS_KEYS = frozenset({"checkout", "order-1"})
 APPROVED_K8S_TARGETS = {
     ("rca-testbed-commerce", "api-gateway"): "app=testbed-gateway",
@@ -287,6 +333,12 @@ F12_PRODUCT_TARGET = {
     "namespace": "rca-testbed-commerce",
     "deployment": "testbed-product",
     "container": "product-service",
+}
+# (namespace, deployment) allowed to be asked about pod network errors. F12-H
+# uses this as the discriminator that separates "CPU starvation" from "the
+# network broke"; the template used to hardcode this pair.
+NETWORK_ERROR_TARGETS = {
+    ("rca-testbed-commerce", "testbed-product"),
 }
 # Every Oracle lock scenario, not just F01-P. The tag used to be frozen into a
 # single contract dict *and* hand-encoded as chr() codes inside the SQL, so
@@ -732,6 +784,7 @@ class LiveProbeSet:
             "baseline-traffic": self._baseline_active,
             "baseline-business-success": self._baseline_business_succeeds,
             "target-health": self._target_healthy,
+            "worker-cohort-placement": self._worker_cohort_is_placed,
         }
         results: dict[str, bool] = {}
         errors: dict[str, str] = {}
@@ -818,6 +871,32 @@ class LiveProbeSet:
         document = json.loads(result.stdout)
         names = {item["metadata"]["name"] for item in document["items"]}
         return names == EXPECTED_KUBE_NODES
+
+    def _worker_cohort_is_placed(self) -> bool:
+        placement = WORKER_COHORT_PLACEMENT.get(self.scenario_id)
+        if placement is None:
+            raise LiveProbeError(
+                f"no worker cohort placement is registered for {self.scenario_id}"
+            )
+        node, namespace, cohort = placement
+        result = self._kubectl("get", "pods", "-n", namespace, "-o", "json")
+        document = json.loads(result.stdout)
+        hosted: dict[str, set[str]] = {}
+        for item in document["items"]:
+            app = (item["metadata"].get("labels") or {}).get("app")
+            node_name = (item.get("spec") or {}).get("nodeName")
+            if not app or not node_name:
+                continue
+            if (item.get("status") or {}).get("phase") != "Running":
+                continue
+            hosted.setdefault(app, set()).add(node_name)
+        missing = [name for name in cohort if node not in hosted.get(name, set())]
+        if missing:
+            raise LiveProbeError(
+                f"{node} does not host {sorted(missing)} — the cohort this scenario "
+                "measures is not on the node it starves"
+            )
+        return True
 
     def _baseline_active(self) -> bool:
         if self.paths.baseline_status.is_file():
@@ -988,13 +1067,14 @@ class LiveProbeSet:
                 raise LiveProbeError("GC service_name is not allowlisted")
             promql = PROMETHEUS_TEMPLATES[query.template_id] % (service, service)
         elif query.query_id == "prometheus.pod_network_error_rate":
-            expected = {
-                "namespace": F12_PRODUCT_TARGET["namespace"],
-                "deployment": F12_PRODUCT_TARGET["deployment"],
-            }
-            if dict(query.parameters) != expected:
+            if set(query.parameters) != {"namespace", "deployment"}:
+                raise LiveProbeError("network error query requires the fixed target parameters")
+            target = (query.parameters["namespace"], query.parameters["deployment"])
+            if target not in NETWORK_ERROR_TARGETS:
                 raise LiveProbeError("network error target is not allowlisted")
-            promql = PROMETHEUS_TEMPLATES[query.template_id]
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % (
+                target[0], target[1], target[0], target[1],
+            )
         elif query.query_id in {
             "prometheus.node_cpu_utilization", "prometheus.node_memory_utilization"
         }:
@@ -1018,8 +1098,18 @@ class LiveProbeSet:
         if payload.get("status") not in {None, "success"}:
             raise LiveProbeError("prometheus query did not succeed")
         result = payload["data"]["result"]
-        if len(result) != 1:
-            raise LiveProbeError("prometheus query requires exactly one series")
+        if not result:
+            # "no data" and "ambiguous data" are opposite failures with opposite
+            # repairs, and this used to report both as the same sentence. On
+            # 2026-07-31 F21-P burned a whole run with api_p95/transfer_p95/
+            # api_busy_threads reading "requires exactly one series" from the
+            # first settling tick — the APM plane was simply empty, but the
+            # message sent the reader looking for a fan-out that was not there.
+            raise LiveProbeError("prometheus query returned no series")
+        if len(result) > 1:
+            raise LiveProbeError(
+                f"prometheus query returned {len(result)} series, expected exactly one"
+            )
         timestamp, value = result[0]["value"]
         numeric = float(value)
         timestamp_value = float(timestamp)

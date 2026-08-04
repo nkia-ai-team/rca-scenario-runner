@@ -766,8 +766,8 @@ def test_f12h_fixed_apm_kcm_and_cpu_limit_queries(tmp_path) -> None:
     ]
     assert rendered == [
         'max without(grade) (apm.agent.otel.java.percentile95{service_name="commerce-product"})',
-        'max without(grade) (kcm.pod.cpu_throttled_time{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"})',
-        'max without(grade) (kcm.pod.network_rx_error{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"}) + max without(grade) (kcm.pod.network_tx_error{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"})',
+        'max (kcm.pod.cpu_throttled_time{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"})',
+        'max (kcm.pod.network_rx_error{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"}) + max (kcm.pod.network_tx_error{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"})',
     ]
 
     tampered = dict(F12_PRODUCT_TARGET)
@@ -896,6 +896,29 @@ def test_no_prometheus_template_sums_the_grade_label() -> None:
             if not re.match(r"\s*max\s+without\s*\(\s*grade", inner):
                 offenders.append((template_id, "bare sum() over an un-collapsed grade"))
     assert offenders == [], f"templates that let grade inflate the value: {offenders}"
+
+
+def test_pod_scoped_templates_collapse_to_a_single_series() -> None:
+    # `_prometheus_observation` rejects anything that answers with more than one
+    # series, so a template matching `pod=~"<deployment>-.*"` must aggregate the
+    # `pod` label away — otherwise it is fine at rest and unreadable during a
+    # rollout, which is exactly when these scenarios look. `max without(grade)`
+    # collapses grade but keeps pod: on 2026-08-04 F12-H's 100m rung killed the
+    # pod, the Deployment ran two of them, and both cpu_throttled_time and
+    # network_error_rate went unusable at every tick that mattered (live-checked
+    # on VictoriaMetrics 119:18428 — the same selector widened to two pods
+    # returns 15 series under `without(grade)` and 1 under `max()`).
+    offenders = []
+    for template_id, promql in PROMETHEUS_TEMPLATES.items():
+        if "pod=~" not in promql and "pod=" not in promql:
+            continue
+        for match in re.finditer(r"\bpod=~?", promql):
+            # Walk back to the aggregation guarding this selector.
+            head = promql[:match.start()]
+            aggregation = re.findall(r"\b(max|min|sum|avg)\s*(without\s*\(|by\s*\(|\()", head)
+            if not aggregation or aggregation[-1][1].strip() != "(":
+                offenders.append((template_id, "pod selector is not collapsed"))
+    assert offenders == [], f"templates that fan out across pods: {offenders}"
 
 
 def test_f06g_pulse_and_payment_duplicate_observations_are_run_scoped(tmp_path) -> None:

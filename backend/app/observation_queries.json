@@ -36,7 +36,7 @@
     "prometheus.user_p95": {
       "adapter": "prometheus",
       "template_id": "http-server-duration-p95-v1",
-      "freshness_sec": 60,
+      "freshness_sec": 120,
       "update_interval_sec": 60,
       "allowed_parameters": [
         "service_name"
