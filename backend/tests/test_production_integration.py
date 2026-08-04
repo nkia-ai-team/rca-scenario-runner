@@ -30,6 +30,7 @@ from app.production_runtime import (
     _configured_live_probes,
     file_sha256,
 )
+from app.coordinator import GlobalCoordinator
 from app.runner import ScenarioRunner
 
 
@@ -1129,3 +1130,69 @@ def test_capsule_repair_refuses_when_a_target_field_moves(tmp_path) -> None:
         )
     assert json.loads((run_dir / "plan.json").read_text()) == stored
     assert not (run_dir / "capsule-repair.json").exists()
+
+
+def _orphaned_dirty_run(root: Path, *, run_id: str, scenario_id: str, token: int, **overrides):
+    run_dir = root / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "lease.json").write_text(json.dumps({"run_id": run_id, "fencing_token": token}))
+    state = {
+        "run_id": run_id,
+        "scenario_id": scenario_id,
+        "status": "dirty",
+        "terminal_at": "2026-08-03T10:56:28.363300Z",
+        "level_changes": [{"applied_at": "2026-08-03T10:52:10.181024Z", "effect_ended_at": None}],
+    }
+    state.update(overrides.pop("state", {}))
+    (run_dir / "state.json").write_text(json.dumps(state))
+    cleanup = overrides.pop("cleanup", {"schema_version": 1, "cleanup": {"succeeded": False}})
+    (run_dir / "cleanup.json").write_text(json.dumps(cleanup))
+    return run_dir
+
+
+def test_orphaned_dirty_run_is_findable_once_the_coordinator_forgets_it(tmp_path):
+    # 정리를 거부당한 런은 effect_ended_at 없는 level change를 남기고, 그러면 그 구간이
+    # 영원히 열려 있어 이후 모든 런의 clean window와 겹친다. 빠져나오는 길은 외부
+    # 정리뿐인데, 코디네이터가 그 런을 잊으면 그 길마저 막힌다 — 2026-08-03의
+    # F15-T2-run-d5b1ae8a가 그 상태로 모든 라이브 시작을 막았다.
+    store = RunArtifactStore(tmp_path)
+    _orphaned_dirty_run(tmp_path, run_id="F15-T2-run-open", scenario_id="F15-T2", token=195)
+    assert store.find_orphaned_dirty_run("F15-T2") == ("F15-T2-run-open", 195)
+    assert store.find_orphaned_dirty_run("F12-H") is None
+
+
+def test_externally_cleaned_and_still_running_runs_are_not_orphans(tmp_path):
+    # 구간을 닫는 것은 외부 정리가 쓰는 평면 형태({"succeeded": true, "effect_ended_at"})
+    # 뿐이다. persist_session 이 쓰는 중첩 형태는 닫지 않는다 — 이 구분을 잃으면
+    # 이미 해소된 런까지 다시 인수해 되돌린다.
+    store = RunArtifactStore(tmp_path)
+    _orphaned_dirty_run(
+        tmp_path, run_id="F16-H-run-closed", scenario_id="F16-H", token=190,
+        cleanup={"schema_version": 1, "succeeded": True,
+                 "effect_ended_at": "2026-08-03T05:09:08.084997+00:00"},
+    )
+    assert store.find_orphaned_dirty_run("F16-H") is None
+
+    _orphaned_dirty_run(
+        tmp_path, run_id="F16-H-run-live", scenario_id="F16-H", token=191,
+        state={"status": "running"},
+    )
+    assert store.find_orphaned_dirty_run("F16-H") is None
+
+
+def test_readopt_takes_the_run_back_only_from_an_idle_coordinator(tmp_path):
+    coordinator = GlobalCoordinator(tmp_path / "coordinator.json")
+    now = datetime(2026, 8, 4, 0, tzinfo=timezone.utc)
+    dirty = coordinator.readopt_dirty(
+        run_id="F15-T2-run-open", scenario_id="F15-T2", fencing_token=195,
+        reason="readopted", now=now,
+    )
+    assert dirty.run_id == "F15-T2-run-open"
+    assert coordinator.snapshot().dirty_run is not None
+
+    # 이미 무언가를 들고 있으면 그쪽이 기록이다. 덮어쓰면 살아 있는 런을 잃는다.
+    with pytest.raises(RuntimeError, match="another dirty run"):
+        coordinator.readopt_dirty(
+            run_id="F15-T2-run-other", scenario_id="F15-T2", fencing_token=196,
+            reason="readopted", now=now,
+        )

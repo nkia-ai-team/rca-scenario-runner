@@ -149,6 +149,45 @@ class GlobalCoordinator:
             self._write(state.model_copy(update={"active_lease": None, "dirty_run": dirty}))
             return dirty
 
+    def readopt_dirty(
+        self,
+        *,
+        run_id: str,
+        scenario_id: str,
+        fencing_token: int,
+        reason: str,
+        now: datetime,
+    ) -> DirtyRun:
+        """Take back a dirty run the coordinator no longer remembers.
+
+        `mark_dirty` needs the run to still hold the lease, which is right while
+        it is running. But a run can end dirty and then have the coordinator
+        cleared out from under it by whatever took the lease next — the run's own
+        record still says dirty and its effect interval is still open, so it goes
+        on blocking every clean window with no supported way to close it.
+        Re-adopting it restores the precondition external cleanup needs.
+
+        Only from a genuinely idle coordinator: if a lease, another dirty run, or
+        a cleanup claim is live, that is the state of record and this must not
+        overwrite it.
+        """
+        with self._locked() as state:
+            if state.active_lease is not None:
+                raise RuntimeError("cannot readopt while a run holds the lease")
+            if state.dirty_run is not None:
+                raise RuntimeError("cannot readopt while another dirty run is held")
+            if state.cleanup_claim is not None:
+                raise RuntimeError("cannot readopt while a cleanup is claimed")
+            dirty = DirtyRun(
+                run_id=run_id,
+                scenario_id=scenario_id,
+                fencing_token=fencing_token,
+                reason=reason,
+                marked_at=now,
+            )
+            self._write(state.model_copy(update={"dirty_run": dirty}))
+            return dirty
+
     def claim_cleanup(
         self, *, run_id: str, fencing_token: int, claimant: str, now: datetime
     ) -> CleanupClaim:

@@ -390,6 +390,64 @@ class RunArtifactStore:
                 raise RuntimeError("capsule profile binding was modified")
         return capsule
 
+    def find_orphaned_dirty_run(self, scenario_id: str) -> tuple[str, int] | None:
+        """The newest run of this scenario that is dirty and whose effect never ended.
+
+        A run whose cleanup was refused keeps a level change with no
+        `effect_ended_at`, and `_run_intervals` then treats its interval as open
+        forever — so it overlaps every future clean window and blocks every start.
+        External cleanup is the way out, but it needs the coordinator to still be
+        holding the run as DIRTY. The coordinator forgets (a later lease clears
+        it) while the run's own record stays dirty, and then nothing can close it:
+        F15-T2-run-d5b1ae8a blocked every live start from 2026-08-03 that way.
+
+        Match on the run's own evidence rather than the coordinator's memory. The
+        cleanup shape is deliberately specific: `persist_session` writes a nested
+        {"cleanup": ...} document, while a completed external cleanup writes the
+        flat {"succeeded": true, "effect_ended_at": ...} that `_run_intervals`
+        reads. Only the latter closes the interval.
+        """
+        best: tuple[datetime, str, int] | None = None
+        if not self.root.is_dir():
+            return None
+        for run_dir in self.root.iterdir():
+            if not run_dir.is_dir():
+                continue
+            try:
+                state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+                lease = json.loads((run_dir / "lease.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if state.get("scenario_id") != scenario_id or state.get("status") != "dirty":
+                continue
+            try:
+                cleanup = json.loads((run_dir / "cleanup.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cleanup = {}
+            if cleanup.get("succeeded") is True and cleanup.get("effect_ended_at"):
+                continue
+            changes = state.get("level_changes") or []
+            if not any(
+                (change.get("applied_at") or change.get("started_at"))
+                and not (change.get("effect_ended_at") or change.get("ended_at"))
+                for change in changes
+            ):
+                continue
+            token = lease.get("fencing_token")
+            run_id = lease.get("run_id") or run_dir.name
+            if not isinstance(token, int) or token <= 0:
+                continue
+            marker = state.get("terminal_at") or state.get("created_at") or ""
+            try:
+                when = datetime.fromisoformat(marker.replace("Z", "+00:00"))
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if best is None or when > best[0]:
+                best = (when, run_id, token)
+        return None if best is None else (best[1], best[2])
+
     def bind_lease(self, run_dir: Path, *, run_id: str, fencing_token: int) -> None:
         self.verify_capsule(run_dir)
         atomic_json(

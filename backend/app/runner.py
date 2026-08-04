@@ -405,6 +405,23 @@ class ScenarioRunner:
         if self._lock.locked() or self.is_busy:
             raise RuntimeError("Another scenario is already running")
         dirty = self.coordinator.snapshot().dirty_run
+        if dirty is None:
+            # The coordinator forgets a dirty run when a later lease clears it,
+            # while the run's own record stays dirty with its effect interval
+            # open — and an open interval overlaps every future clean window, so
+            # every start is refused with check_failed:clean-window. External
+            # cleanup is the way out, and it was the one thing the forgotten
+            # state made unreachable (F15-T2-run-d5b1ae8a, 2026-08-03).
+            orphan = self.artifact_store.find_orphaned_dirty_run(scenario.id)
+            if orphan is not None:
+                run_id, fencing_token = orphan
+                dirty = self.coordinator.readopt_dirty(
+                    run_id=run_id,
+                    scenario_id=scenario.id,
+                    fencing_token=fencing_token,
+                    reason="readopted for external cleanup: effect interval never closed",
+                    now=self.clock.now(),
+                )
         if dirty is None or dirty.scenario_id != scenario.id:
             raise RuntimeError("external cleanup requires a matching DIRTY run")
         claimant = f"manual-cleanup-{uuid.uuid4().hex[:8]}"
