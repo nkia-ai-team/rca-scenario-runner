@@ -271,6 +271,57 @@ def test_must_rule_out_persisting_past_min_hold_still_aborts() -> None:
     assert aborted.reason == "must_rule_out_detected"
 
 
+def test_must_rule_out_streak_built_during_settle_does_not_confirm() -> None:
+    # F21-P run 5df51067 (2026-08-06): the k8s.patch rollout kept api_error_rate
+    # true through the whole settle window, and the first tick past min_hold
+    # confirmed a 3-tick veto on a streak with only one post-min_hold sample.
+    # Evidence gathered before min_hold must not count toward the confirmation;
+    # the veto needs consecutive_ticks of post-min_hold observations.
+    spec = _spec()
+    spec = spec.model_copy(
+        update={
+            "must_rule_out": ConditionSet.model_validate(
+                {
+                    "match": "any",
+                    "conditions": [
+                        {
+                            "id": "alternative-db-lock",
+                            "signal": "db_lock",
+                            "operator": "eq",
+                            "value": True,
+                        }
+                    ],
+                    "consecutive_ticks": 2,
+                }
+            )
+        },
+        deep=True,
+    )
+    state = start(spec)
+    settling = advance(
+        spec, state, Observation(elapsed_sec=4, signals=_safe_signals(db_lock=True))
+    )
+    assert settling.streaks["must_rule_out"] == 0
+    holding = advance(
+        spec, settling, Observation(elapsed_sec=6, signals=_safe_signals(db_lock=True))
+    )
+    assert holding.streaks["must_rule_out"] == 0
+
+    # First post-min_hold tick: one sample of genuine evidence, not two.
+    first = advance(
+        spec, holding, Observation(elapsed_sec=10, signals=_safe_signals(db_lock=True))
+    )
+    assert first.phase == ControllerPhase.EVALUATING
+    assert first.streaks["must_rule_out"] == 1
+
+    # The cause persisting into a second settled sample still aborts.
+    aborted = advance(
+        spec, first, Observation(elapsed_sec=11, signals=_safe_signals(db_lock=True))
+    )
+    assert aborted.phase == ControllerPhase.ABORTED
+    assert aborted.reason == "must_rule_out_detected"
+
+
 def test_must_rule_out_true_aborts_and_false_allows_success() -> None:
     spec = _spec()
     state = start(spec)

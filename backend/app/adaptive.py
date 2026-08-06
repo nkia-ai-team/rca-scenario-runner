@@ -236,20 +236,23 @@ def advance(
 
     if observation.elapsed_sec < level.settle_sec:
         return _transition(
-            current, ControllerPhase.SETTLING, ControllerAction.WAIT, "settling"
+            _drop_ruleout_streak(current), ControllerPhase.SETTLING, ControllerAction.WAIT, "settling"
         )
     if observation.elapsed_sec < level.min_hold_sec:
         return _transition(
-            current, ControllerPhase.EVALUATING, ControllerAction.WAIT, "min_hold"
+            _drop_ruleout_streak(current), ControllerPhase.EVALUATING, ControllerAction.WAIT, "min_hold"
         )
 
     # Alternative-cause veto is judged only once the injection has settled past
     # min_hold. Injections that deliberately restart the target pod (k8s.env,
     # k8s.probe) drive pod_ready=false transiently during the expected restart;
     # evaluating must_rule_out before min_hold aborted those runs on their own
-    # injection mechanism. A genuine alternative cause (pod never recovers) keeps
-    # the streak alive past min_hold and still aborts here; immediate dangers are
-    # already handled by the abort set above.
+    # injection mechanism. The streak is also dropped while settling (above), so
+    # the confirmation below is carried by consecutive_ticks of post-min_hold
+    # evidence alone — F21-P run 5df51067 was vetoed one tick past min_hold on a
+    # streak built almost entirely from its own rollout transient. A genuine
+    # alternative cause still aborts here, at most consecutive_ticks-1 ticks
+    # later; immediate dangers are already handled by the abort set above.
     if _confirmed(spec.must_rule_out, streaks, "must_rule_out"):
         return _transition(
             current,
@@ -400,6 +403,22 @@ def _independence_sec(
     if not intervals:
         return 0
     return max(intervals) if condition_set.match == "all" else min(intervals)
+
+
+def _drop_ruleout_streak(state: ControllerState) -> ControllerState:
+    """Zero the must_rule_out streak while the level has not passed min_hold.
+
+    7eb9391 deferred the veto's *judgment* past min_hold but let its *evidence*
+    keep accumulating through the settle window, so the first post-min_hold tick
+    could confirm on a streak the injection's own transient had built. Dropping
+    the streak here makes ``consecutive_ticks`` mean post-min_hold observations,
+    which is what the deferral promised in the first place.
+    """
+    streaks = dict(state.streaks)
+    streaks["must_rule_out"] = 0
+    marks = dict(state.streak_marks)
+    marks.pop("must_rule_out", None)
+    return state.model_copy(update={"streaks": streaks, "streak_marks": marks}, deep=True)
 
 
 def _updated_streaks(
