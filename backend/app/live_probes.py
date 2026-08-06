@@ -191,11 +191,35 @@ PROMETHEUS_TEMPLATES = {
     # pool limit. This is the GC-pressure signal: a heap that cannot be reclaimed
     # keeps climbing here even though used/committed look busy either way.
     # jvm.gc.duration is not collected, so this stands in for it (F09-H).
+    #
+    # Divide per pod (host_name), THEN aggregate. The old form aggregated
+    # numerator and denominator independently with max by (service_name), so
+    # during a rollout — which is exactly what a k8s.env heap injection causes —
+    # it divided one pod's used_after_last_gc by another pod's limit. VM's 5min
+    # staleness lookback kept dead pods alive longer than the 4m min_hold, so
+    # the query never once read a single pod cleanly: run 4cc52147's "0.324" was
+    # a baseline pod's numerator over an injected pod's denominator, while the
+    # real heap-160 pod sat at 0.5085 (measured 2026-08-06). last_over_time[90s]
+    # is what actually enforces freshness — the registry's freshness_sec never
+    # reaches PromQL.
     "otel-jvm-old-gen-after-gc-ratio-v1": (
-        'max by (service_name) (apm.agent.otel.java.jvm.memory.used_after_last_gc'
-        '{service_name="%s",jvm_memory_pool_name="Tenured Gen"}) '
-        '/ max by (service_name) (apm.agent.otel.java.jvm.memory.limit'
-        '{service_name="%s",jvm_memory_pool_name="Tenured Gen"})'
+        'max('
+        'max by (host_name) (last_over_time(apm.agent.otel.java.jvm.memory.used_after_last_gc'
+        '{service_name="%s",jvm_memory_pool_name="Tenured Gen"}[90s]))'
+        ' / '
+        'max by (host_name) (last_over_time(apm.agent.otel.java.jvm.memory.limit'
+        '{service_name="%s",jvm_memory_pool_name="Tenured Gen"}[90s]))'
+        ')'
+    ),
+    # Smallest live pod's Tenured limit in MiB — a noise-free step function
+    # (256Mi heap -> 170.69, 208 -> 138.69, 160 -> 106.69; SerialGC NewRatio=2).
+    # Reads "did the heap injection actually land": run 4793c9f4 froze at the
+    # baseline ratio for its whole run because the rollout never delivered an
+    # injected pod into the query's view, and no ratio threshold can express
+    # that (a fresh baseline pod legitimately reads 0.29).
+    "otel-jvm-tenured-limit-mib-v1": (
+        'min(max by (host_name) (last_over_time(apm.agent.otel.java.jvm.memory.limit'
+        '{service_name="%s",jvm_memory_pool_name="Tenured Gen"}[90s]))) / 1048576'
     ),
     # Same single-series collapse as the throttle template above. This one also
     # ignored its own declared parameters and hardcoded F12-H's target, so the
@@ -1081,6 +1105,13 @@ class LiveProbeSet:
             if service not in APPROVED_GC_SERVICES:
                 raise LiveProbeError("GC service_name is not allowlisted")
             promql = PROMETHEUS_TEMPLATES[query.template_id] % (service, service)
+        elif query.query_id == "prometheus.jvm_tenured_limit_mib":
+            if set(query.parameters) != {"service_name"}:
+                raise LiveProbeError("GC ratio query requires the fixed service parameter")
+            service = query.parameters["service_name"]
+            if service not in APPROVED_GC_SERVICES:
+                raise LiveProbeError("GC service_name is not allowlisted")
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % service
         elif query.query_id == "prometheus.pod_network_error_rate":
             if set(query.parameters) != {"namespace", "deployment"}:
                 raise LiveProbeError("network error query requires the fixed target parameters")

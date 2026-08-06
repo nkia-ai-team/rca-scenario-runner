@@ -647,6 +647,15 @@
         "service_name"
       ]
     },
+    "prometheus.jvm_tenured_limit_mib": {
+      "adapter": "prometheus",
+      "template_id": "otel-jvm-tenured-limit-mib-v1",
+      "freshness_sec": 60,
+      "update_interval_sec": 60,
+      "allowed_parameters": [
+        "service_name"
+      ]
+    },
     "clickhouse.service_error_rate": {
       "adapter": "clickhouse",
       "template_id": "trace-service-error-rate-v1",
