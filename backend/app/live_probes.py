@@ -999,9 +999,9 @@ class LiveProbeSet:
         return float(value), _parse_time(document["observed_at"]), source
 
     def _http_observation(self, query: ApprovedQuery) -> tuple[int, datetime, str]:
-        if query.parameters:
-            raise LiveProbeError("unsupported http query")
         if query.query_id == "http.target_health":
+            if query.parameters:
+                raise LiveProbeError("unsupported http query")
             response = self.http_client("GET", TARGET_HEALTH_URL, timeout=5.0)
             status = int(response["status"])
             if not 0 <= status <= 599:
@@ -1009,11 +1009,26 @@ class LiveProbeSet:
             return status, _response_time(response, self.clock), "http:target-health"
         if query.query_id != "http.entry_health":
             raise LiveProbeError("unsupported http query")
-        document = self._loadgen_live_document()
+        # `domain` reads the standing baseline unit's document instead of the
+        # scenario's own k6 output — the only entry view that survives when the
+        # scenario has no load companion (F14-P, F15-P, F15-T1) or when the
+        # injection destroys the journey's own step precondition (F16-H: killing
+        # testbed-user login means the scenario k6 never emits a checkout, so
+        # its own entry_status stays null for the whole run, 2026-08-06). The
+        # baseline unit keeps a pre-fault token cache and keeps probing. Same
+        # switch _loadgen_observation already has; do NOT fork a new query_id
+        # for this (the LOADGEN_FIELDS fork is what broke F06-P).
+        if set(query.parameters) - {"domain"}:
+            raise LiveProbeError("unsupported http query")
+        domain = query.parameters.get("domain")
+        document = (
+            self._baseline_live_document(domain) if domain else self._loadgen_live_document()
+        )
         status = document.get("entry_status")
         if isinstance(status, bool) or not isinstance(status, int) or not 0 <= status <= 599:
             raise LiveProbeError("checkout entry status is unavailable")
-        return status, _parse_time(document["observed_at"]), "k6:checkout-entry-status"
+        source = f"k6:baseline:{domain}:entry_status" if domain else "k6:checkout-entry-status"
+        return status, _parse_time(document["observed_at"]), source
 
     def _prometheus_observation(self, query: ApprovedQuery) -> tuple[float, datetime, str]:
         if query.template_id not in PROMETHEUS_TEMPLATES:

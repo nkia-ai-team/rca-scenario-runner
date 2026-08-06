@@ -24,7 +24,9 @@
       "request_ref": "scenario.entry_health",
       "freshness_sec": 15,
       "update_interval_sec": 0,
-      "allowed_parameters": []
+      "allowed_parameters": [
+        "domain"
+      ]
     },
     "http.target_health": {
       "adapter": "http_probe",

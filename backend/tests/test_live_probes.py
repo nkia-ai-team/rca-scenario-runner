@@ -1122,6 +1122,32 @@ def test_loadgen_domain_parameter_reads_the_resident_baseline_document(tmp_path)
     assert unscoped["value"] == 0.125 and unscoped["source"] == "k6:checkout_5xx_rate"
 
 
+def test_entry_health_domain_parameter_reads_the_resident_baseline_document(tmp_path) -> None:
+    """The entry view that survives when the scenario cannot produce its own.
+
+    F16-H kills testbed-user's readiness, so the scenario k6's checkout journey
+    aborts before its first request and the scenario's own entry_status stays
+    null for the entire run — the safety observation starved and every run
+    aborted (52/52 ticks, 2026-08-06). F14-P/F15-P/F15-T1 have no load
+    companion at all, so their own document never exists. The standing baseline
+    unit keeps a pre-fault token cache and keeps probing, so `domain` reads it.
+    """
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    _write_baseline(probes, "commerce", entry_status=502)
+
+    scoped = probes.observe(
+        registry.bind({"query_id": "http.entry_health", "parameters": {"domain": "commerce"}})
+    )
+    unscoped = probes.observe(registry.bind({"query_id": "http.entry_health"}))
+
+    assert scoped["quality"] == "good" and scoped["value"] == 502
+    assert scoped["source"] == "k6:baseline:commerce:entry_status"
+    # No parameters keeps the historical behaviour byte-for-byte.
+    assert unscoped["source"] == "k6:checkout-entry-status"
+
+
 def test_business_invariant_also_reads_the_resident_baseline_document(tmp_path) -> None:
     """The one instrument the 07-29 split left behind.
 
