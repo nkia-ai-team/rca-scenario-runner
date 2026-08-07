@@ -225,8 +225,24 @@ PROMETHEUS_TEMPLATES = {
         '(max without(grade) '
         '(max_over_time(apm.agent.otel.java.span_count{service_name="%s"}[60s])) > 0)'
     ),
+    # Same publisher, same two defects as the percentile gauge above, and the
+    # same guard. Measured 2026-08-07: error_rate also arrives as ~24 samples
+    # sharing one minute-boundary timestamp, so a plain instant read draws an
+    # arbitrary point of the minute's running aggregate, and an empty window
+    # publishes 0 — which for an error *rate* reads as "this service is healthy"
+    # at exactly the moment it stopped serving. That is the false-negative
+    # direction the ClickHouse twin had.
+    #
+    # No controller binds prometheus.apm_service_error_rate today (the trace-table
+    # query clickhouse.service_error_rate is what the scenarios use), so this is
+    # closed while the blast radius is zero rather than left for whoever wires it
+    # next and inherits the bug silently.
     "apm-agent-error-rate-v1": (
-        'max without(grade) (apm.agent.otel.java.error_rate{service_name="%s"})'
+        'max without(grade) '
+        '(max_over_time(apm.agent.otel.java.error_rate{service_name="%s"}[60s]))'
+        ' and on(service_name) '
+        '(max without(grade) '
+        '(max_over_time(apm.agent.otel.java.span_count{service_name="%s"}[60s])) > 0)'
     ),
     # The bare sum() this used until 2026-07-30 also summed `grade`, which the
     # APM pipeline fans every series out across (13 copies of one measurement —
@@ -1157,13 +1173,9 @@ class LiveProbeSet:
             service = query.parameters["service_name"]
             if service not in APPROVED_APM_SERVICES:
                 raise LiveProbeError("APM service_name is not allowlisted")
-            # p95 names the service twice — once for the value, once for the
-            # span-count guard it is joined against; error_rate names it once.
-            promql = PROMETHEUS_TEMPLATES[query.template_id] % (
-                (service, service)
-                if query.query_id == "prometheus.apm_service_p95"
-                else service
-            )
+            # Both name the service twice — once for the value, once for the
+            # span-count guard it is joined against.
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % (service, service)
         elif query.query_id == "prometheus.hikari_pending_connections":
             if set(query.parameters) != {"service_name"}:
                 raise LiveProbeError("Hikari pending query requires the fixed service parameter")
@@ -1242,13 +1254,15 @@ class LiveProbeSet:
             # api_busy_threads reading "requires exactly one series" from the
             # first settling tick — the APM plane was simply empty, but the
             # message sent the reader looking for a fan-out that was not there.
-            if query.query_id == "prometheus.apm_service_p95":
+            if query.query_id in {
+                "prometheus.apm_service_p95", "prometheus.apm_service_error_rate"
+            }:
                 # The span-count guard in the template turns "the window carried
                 # no completed transaction" into this same empty result, and that
                 # is the common case by far — say so, or the reader goes looking
                 # for a missing APM series that is sitting right there.
                 raise LiveProbeError(
-                    "APM p95 has no usable sample: the service completed no transaction in "
+                    "APM gauge has no usable sample: the service completed no transaction in "
                     "the last 60s, or the APM series is absent"
                 )
             raise LiveProbeError("prometheus query returned no series")

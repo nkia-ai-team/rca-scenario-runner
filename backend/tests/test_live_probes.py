@@ -978,12 +978,17 @@ def test_apm_p95_collapses_the_minute_sample_cluster_deterministically() -> None
     # keeps an arbitrary one. Without a range collapse the reader walks the
     # partial curve at random; with `last` the collapse is still undefined
     # (measured 08:23Z: last_over_time gave 235.7 where the cluster ended 366.43).
-    promql = PROMETHEUS_TEMPLATES["apm-agent-percentile95-v1"]
-    assert "max_over_time" in promql and "last_over_time" not in promql
-    # The value and its guard must share one window, or they sample different
-    # sub-samples of the same minute and the guard decides on the wrong one.
-    assert promql.count("[60s]") == 2
-    assert "apm.agent.otel.java.span_count" in promql and "> 0" in promql
+    # Both APM gauges come from the same publisher and carry the same two
+    # defects, so the guard is asserted on both — error_rate has no controller
+    # binding it today, and an unguarded template is exactly what the next
+    # scenario to wire it would inherit without noticing.
+    for template_id in ("apm-agent-percentile95-v1", "apm-agent-error-rate-v1"):
+        promql = PROMETHEUS_TEMPLATES[template_id]
+        assert "max_over_time" in promql and "last_over_time" not in promql, template_id
+        # The value and its guard must share one window, or they sample different
+        # sub-samples of the same minute and the guard decides on the wrong one.
+        assert promql.count("[60s]") == 2, template_id
+        assert "apm.agent.otel.java.span_count" in promql and "> 0" in promql, template_id
 
 
 def test_no_prometheus_template_sums_the_grade_label() -> None:
