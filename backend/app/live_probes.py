@@ -158,8 +158,48 @@ PROMETHEUS_TEMPLATES = {
         'histogram_quantile(0.95, sum by (le) '
         '(rate(http_server_request_duration_seconds_bucket{service_name=~"%s"}[2m])))'
     ),
+    # Two defects in one read, both measured 2026-08-07 against VictoriaMetrics.
+    #
+    # (1) The APM agent republishes a *running* aggregate every ~2.5s but stamps
+    # every publication of a minute with that minute's boundary, so one series
+    # carries ~24 samples at one identical timestamp. VM keeps an arbitrary one,
+    # so a plain instant read lands anywhere on the minute's partial curve —
+    # including the leading 0.0 published before the minute's first transaction
+    # completed. commerce-payment at 08:17Z: a single timestamp holding
+    # 19.82/61.27/146.3/262.52 with span_count climbing 1..7 alongside. F20-R
+    # run fa6749a8 (05:07-05:18Z) is the same disease: the raw read gave
+    # 0.0/39389/46503/30016/20467/30010/... while the collapsed read gives a flat
+    # 43128/45390/46503/44530/30501/30518/... — the underlying signal never
+    # oscillated, only the read did, and the sawtooth left order_p95>=1500 with
+    # six qualifying ticks but never two in a row against consecutive_ticks: 3.
+    # max_over_time collapses the cluster deterministically. `max` and not
+    # `last`: samples sharing a timestamp have no defined order, and
+    # last_over_time returned 235.7 where the cluster's final value was 366.43
+    # (08:23Z). The running p95 is non-decreasing in practice as the minute
+    # fills, so the max is the completed minute.
+    #
+    # (2) A window that completed no transaction still publishes p95=0, which is
+    # indistinguishable *in this series* from a genuinely instant response — so
+    # "p95==0 is unusable" cannot be decided from p95 alone. span_count over the
+    # same window is the discriminator, and `and on(...)` evaluates it at the
+    # same instant over the same window rather than as a second racing read
+    # (a separate instant query would draw its own arbitrary sub-sample: at
+    # 05:07Z the raw span_count read 0 while the minute in fact carried 3 spans).
+    # No samples -> empty result -> LiveProbeError -> unusable, which is the
+    # defensive side: a withheld read holds the judgement, while a fake 0.0 both
+    # breaks consecutive-tick gates and can *satisfy* an `lt` escalate condition
+    # and drive a level change on absent traffic.
+    #
+    # The 60s window is also what enforces freshness here, exactly as in the GC
+    # ratio template below: it is stricter than the registry's 120s
+    # freshness_sec, which never reaches PromQL, so a read that returns at all
+    # is necessarily fresh.
     "apm-agent-percentile95-v1": (
-        'max without(grade) (apm.agent.otel.java.percentile95{service_name="%s"})'
+        'max without(grade) '
+        '(max_over_time(apm.agent.otel.java.percentile95{service_name="%s"}[60s]))'
+        ' and on(service_name) '
+        '(max without(grade) '
+        '(max_over_time(apm.agent.otel.java.span_count{service_name="%s"}[60s])) > 0)'
     ),
     "apm-agent-error-rate-v1": (
         'max without(grade) (apm.agent.otel.java.error_rate{service_name="%s"})'
@@ -1072,7 +1112,13 @@ class LiveProbeSet:
             service = query.parameters["service_name"]
             if service not in APPROVED_APM_SERVICES:
                 raise LiveProbeError("APM service_name is not allowlisted")
-            promql = PROMETHEUS_TEMPLATES[query.template_id] % service
+            # p95 names the service twice — once for the value, once for the
+            # span-count guard it is joined against; error_rate names it once.
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % (
+                (service, service)
+                if query.query_id == "prometheus.apm_service_p95"
+                else service
+            )
         elif query.query_id == "prometheus.hikari_pending_connections":
             if set(query.parameters) != {"service_name"}:
                 raise LiveProbeError("Hikari pending query requires the fixed service parameter")
@@ -1151,6 +1197,15 @@ class LiveProbeSet:
             # api_busy_threads reading "requires exactly one series" from the
             # first settling tick — the APM plane was simply empty, but the
             # message sent the reader looking for a fan-out that was not there.
+            if query.query_id == "prometheus.apm_service_p95":
+                # The span-count guard in the template turns "the window carried
+                # no completed transaction" into this same empty result, and that
+                # is the common case by far — say so, or the reader goes looking
+                # for a missing APM series that is sitting right there.
+                raise LiveProbeError(
+                    "APM p95 has no usable sample: the service completed no transaction in "
+                    "the last 60s, or the APM series is absent"
+                )
             raise LiveProbeError("prometheus query returned no series")
         if len(result) > 1:
             raise LiveProbeError(

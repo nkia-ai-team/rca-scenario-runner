@@ -61,6 +61,7 @@ class Fakes:
         self.database_calls: list[tuple[str, tuple[str, ...], dict]] = []
         self.paid_orders = 120
         self.clickhouse_value = 96.3636
+        self.prometheus_result = [{"value": [NOW.timestamp(), "0.321"]}]
 
     def process(self, argv, **kwargs):
         argv = list(argv)
@@ -204,7 +205,7 @@ class Fakes:
         if url == PROMETHEUS_URL:
             return {
                 "status": 200,
-                "json": {"data": {"result": [{"value": [NOW.timestamp(), "0.321"]}]}},
+                "json": {"data": {"result": self.prometheus_result}},
             }
         if url == CLICKHOUSE_URL:
             return {"status": 200, "json": {"data": [{"value": self.clickhouse_value}]}}
@@ -765,7 +766,11 @@ def test_f12h_fixed_apm_kcm_and_cpu_limit_queries(tmp_path) -> None:
         if method == "POST" and url == PROMETHEUS_URL
     ]
     assert rendered == [
-        'max without(grade) (apm.agent.otel.java.percentile95{service_name="commerce-product"})',
+        'max without(grade) '
+        '(max_over_time(apm.agent.otel.java.percentile95{service_name="commerce-product"}[60s]))'
+        ' and on(service_name) '
+        '(max without(grade) '
+        '(max_over_time(apm.agent.otel.java.span_count{service_name="commerce-product"}[60s])) > 0)',
         'max (kcm.pod.cpu_throttled_time{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"})',
         'max (kcm.pod.network_rx_error{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"}) + max (kcm.pod.network_tx_error{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"})',
     ]
@@ -799,7 +804,10 @@ def test_gateway_apm_p95_is_an_approved_live_observation(tmp_path) -> None:
     rendered = parse_qs(fakes.http_calls[-1][2]["body"].decode())["query"][0]
     assert rendered == (
         'max without(grade) '
-        '(apm.agent.otel.java.percentile95{service_name="commerce-gateway"})'
+        '(max_over_time(apm.agent.otel.java.percentile95{service_name="commerce-gateway"}[60s]))'
+        ' and on(service_name) '
+        '(max without(grade) '
+        '(max_over_time(apm.agent.otel.java.span_count{service_name="commerce-gateway"}[60s])) > 0)'
     )
 
 
@@ -869,6 +877,53 @@ def test_jvm_daemon_thread_count_is_approved_for_f21_targets(tmp_path) -> None:
         "(apm.agent.otel.java.jvm.thread.count"
         '{service_name="core-banking-api",jvm_thread_daemon="true"}))'
     )
+
+
+def test_apm_p95_withholds_the_zero_of_a_transaction_free_window(tmp_path) -> None:
+    # The APM agent publishes p95=0 for an aggregation window that completed no
+    # transaction, and the runner used to read that 0 as a good, usable latency.
+    # F20-R run fa6749a8 (2026-08-07 05:07-05:18Z) died of it: the raw Prometheus
+    # series was large and steady the whole time (39389/46503/30016/20466/30010/
+    # 30008/33988/30005/19981/27992ms) but the reads sawtoothed to 0.0, so
+    # order_p95>=1500 had six qualifying ticks and never two in a row against
+    # consecutive_ticks: 3. p95 alone cannot tell that 0 from a genuinely instant
+    # response, so the template joins the span count of the same window and the
+    # empty-window read is withheld rather than answered.
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    query = ApprovedQueryRegistry.from_path().bind(
+        {
+            "query_id": "prometheus.apm_service_p95",
+            "parameters": {"service_name": "commerce-order"},
+        }
+    )
+
+    # A window with traffic answers normally — including a genuinely small p95,
+    # which must stay a value and not be swept up by the guard.
+    fakes.prometheus_result = [{"value": [NOW.timestamp(), "0.4"]}]
+    observed = probes.observe(query)
+    assert observed["quality"] == "good" and observed["value"] == 0.4
+
+    # No spans in the window: the `and on(...)` join drops the sample server-side
+    # and the probe reports unusable instead of inventing a latency of zero.
+    fakes.prometheus_result = []
+    withheld = probes.observe(query)
+    assert withheld["quality"] == "error" and withheld["value"] is None
+    assert "completed no transaction" in withheld["error"]
+
+
+def test_apm_p95_collapses_the_minute_sample_cluster_deterministically() -> None:
+    # Every publication of a minute carries that minute's boundary timestamp, so
+    # ~24 samples of the running aggregate share one timestamp and VictoriaMetrics
+    # keeps an arbitrary one. Without a range collapse the reader walks the
+    # partial curve at random; with `last` the collapse is still undefined
+    # (measured 08:23Z: last_over_time gave 235.7 where the cluster ended 366.43).
+    promql = PROMETHEUS_TEMPLATES["apm-agent-percentile95-v1"]
+    assert "max_over_time" in promql and "last_over_time" not in promql
+    # The value and its guard must share one window, or they sample different
+    # sub-samples of the same minute and the guard decides on the wrong one.
+    assert promql.count("[60s]") == 2
+    assert "apm.agent.otel.java.span_count" in promql and "> 0" in promql
 
 
 def test_no_prometheus_template_sums_the_grade_label() -> None:
