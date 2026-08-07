@@ -99,14 +99,38 @@ CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
 #
 # Verified against the 2026-07-28 23:55 commerce-payment outage window:
 # food-delivery-order 96.3636% (53/55), food-delivery-dispatch 35.2941% (18/51).
+# `HAVING count() > 0` rather than the `if(count() = 0, 0, ...)` this carried until
+# 2026-08-07. That fold answered "no spans in the window" with an error rate of
+# 0.0 — a manufactured clean bill of health for a service that produced no
+# evidence at all. It is the same defect as the APM percentile gauge publishing 0
+# for an empty window (see apm-agent-percentile95-v1), but it lands in the
+# opposite and worse direction: p95=0 breaks a `gte` gate, while error_rate=0
+# *satisfies* the "this alternative cause is not happening" reading. Every
+# consumer of this query is a discriminator asking exactly that question, so the
+# window where a service dies and stops emitting spans is the window where it was
+# reported healthy.
+#
+# Measured over the runs still inside ClickHouse trace retention (2026-08-04
+# onward), reconstructing each tick's 60s window from per-second span counts:
+# F19-P 87 zero-ticks of which 34 had no spans at all (12 consecutive at worst),
+# F20-R 13 of 90, F20-Q 2 of 22, F06-P 1 of 64. The `success`-role consumers are
+# nearly clean (F01-P 2 of 40, F08-P/F06-H/F17-R 0) because they only read the
+# service their own load is driving.
+#
+# Zero rows now reach _clickhouse_observation as an empty result and become a
+# LiveProbeError, i.e. unusable — the same contract the APM guard uses. Unusable
+# in a must_rule_out set holds the judgement rather than answering it, and that is
+# the defensible side: "the discriminator could not be read" is a true statement,
+# "the alternative cause is absent" was not.
 CLICKHOUSE_TEMPLATES = {
     "trace-service-error-rate-v1": (
-        "SELECT if(count() = 0, 0, round(100.0 * countIf("
+        "SELECT round(100.0 * countIf("
         "toUInt16OrZero(span_attributes['http.response.status_code']) >= 500"
-        ") / count(), 4)) AS value "
+        ") / count(), 4) AS value "
         "FROM lucida.otel_traces_local "
         "WHERE service_name = '%s' AND span_kind = 'SERVER' "
         "AND timestamp > now() - INTERVAL 60 SECOND "
+        "HAVING count() > 0 "
         "FORMAT JSON"
     ),
 }
@@ -1267,6 +1291,14 @@ class LiveProbeSet:
         )
         payload = _response_json(response)
         rows = payload.get("data")
+        if isinstance(rows, list) and not rows:
+            # The HAVING guard in the template turns "no SERVER span in the 60s
+            # window" into zero rows. Name it, or the reader hunts for a broken
+            # query when the service simply produced nothing to judge.
+            raise LiveProbeError(
+                "trace error rate has no usable sample: the service produced no "
+                "SERVER span in the last 60s"
+            )
         if not isinstance(rows, list) or len(rows) != 1:
             raise LiveProbeError("clickhouse query requires exactly one row")
         numeric = float(rows[0]["value"])

@@ -32,6 +32,7 @@ from app.live_probes import (
     KAFKA_LAG_CONTRACT,
     PAYMENT_DUPLICATE_SINCE_T1_SQL,
     KUBECONFIG,
+    CLICKHOUSE_TEMPLATES,
     CLICKHOUSE_URL,
     PROMETHEUS_TEMPLATES,
     PROMETHEUS_URL,
@@ -63,6 +64,7 @@ class Fakes:
         self.database_calls: list[tuple[str, tuple[str, ...], dict]] = []
         self.paid_orders = 120
         self.clickhouse_value = 96.3636
+        self.clickhouse_rows = None
         self.prometheus_result = [{"value": [NOW.timestamp(), "0.321"]}]
 
     def process(self, argv, **kwargs):
@@ -210,7 +212,12 @@ class Fakes:
                 "json": {"data": {"result": self.prometheus_result}},
             }
         if url == CLICKHOUSE_URL:
-            return {"status": 200, "json": {"data": [{"value": self.clickhouse_value}]}}
+            rows = (
+                self.clickhouse_rows
+                if self.clickhouse_rows is not None
+                else [{"value": self.clickhouse_value}]
+            )
+            return {"status": 200, "json": {"data": rows}}
         raise AssertionError(url)
 
     def database(self, sql, parameters, **kwargs):
@@ -879,6 +886,46 @@ def test_jvm_daemon_thread_count_is_approved_for_f21_targets(tmp_path) -> None:
         "(apm.agent.otel.java.jvm.thread.count"
         '{service_name="core-banking-api",jvm_thread_daemon="true"}))'
     )
+
+
+def test_trace_error_rate_withholds_the_zero_of_a_span_free_window(tmp_path) -> None:
+    # `if(count() = 0, 0, ...)` used to answer "no spans at all" with an error
+    # rate of 0.0. Every consumer of this query is a discriminator asking "is this
+    # other service the real cause", so a manufactured 0 reads as "ruled out" at
+    # exactly the moment the service was too dead to emit a span — a false
+    # negative, which is worse than the APM twin where a fake 0 merely broke a
+    # `gte` streak. Reconstructed from per-second span counts over the runs inside
+    # ClickHouse retention: F19-P had 34 such ticks of 87, 12 consecutive at worst.
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    query = ApprovedQueryRegistry.from_path().bind(
+        {
+            "query_id": "clickhouse.service_error_rate",
+            "parameters": {"service_name": "food-delivery-payment"},
+        }
+    )
+
+    # A window with spans answers normally, including a genuine 0.0 — traffic that
+    # is healthy must stay a value, or the discriminator never rules anything out.
+    fakes.clickhouse_rows = [{"value": 0.0}]
+    observed = probes.observe(query)
+    assert observed["quality"] == "good" and observed["value"] == 0.0
+
+    # No SERVER span in the window: HAVING drops the row server-side and the probe
+    # reports unusable instead of inventing a clean bill of health.
+    fakes.clickhouse_rows = []
+    withheld = probes.observe(query)
+    assert withheld["quality"] == "error" and withheld["value"] is None
+    assert "no SERVER span" in withheld["error"]
+
+
+def test_no_clickhouse_template_folds_an_empty_window_to_a_value() -> None:
+    # The guard has to live in SQL, not in Python: the adapter only sees rows, so
+    # any template that collapses count() = 0 to a number has already destroyed
+    # the distinction before the runner can act on it.
+    for template_id, sql in CLICKHOUSE_TEMPLATES.items():
+        assert "count() = 0" not in sql, f"{template_id} folds an empty window to a value"
+        assert "HAVING count() > 0" in sql, f"{template_id} does not withhold an empty window"
 
 
 def test_restock_window_agrees_between_the_contract_and_the_sql() -> None:
