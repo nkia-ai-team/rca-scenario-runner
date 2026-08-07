@@ -322,6 +322,57 @@ def test_must_rule_out_streak_built_during_settle_does_not_confirm() -> None:
     assert aborted.reason == "must_rule_out_detected"
 
 
+def test_escalate_streak_built_during_settle_does_not_confirm() -> None:
+    """F05-R run 14fc63f9 (2026-08-07): the rung was abandoned 6s before it worked.
+
+    An escalate condition states "the effect has not appeared yet" — F05-R's is
+    `restart_count == 0`, i.e. "the OOM has not landed". That is *necessarily*
+    true while the injection is still working, so the streak charged to full
+    during settle+min_hold and fired on the first tick min_hold allowed. The
+    640Mi rung was dropped at elapsed 140s; payment OOMed at ~146s, then vanished
+    for 70s while checkout returned 91 5xx and zero 200s — the exact success
+    condition — with no ticks recorded for any of it.
+
+    Same hole 0eec7ed closed for must_rule_out; escalation must likewise be
+    carried by consecutive_ticks of post-min_hold observations.
+    """
+    spec = _spec()
+    state = start(spec)
+
+    # error_rate 0.0 makes the escalate condition (`< 0.05`) true from tick one,
+    # exactly as "the OOM has not landed yet" is true from tick one.
+    settling = advance(spec, state, Observation(elapsed_sec=4, signals=_safe_signals()))
+    assert settling.phase == ControllerPhase.SETTLING
+    assert settling.streaks["escalate"] == 0
+
+    holding = advance(spec, settling, Observation(elapsed_sec=6, signals=_safe_signals()))
+    assert holding.reason == "min_hold"
+    assert holding.streaks["escalate"] == 0
+
+    # First post-min_hold tick is one sample, not two: the rung must be kept.
+    first = advance(spec, holding, Observation(elapsed_sec=10, signals=_safe_signals()))
+    assert first.phase == ControllerPhase.EVALUATING
+    assert first.level_id == "low", "rung abandoned on pre-min_hold evidence"
+    assert first.streaks["escalate"] == 1
+
+    # A genuinely weak rung still escalates one sample later.
+    escalated = advance(spec, first, Observation(elapsed_sec=11, signals=_safe_signals()))
+    assert escalated.action == ControllerAction.ESCALATE
+    assert escalated.level_id == "high"
+
+
+def test_escalate_still_fires_when_the_rung_is_genuinely_weak() -> None:
+    # The fix defers escalation; it must not disable it. A rung that never
+    # produces the effect still gets abandoned, just on post-min_hold evidence.
+    spec = _spec()
+    state = start(spec)
+    tick = advance(spec, state, Observation(elapsed_sec=6, signals=_safe_signals()))
+    for elapsed in (10, 11):
+        tick = advance(spec, tick, Observation(elapsed_sec=elapsed, signals=_safe_signals()))
+    assert tick.level_id == "high"
+    assert tick.reason == "escalate_condition"
+
+
 def test_must_rule_out_true_aborts_and_false_allows_success() -> None:
     spec = _spec()
     state = start(spec)

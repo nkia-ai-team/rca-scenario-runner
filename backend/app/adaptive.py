@@ -236,11 +236,11 @@ def advance(
 
     if observation.elapsed_sec < level.settle_sec:
         return _transition(
-            _drop_ruleout_streak(current), ControllerPhase.SETTLING, ControllerAction.WAIT, "settling"
+            _drop_pending_streaks(current), ControllerPhase.SETTLING, ControllerAction.WAIT, "settling"
         )
     if observation.elapsed_sec < level.min_hold_sec:
         return _transition(
-            _drop_ruleout_streak(current), ControllerPhase.EVALUATING, ControllerAction.WAIT, "min_hold"
+            _drop_pending_streaks(current), ControllerPhase.EVALUATING, ControllerAction.WAIT, "min_hold"
         )
 
     # Alternative-cause veto is judged only once the injection has settled past
@@ -266,6 +266,11 @@ def advance(
             current, ControllerPhase.SUCCEEDED, ControllerAction.SUCCEED, "success"
         )
 
+    # Escalation is carried by post-min_hold observations only: an escalate
+    # condition says "the effect has not appeared yet", which is trivially true
+    # while the injection is still working, so a streak charged during
+    # settle+min_hold would abandon every rung the instant min_hold expires.
+    # See _drop_pending_streaks (F05-R run 14fc63f9: gave up 6s before the OOM).
     if (
         not safety_unknown
         and not safety_pending
@@ -405,19 +410,35 @@ def _independence_sec(
     return max(intervals) if condition_set.match == "all" else min(intervals)
 
 
-def _drop_ruleout_streak(state: ControllerState) -> ControllerState:
-    """Zero the must_rule_out streak while the level has not passed min_hold.
+def _drop_pending_streaks(state: ControllerState) -> ControllerState:
+    """Zero the must_rule_out and escalate streaks while the level is pre-min_hold.
 
     7eb9391 deferred the veto's *judgment* past min_hold but let its *evidence*
     keep accumulating through the settle window, so the first post-min_hold tick
     could confirm on a streak the injection's own transient had built. Dropping
     the streak here makes ``consecutive_ticks`` mean post-min_hold observations,
-    which is what the deferral promised in the first place.
+    which is what the deferral promised in the first place (0eec7ed).
+
+    2026-08-07: escalate had the identical hole, and F05-R run 14fc63f9 paid for
+    it. Its escalate condition is `restart_count == 0` — "the OOM has not landed
+    yet" — which is *necessarily* true while the injection is still working, so
+    the streak charges to full during settle+min_hold and fires on the first tick
+    min_hold allows. The 640Mi rung was abandoned at elapsed 140s; payment OOMed
+    at ~146s. Six seconds. The rung worked: for the next 70s payment was gone
+    entirely and checkout returned 91 5xx and zero 200s — the exact success
+    condition — but by then the controller had moved on and logged no ticks at
+    all for that window.
+
+    This generalises to every escalate condition of the form "the effect has not
+    appeared yet", which is what an escalate condition *is*. Deferring the
+    judgment past min_hold while letting the evidence accrue before it means
+    min_hold never protects the rung it was added to protect.
     """
     streaks = dict(state.streaks)
-    streaks["must_rule_out"] = 0
     marks = dict(state.streak_marks)
-    marks.pop("must_rule_out", None)
+    for gate in ("must_rule_out", "escalate"):
+        streaks[gate] = 0
+        marks.pop(gate, None)
     return state.model_copy(update={"streaks": streaks, "streak_marks": marks}, deep=True)
 
 
