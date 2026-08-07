@@ -1659,3 +1659,27 @@ def test_f15r_flap_and_f15t1_food_payment_observations(tmp_path) -> None:
         )
     )
     assert tagged["quality"] == "good" and tagged["value"] == 3
+
+
+def test_node_utilization_templates_read_the_system_series() -> None:
+    """노드 사용률은 pod/cgroup 회계가 아니라 실제 시스템 값을 읽어야 한다.
+
+    `kcm.node.cpu_utilization` / `kcm.node.mem_utilization` 은 파드 회계 기준이라
+    **파드 밖에서 도는 주입**(ssh 로 띄운 memhog·stress-ng·yes 루프)을 보지 못한다.
+    CPU 는 2026-08-04 에 교체됐고, 메모리는 그때 "같은 병이 아니다"로 남겨졌다가
+    2026-08-07 F05-P run 1f444bc5 에서 반증됐다 — 08-04 대조가 **파드 밖 메모리 부하
+    없이** 이뤄져 두 계열이 같아 보였을 뿐이다. 같은 노드·같은 창 실측:
+
+        18:22  system_mem_utilization 51.80%   mem_utilization 55.35%
+        18:23                         93.12%                   52.02%
+        18:29                         93.74%                   46.85%
+
+    5500MiB 단이 성공 임계 92% 를 6분 반 유지했는데 컨트롤러는 46% 를 봤고, 그래서
+    노드를 죽이는 6250MiB 단으로 승급했다. 이 두 시나리오(F05-P·F15-P)에서 이 신호는
+    success·escalate·must_rule_out·recovery **네 게이트 전부**를 굴린다.
+    """
+    from app.live_probes import PROMETHEUS_TEMPLATES
+
+    for template_id in ("kcm-node-cpu-utilization-v1", "kcm-node-memory-utilization-v1"):
+        promql = PROMETHEUS_TEMPLATES[template_id]
+        assert ".system_" in promql, f"{template_id} 가 파드 회계 계열을 읽는다: {promql}"

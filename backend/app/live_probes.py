@@ -168,15 +168,29 @@ PROMETHEUS_TEMPLATES = {
     #   system_cpu_utilization  10.6%      -> 60.6%   (tracks, within 1pp)
     #   cpu_usage/cpu_capacity  425m/4000  -> 2424m/4000 = 60.6%
     # F09-R aborted on `node_cpu_util < 50` and F15-P required `>= 80` against
-    # the blind series. Its memory twin does NOT have this defect (measured the
-    # same day: mem_utilization 58.3 vs 57.2 real), so only CPU moves here.
+    # the blind series.
+    #
+    # 2026-08-07: the memory twin DOES have this defect. The 08-04 note here said
+    # it did not ("mem_utilization 58.3 vs 57.2 real"), but that comparison was
+    # made without a pod-external memory load — at rest both series read the same
+    # system number, so they look equivalent. They only diverge once something
+    # outside the pod accounting allocates. F05-P run 1f444bc5 measured it, same
+    # node (tb-w1), same window, 5500MiB memhog:
+    #   18:22  system_mem_utilization 51.80%   mem_utilization 55.35%
+    #   18:23                         93.12%                   52.02%  <- diverge
+    #   18:29                         93.74%                   46.85%
+    # mem_usage/mem_capacity = 45.80% matches mem_utilization, which pins it as
+    # pod/cgroup-scoped accounting. memhog is an ssh-launched process outside any
+    # pod, so that accounting cannot see it — exactly the CPU story.
+    # The rung reached and held the 92% success threshold for 6.5 minutes and the
+    # controller saw 46%; it escalated into 6250MiB, which killed the node.
     "kcm-node-cpu-utilization-v1": (
         'max without(grade) (kcm.node.system_cpu_utilization{node="%s"})'
     ),
     # 실측(2026-07-21): 메트릭명은 mem_utilization(memory_ 아님), 단위 퍼센트,
-    # grade 라벨 중복은 max로 붕괴.
+    # grade 라벨 중복은 max로 붕괴. 2026-08-07: system_ 계열로 교체(위 참조).
     "kcm-node-memory-utilization-v1": (
-        'max without(grade) (kcm.node.mem_utilization{node="%s"})'
+        'max without(grade) (kcm.node.system_mem_utilization{node="%s"})'
     ),
     "http-server-duration-p95-v1": (
         'histogram_quantile(0.95, sum by (le) '
