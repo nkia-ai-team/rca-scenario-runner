@@ -644,9 +644,29 @@ INVENTORY_STOCK_CONTRACT = {
 INVENTORY_ZERO_STOCK_SQL = (
     "SELECT count(*) AS zero_stock_count FROM inventory_schema.inventory WHERE stock = 0"
 )
-# F23-R must_rule_out companion: RESTOCK movement rows in the last 12 minutes
-# (batch period 10m + margin) — zero rows means the reconciliation batch has
-# stopped running, not merely that stock hasn't hit zero yet.
+# F23-R must_rule_out companion: RESTOCK movement rows in the recent window —
+# zero rows means the reconciliation batch has stopped running, not merely that
+# stock hasn't hit zero yet.
+#
+# The lookback has to stay a small multiple of the batch period or the
+# discriminator goes blind in the direction that matters: rows written before the
+# injection keep answering "still running" long after the batch has stopped.
+# testbed-services 52f23b6 rescaled restock from a 600s burst to a 60s steady
+# supply, which made the 12m window (10m period + margin) a stale scale, and the
+# registry moved to 5.
+#
+# The window is defined once here because the contract and the SQL are compared
+# and executed separately: parameters must match the registry *exactly*
+# (`!= RESTOCK_MOVEMENT_CONTRACT` below) while the SQL is a module constant keyed
+# into production_runtime's PARAMETERLESS_DATABASE_PROBES, so it cannot be built
+# from the parameters the way the ledger window is. Editing one and not the other
+# does not fail loudly — it rejects every tick at runtime.
+#
+# The wider lesson from 2026-08-07: a registry parameter change needs the runner's
+# allowlist contract to move with it. Synchronizing the four faces inside
+# testbed-services still leaves this fifth one in another repo, and the only thing
+# that catches it is test_every_live_controller_observation_passes_the_probe_allowlists.
+RESTOCK_MOVEMENT_WINDOW_MINUTES = 5
 RESTOCK_MOVEMENT_CONTRACT = {
     "db_host": "192.168.122.77",
     "db_port": 30432,
@@ -655,11 +675,12 @@ RESTOCK_MOVEMENT_CONTRACT = {
     "schema": "inventory_schema",
     "table": "inventory_movements",
     "movement_type": "RESTOCK",
-    "window_minutes": 12,
+    "window_minutes": RESTOCK_MOVEMENT_WINDOW_MINUTES,
 }
 RESTOCK_MOVEMENT_SQL = (
     "SELECT count(*) AS restock_count FROM inventory_schema.inventory_movements "
-    "WHERE movement_type = 'RESTOCK' AND created_at >= now() - interval '12 minutes'"
+    "WHERE movement_type = 'RESTOCK' AND created_at >= now() - interval "
+    f"'{RESTOCK_MOVEMENT_WINDOW_MINUTES} minutes'"
 )
 DEPLOYMENT_REPLICAS_CONTRACT = {
     "namespace": "rca-testbed-commerce",

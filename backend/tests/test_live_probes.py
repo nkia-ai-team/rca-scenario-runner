@@ -26,7 +26,9 @@ from app.live_probes import (
     INVENTORY_STOCK_CONTRACT,
     INVENTORY_ZERO_STOCK_SQL,
     RESTOCK_MOVEMENT_CONTRACT,
+    RESTOCK_MOVEMENT_CONTRACT,
     RESTOCK_MOVEMENT_SQL,
+    RESTOCK_MOVEMENT_WINDOW_MINUTES,
     KAFKA_LAG_CONTRACT,
     PAYMENT_DUPLICATE_SINCE_T1_SQL,
     KUBECONFIG,
@@ -877,6 +879,17 @@ def test_jvm_daemon_thread_count_is_approved_for_f21_targets(tmp_path) -> None:
         "(apm.agent.otel.java.jvm.thread.count"
         '{service_name="core-banking-api",jvm_thread_daemon="true"}))'
     )
+
+
+def test_restock_window_agrees_between_the_contract_and_the_sql() -> None:
+    # These two are checked and executed in different places — the parameters are
+    # compared for exact equality against the registry, the SQL is a module
+    # constant keyed into PARAMETERLESS_DATABASE_PROBES — so a one-sided edit is
+    # silent until it rejects every tick at runtime. testbed-services 52f23b6
+    # narrowed F23-R's window 12 -> 5 with the batch period 600s -> 60s and the
+    # runner stayed at 12, which disqualified the observation on every tick.
+    assert RESTOCK_MOVEMENT_CONTRACT["window_minutes"] == RESTOCK_MOVEMENT_WINDOW_MINUTES
+    assert f"interval '{RESTOCK_MOVEMENT_WINDOW_MINUTES} minutes'" in RESTOCK_MOVEMENT_SQL
 
 
 def test_apm_p95_withholds_the_zero_of_a_transaction_free_window(tmp_path) -> None:
