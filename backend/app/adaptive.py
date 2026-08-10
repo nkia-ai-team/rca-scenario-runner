@@ -442,6 +442,33 @@ def _drop_pending_streaks(state: ControllerState) -> ControllerState:
     return state.model_copy(update={"streaks": streaks, "streak_marks": marks}, deep=True)
 
 
+# Gates whose streak survives an *unreadable* sample (as opposed to a sample
+# that genuinely missed the threshold).
+#
+# `success` counts damage that has already been observed. A gauge going blind
+# does not un-observe it. And the gauges go blind precisely when the injection
+# bites hardest: an APM percentile has no sample when the service completes no
+# transaction, which is by design (publishing 0 for an empty window broke `gte`
+# gates, so the probe reports "unusable" instead). Treating that identically to
+# "the threshold was not met" made success hardest to confirm exactly where the
+# damage was worst — measured on 2026-08-09: F15-H `commerce_order_p95`
+# unusable 21/53 ticks with all three conditions otherwise satisfied (streak
+# never passed 1), F05-P's four-tick success window broken by one unreadable
+# `checkout_5xx_rate` mid-window.
+#
+# `abort` and `must_rule_out` are deliberately excluded. They assert "this is
+# dangerous" / "another cause is present"; an unreadable sample is not evidence
+# for either, so they keep resetting (fail-closed). The asymmetry is the point.
+_HOLD_ON_UNKNOWN = frozenset({"success"})
+
+# How stale held evidence may get before it is discarded, in multiples of the
+# gate's independence window. Without a bound, success could be confirmed across
+# an arbitrarily long observation gap — the real risk this exception carries.
+# With independence 0 (a signal re-queried every tick) the bound is 0, so an
+# unreadable sample resets immediately, which is the pre-existing behaviour.
+_UNKNOWN_HOLD_FACTOR = 2
+
+
 def _updated_streaks(
     streaks: dict[str, int],
     marks: dict[str, int],
@@ -451,16 +478,26 @@ def _updated_streaks(
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Advance each gate's streak, counting independent samples rather than ticks.
 
-    Three outcomes per gate: a false/unknown result resets it, a true result on
-    fresh evidence advances it, and a true result that can only be re-reading the
-    previous sample holds it where it is. Holding rather than advancing is what
-    makes ``consecutive_ticks`` mean consecutive *observations* — before this the
-    tick interval (15s) outpaced every prometheus metric (60s), so a three-tick
-    confirmation could be satisfied inside a single sample.
+    Four outcomes per gate: a false result resets it, an unreadable result resets
+    it too *unless* the gate holds on unknown (see ``_HOLD_ON_UNKNOWN``), a true
+    result on fresh evidence advances it, and a true result that can only be
+    re-reading the previous sample holds it where it is. Holding rather than
+    advancing is what makes ``consecutive_ticks`` mean consecutive
+    *observations* — before this the tick interval (15s) outpaced every
+    prometheus metric (60s), so a three-tick confirmation could be satisfied
+    inside a single sample.
     """
     updated = dict(streaks)
     updated_marks = dict(marks)
     for name, result in results.items():
+        if result is None and name in _HOLD_ON_UNKNOWN:
+            mark = updated_marks.get(name)
+            if mark is None or updated.get(name, 0) == 0:
+                continue  # nothing accrued yet, so nothing to hold
+            if elapsed_sec - mark > _UNKNOWN_HOLD_FACTOR * independence.get(name, 0):
+                updated[name] = 0
+                updated_marks.pop(name, None)
+            continue
         if result is not True:
             updated[name] = 0
             updated_marks.pop(name, None)

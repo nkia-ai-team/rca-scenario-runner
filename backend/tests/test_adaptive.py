@@ -175,6 +175,84 @@ def test_streak_resets_rather_than_holds_when_the_condition_stops_matching() -> 
     assert state.streaks["success"] == 1
 
 
+def test_success_streak_survives_an_unreadable_sample_but_a_miss_still_resets() -> None:
+    """An unreadable gauge is not evidence that the damage stopped.
+
+    The APM percentile has no sample when the service completes no transaction,
+    which is by design. Before this, that reset the success streak — so success
+    was hardest to confirm exactly where the injection bit hardest. Measured
+    2026-08-09: F15-H had all three success conditions satisfied while
+    ``commerce_order_p95`` was unusable 21/53 ticks and the streak never passed 1.
+    """
+    spec = _spec(mode=AdaptiveMode.EVALUATION)
+    blind = {**_value(None), "update_interval_sec": 60}
+
+    state = start(spec)
+    state = advance(spec, state, Observation(elapsed_sec=15, signals=_safe_signals(
+        error_rate=0.2, update_interval_sec=60)))
+    assert state.streaks["success"] == 1
+    # The gauge goes blind. The damage already counted is not un-observed.
+    state = advance(spec, state, Observation(
+        elapsed_sec=30, signals={**_safe_signals(update_interval_sec=60), "error_rate": blind}))
+    assert state.streaks["success"] == 1, "an unreadable sample must not erase counted evidence"
+    # A genuine miss still resets — this exception is about *unreadable*, not *below threshold*.
+    state = advance(spec, state, Observation(elapsed_sec=45, signals=_safe_signals(
+        error_rate=0.0, update_interval_sec=60)))
+    assert state.streaks["success"] == 0
+
+
+def test_held_success_evidence_is_discarded_once_it_goes_stale() -> None:
+    """Holding without a bound would confirm success across an observation gap.
+
+    That is the real risk this exception carries, so the hold expires at
+    ``_UNKNOWN_HOLD_FACTOR`` independence windows past the last advance.
+    """
+    spec = _spec(mode=AdaptiveMode.EVALUATION)  # single level, timeout 45s
+    blind = {**_value(None), "update_interval_sec": 10}
+
+    state = start(spec)
+    state = advance(spec, state, Observation(elapsed_sec=15, signals=_safe_signals(
+        error_rate=0.2, update_interval_sec=10)))
+    assert state.streaks["success"] == 1
+    # 10s independence x factor 2 = 20s of grace, measured from the last advance (15s).
+    state = advance(spec, state, Observation(
+        elapsed_sec=35, signals={**_safe_signals(update_interval_sec=10), "error_rate": blind}))
+    assert state.streaks["success"] == 1, "still inside the grace window"
+    state = advance(spec, state, Observation(
+        elapsed_sec=36, signals={**_safe_signals(update_interval_sec=10), "error_rate": blind}))
+    assert state.streaks["success"] == 0, "evidence older than the bound is discarded"
+
+
+def test_abort_and_must_rule_out_still_reset_on_an_unreadable_sample() -> None:
+    """The asymmetry is the point — a veto must stay fail-closed.
+
+    ``success`` counts damage already seen; ``abort``/``must_rule_out`` assert
+    that something dangerous or an alternative cause *is happening*. An
+    unreadable sample is not evidence for either claim.
+    """
+    base = _spec(mode=AdaptiveMode.EVALUATION).model_dump()
+    base["abort"] = {
+        "match": "any",
+        "conditions": [{"id": "entry-dark", "signal": "health", "operator": "eq", "value": False}],
+        "consecutive_ticks": 2,
+    }
+    spec = AdaptiveSpec.model_validate(base)
+    slow_health = {"update_interval_sec": 60}
+
+    state = start(spec)
+    state = advance(spec, state, Observation(elapsed_sec=15, signals={
+        **_safe_signals(update_interval_sec=60),
+        "health": {**_value(False), **slow_health},
+    }))
+    assert state.streaks["abort"] == 1
+    state = advance(spec, state, Observation(elapsed_sec=30, signals={
+        **_safe_signals(update_interval_sec=60),
+        "health": {**_value(None), **slow_health},
+    }))
+    assert state.streaks["abort"] == 0, "a veto must not accrue across an unreadable sample"
+    assert state.phase is not ControllerPhase.ABORTED
+
+
 def test_schema_matches_calibration_and_evaluation_contract() -> None:
     assert _spec().mode == AdaptiveMode.CALIBRATION
     assert _spec(mode=AdaptiveMode.EVALUATION).mode == AdaptiveMode.EVALUATION
