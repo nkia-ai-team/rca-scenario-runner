@@ -706,6 +706,7 @@ class LiveScenarioQueue:
             if verdict is not None:
                 self._write_preflight(run.run_id, verdict)
             self._write_normal_segment_marker(run.run_id)
+            self._write_batch_marker(run.run_id, state)
             state = state.model_copy(
                 update={
                     "current_scenario_id": scenario_id,
@@ -1607,6 +1608,40 @@ class LiveScenarioQueue:
         path = self.runner.artifact_store.root / run_id / "normal-segment.path"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"{segment}\n", encoding="utf-8")
+
+    def _write_batch_marker(self, run_id: str, state: LiveQueueState) -> None:
+        """Record which batch this run belongs to, inside the run's own artifacts.
+
+        Without this the batch is only reconstructible from the queue state, which
+        holds one batch at a time — once the next batch starts, the previous run's
+        membership is gone. Comparing batches then means guessing from timestamps,
+        and on 2026-08-09 three different guesses were all wrong: "the last N runs"
+        pulled in runs from outside the batch, a one-hour gap detector missed the
+        ~13 minute inter-batch pause, and fixed-size windows skewed because a batch
+        retries some scenarios (F20-R ran three times inside one batch).
+
+        Fail-open: a marker that cannot be written must never stop a run.
+        """
+        if state.queue_id is None:
+            return
+        try:
+            path = self.runner.artifact_store.root / run_id / "batch.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "queue_id": state.queue_id,
+                        "index": state.next_index,
+                        "started_at": state.started_at,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            return
 
     def _controller_evidence_error(self, run_id: str) -> str | None:
         state_path = self.runner.artifact_store.root / run_id / "state.json"

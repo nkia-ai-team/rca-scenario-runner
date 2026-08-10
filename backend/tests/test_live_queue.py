@@ -175,6 +175,29 @@ async def test_smoke_pass_releases_the_capture_window_isolation_gates(
 
 
 @pytest.mark.asyncio
+async def test_every_run_records_which_batch_it_belongs_to(tmp_path: Path) -> None:
+    """배치 소속은 런 자신의 아티팩트에 남아야 한다.
+
+    큐 상태는 한 번에 한 배치만 들고 있어서, 다음 배치가 시작되면 이전 런의 소속이
+    사라진다. 그러면 배치 비교가 타임스탬프 추측이 되는데, 2026-08-09 에 세 가지
+    추측이 모두 틀렸다 — "최근 N개"는 배치 밖 런을 끌어왔고, 1시간 공백 탐지는
+    ~13분짜리 배치 간 간격을 못 봤고, 고정 크기 윈도는 배치 안 재시도(F20-R 이 한
+    배치에서 세 번 실행) 때문에 어긋났다.
+    """
+    queue, runner, _, _, _ = make_queue(tmp_path)
+    state = await queue.start()
+    state = await queue.tick()
+    run_id = state.current_run_id
+
+    marker = runner.artifact_store.root / run_id / "batch.json"
+    assert marker.is_file(), "런이 자기 배치 소속을 기록하지 않았다"
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    assert recorded["queue_id"] == state.queue_id
+    assert recorded["index"] == 0
+    assert recorded["started_at"] == state.started_at
+
+
+@pytest.mark.asyncio
 async def test_fixed_sequence_waits_for_capture_and_two_hour_clean_window(tmp_path: Path) -> None:
     queue, runner, _, scheduler, clock = make_queue(tmp_path)
     state = await queue.start()
@@ -196,7 +219,7 @@ async def test_fixed_sequence_waits_for_capture_and_two_hour_clean_window(tmp_pa
 
     scheduler.jobs[run_id].status = "completed"
     capture = runner.artifact_store.root / run_id / "capture-complete.json"
-    capture.parent.mkdir(parents=True)
+    capture.parent.mkdir(parents=True, exist_ok=True)
     capture.write_text("{}\n", encoding="utf-8")
     runner.current = None
     state = await queue.tick()
