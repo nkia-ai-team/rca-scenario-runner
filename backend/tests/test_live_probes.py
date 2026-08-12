@@ -776,10 +776,12 @@ def test_f12h_fixed_apm_kcm_and_cpu_limit_queries(tmp_path) -> None:
     ]
     assert rendered == [
         'max without(grade) '
-        '(max_over_time(apm.agent.otel.java.percentile95{service_name="commerce-product"}[60s]))'
+        '(max_over_time(apm.agent.otel.java.percentile95'
+        '{service_name="commerce-product"}[60s] offset 30s))'
         ' and on(service_name) '
         '(max without(grade) '
-        '(max_over_time(apm.agent.otel.java.span_count{service_name="commerce-product"}[60s])) > 0)',
+        '(max_over_time(apm.agent.otel.java.span_count'
+        '{service_name="commerce-product"}[60s] offset 30s)) > 0)',
         'max (last_over_time(kcm.pod.cpu_throttled_time'
         '{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"}[120s]))',
         'max (last_over_time(kcm.pod.network_rx_error'
@@ -817,10 +819,12 @@ def test_gateway_apm_p95_is_an_approved_live_observation(tmp_path) -> None:
     rendered = parse_qs(fakes.http_calls[-1][2]["body"].decode())["query"][0]
     assert rendered == (
         'max without(grade) '
-        '(max_over_time(apm.agent.otel.java.percentile95{service_name="commerce-gateway"}[60s]))'
+        '(max_over_time(apm.agent.otel.java.percentile95'
+        '{service_name="commerce-gateway"}[60s] offset 30s))'
         ' and on(service_name) '
         '(max without(grade) '
-        '(max_over_time(apm.agent.otel.java.span_count{service_name="commerce-gateway"}[60s])) > 0)'
+        '(max_over_time(apm.agent.otel.java.span_count'
+        '{service_name="commerce-gateway"}[60s] offset 30s)) > 0)'
     )
 
 

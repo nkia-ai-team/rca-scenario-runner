@@ -268,12 +268,36 @@ PROMETHEUS_TEMPLATES = {
     # ratio template below: it is stricter than the registry's 120s
     # freshness_sec, which never reaches PromQL, so a read that returns at all
     # is necessarily fresh.
+    # 2026-08-12: `offset 30s` 추가. 창 폭 60초는 그대로다.
+    #
+    # 이 게이지는 "지금 이 순간"을 물으면 값이 아직 도착하지 않아 자주 빈다. 원인은
+    # 창 정렬이 아니라 **적재 지연**이다 — 그래서 과거 시각으로 재조회하면 결손이
+    # 재현되지 않는다(그 사이 적재가 끝나 있다). 실시간으로 재야 보인다.
+    # commerce-order, 10초 간격 30 표본, 2026-08-12 실측:
+    #
+    #     현행 [60s]        결손  7/30 = 23%
+    #     [60s] offset 15s  결손  2/30 =  7%
+    #     [60s] offset 30s  결손  0/30 =  0%
+    #
+    # 결손은 그냥 손실이 아니라 **판정을 되돌린다**: 스트릭은 독립 표본을 세는데
+    # consecutive_ticks 2~3 을 채우는 동안 하나만 비어도 D0 의 hold 상한(2x독립창)을
+    # 넘기면 0 으로 리셋된다. 7차 사이클에서 F15-H(25/53 unusable)·F15-T2(35/72)가
+    # 스트릭 1 을 못 넘었고, F20-R 은 escalate 틱에 결손이 떨어져
+    # decision_observation_unavailable 로 abort 했다 — 수리 4종 중 셋이 이것으로 죽었다.
+    #
+    # 백로그 #23 은 offset 15s 를 권고했고 당시 실측은 결손 0% 였다. 지금은 15s 로
+    # 7% 가 남는다 — 지연이 커졌다. 값을 그대로 옮겨오지 말고 다시 잴 것.
+    # 창을 넓히는 것은 여전히 금지다(폭 60초는 항상 정확히 한 분 클러스터를 고르지만
+    # 90초는 둘을 걸쳐 max_over_time 이 나쁜 분을 회복 후에도 붙든다). offset 은 폭을
+    # 건드리지 않는다. 대가는 위반·회복이 **똑같이** 30초 늦는 균일 이동이다.
     "apm-agent-percentile95-v1": (
         'max without(grade) '
-        '(max_over_time(apm.agent.otel.java.percentile95{service_name="%s"}[60s]))'
+        '(max_over_time(apm.agent.otel.java.percentile95'
+        '{service_name="%s"}[60s] offset 30s))'
         ' and on(service_name) '
         '(max without(grade) '
-        '(max_over_time(apm.agent.otel.java.span_count{service_name="%s"}[60s])) > 0)'
+        '(max_over_time(apm.agent.otel.java.span_count'
+        '{service_name="%s"}[60s] offset 30s)) > 0)'
     ),
     # Same publisher, same two defects as the percentile gauge above, and the
     # same guard. Measured 2026-08-07: error_rate also arrives as ~24 samples
@@ -289,10 +313,12 @@ PROMETHEUS_TEMPLATES = {
     # next and inherits the bug silently.
     "apm-agent-error-rate-v1": (
         'max without(grade) '
-        '(max_over_time(apm.agent.otel.java.error_rate{service_name="%s"}[60s]))'
+        '(max_over_time(apm.agent.otel.java.error_rate'
+        '{service_name="%s"}[60s] offset 30s))'
         ' and on(service_name) '
         '(max without(grade) '
-        '(max_over_time(apm.agent.otel.java.span_count{service_name="%s"}[60s])) > 0)'
+        '(max_over_time(apm.agent.otel.java.span_count'
+        '{service_name="%s"}[60s] offset 30s)) > 0)'
     ),
     # The bare sum() this used until 2026-07-30 also summed `grade`, which the
     # APM pipeline fans every series out across (13 copies of one measurement —
@@ -1317,7 +1343,7 @@ class LiveProbeSet:
                 # for a missing APM series that is sitting right there.
                 raise LiveProbeError(
                     "APM gauge has no usable sample: the service completed no transaction in "
-                    "the last 60s, or the APM series is absent"
+                    "the 60s window ending 30s ago, or the APM series is absent"
                 )
             raise LiveProbeError("prometheus query returned no series")
         if len(result) > 1:

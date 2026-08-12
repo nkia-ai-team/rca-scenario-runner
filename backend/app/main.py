@@ -15,6 +15,7 @@ from app.coordinator import get_coordinator
 from app.manifests import ScenarioManifest, get_manifest, load_manifests
 from app.watchdog import WatchdogDecision, WatchdogRequest, decide_watchdog
 from app.live_queue import LiveQueueState, OperationalReadiness, get_live_queue
+from app.pass_mode import isolation_checks_enabled
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -134,7 +135,21 @@ async def api_get_scenario(scenario_id: str) -> Scenario:
 async def api_run(scenario_id: str) -> RunInfo:
     runner = get_runner()
     try:
-        return await runner.start(scenario_id=scenario_id, mode="run")
+        # 큐(live_queue.py:702)와 같은 판단을 쓴다. 이 엔드포인트만 pass mode 를
+        # 읽지 않아, smoke pass 에서 큐는 통과하는 런이 단독 실행으로는
+        # check_failed:clean-window 로 거부됐다 — 같은 시나리오·같은 클러스터·같은
+        # 순간인데 진입 경로에 따라 답이 갈렸다. isolation 게이트는 capture 창 쌍을
+        # 떼어놓기 위한 것이고 smoke pass 에는 그 쌍이 없다(pass_mode.py:82-87).
+        #
+        # 2026-08-12 에 이걸로 4종 단독 재실행이 통째로 막혔다. 겸사겸사 드러난 것:
+        # 08-07~09 의 F15-T2 런 넷이 status=dirty / effect_ended=None 으로 닫히지
+        # 않아 227 개 런의 overlapping_run_ids 에 영구히 들어간다. 게이트가 켜져
+        # 있었더라도 아무도 통과하지 못했을 상태다(별건으로 남긴다).
+        return await runner.start(
+            scenario_id=scenario_id,
+            mode="run",
+            skip_isolation_checks=not isolation_checks_enabled(),
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
