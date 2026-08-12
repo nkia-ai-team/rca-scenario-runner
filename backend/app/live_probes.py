@@ -158,6 +158,40 @@ APPROVED_CHECK_IDS = frozenset(
     }
 )
 
+# 2026-08-11: every template here now reads through a range selector, and that
+# is a contract (test_every_prometheus_template_bounds_its_own_staleness), not a
+# style. An *instant* PromQL read cannot tell "this is the current value" from
+# "this is the last value VictoriaMetrics still remembers" — VM answers an
+# instant query from its 5-minute staleness lookback, and the timestamp it
+# returns is the **evaluation** time, not the sample's. So the probe stamps
+# observed_at = now on a sample that may be minutes old, and every downstream
+# freshness check (the registry's freshness_sec included) is answered by a clock
+# that is telling the truth about the wrong thing.
+#
+# The gauges go blind exactly when the injection bites hardest, which is when
+# the node stops shipping metrics at all. F05-P run dcf596e9 (6th batch), rung
+# mem-6250, measured against VM directly:
+#
+#   06:12:00 -> 06:19:30   94.35 .. 95.38 %   (rung mem-5500, healthy reporting)
+#   06:20:00 -> 06:21:00   49.49 %            (rung mem-6250 starts, 3 samples)
+#   06:21:30 -> 06:26:30   -- no samples --   <- the whole damage window
+#   06:27:00 ->            46.32 %            (node recovered)
+#
+# The runner read 49.4902299532 for 14 consecutive ticks with usable=True while
+# observed_at advanced 06:21:09 -> 06:24:49 — a 229-second-old sample served as
+# fresh, on a node that was returning 502s with a 16.8s gateway p95. success
+# needed node_mem_util >= 92 (unreachable) and escalate fired on < 92, so the
+# ladder climbed away from the rung that was working.
+#
+# Window = 2x the metric's measured sample spacing, so one missed scrape is
+# tolerated and a real hole is caught:
+#   kcm.node.* / kcm.pod.*                 60s spacing -> [120s]
+#   db.client.* / apm.agent.otel.java.*    10s spacing -> [60s]
+# (measured 2026-08-11 via max(count_over_time(<metric>[10m])) against VM.)
+# No samples in the window -> empty result -> LiveProbeError -> unusable, which
+# is the fail-closed side: a withheld read holds the judgement, a stale read
+# decides it wrongly. The templates that already carried max_over_time /
+# last_over_time were correct for this reason and are unchanged.
 PROMETHEUS_TEMPLATES = {
     # kcm.node.cpu_utilization is NOT host CPU busy-ness — it tracks the pod
     # CPU *requests* scheduled onto the node, so it sits flat wherever the
@@ -185,12 +219,14 @@ PROMETHEUS_TEMPLATES = {
     # The rung reached and held the 92% success threshold for 6.5 minutes and the
     # controller saw 46%; it escalated into 6250MiB, which killed the node.
     "kcm-node-cpu-utilization-v1": (
-        'max without(grade) (kcm.node.system_cpu_utilization{node="%s"})'
+        'max without(grade) '
+        '(last_over_time(kcm.node.system_cpu_utilization{node="%s"}[120s]))'
     ),
     # 실측(2026-07-21): 메트릭명은 mem_utilization(memory_ 아님), 단위 퍼센트,
     # grade 라벨 중복은 max로 붕괴. 2026-08-07: system_ 계열로 교체(위 참조).
     "kcm-node-memory-utilization-v1": (
-        'max without(grade) (kcm.node.system_mem_utilization{node="%s"})'
+        'max without(grade) '
+        '(last_over_time(kcm.node.system_mem_utilization{node="%s"}[120s]))'
     ),
     "http-server-duration-p95-v1": (
         'histogram_quantile(0.95, sum by (le) '
@@ -267,7 +303,8 @@ PROMETHEUS_TEMPLATES = {
     # then sum across pools/instances as before.
     "otel-hikari-pending-v1": (
         'sum(max without(grade) '
-        '(db.client.connections.pending_requests{service_name="%s"}))'
+        '(last_over_time(db.client.connections.pending_requests'
+        '{service_name="%s"}[60s])))'
     ),
     # Parameterized on 2026-07-28. It used to hardcode testbed-product, which
     # made the throttling signal exist for F12-H and for nothing else — F09-P
@@ -279,7 +316,8 @@ PROMETHEUS_TEMPLATES = {
     # unusable at the only ticks that mattered. Collapse everything — across
     # pods we want the worst one, which is what max already means here.
     "kcm-pod-cpu-throttled-time-v1": (
-        'max (kcm.pod.cpu_throttled_time{namespace="%s",pod=~"%s-.*"})'
+        'max (last_over_time(kcm.pod.cpu_throttled_time'
+        '{namespace="%s",pod=~"%s-.*"}[120s]))'
     ),
     # Old-gen occupancy immediately after a collection, as a fraction of the
     # pool limit. This is the GC-pressure signal: a heap that cannot be reclaimed
@@ -321,8 +359,10 @@ PROMETHEUS_TEMPLATES = {
     # asking this question would silently have been answered about
     # testbed-product.
     "kcm-workload-network-error-rate-v1": (
-        'max (kcm.pod.network_rx_error{namespace="%s",pod=~"%s-.*"}) '
-        '+ max (kcm.pod.network_tx_error{namespace="%s",pod=~"%s-.*"})'
+        'max (last_over_time(kcm.pod.network_rx_error'
+        '{namespace="%s",pod=~"%s-.*"}[120s])) '
+        '+ max (last_over_time(kcm.pod.network_tx_error'
+        '{namespace="%s",pod=~"%s-.*"}[120s]))'
     ),
     # F21-Q/P: no Tomcat-thread-pool metric exists in the APM pipeline —
     # Tomcat's http-nio-*-exec worker threads are DAEMON threads, so the
@@ -344,8 +384,8 @@ PROMETHEUS_TEMPLATES = {
     "otel-jvm-daemon-thread-count-v1": (
         'max without(grade,target_id,host_name,process_pid,os_description,'
         'os_type,host_arch) (sum without(jvm_thread_state) '
-        '(apm.agent.otel.java.jvm.thread.count'
-        '{service_name="%s",jvm_thread_daemon="true"}))'
+        '(last_over_time(apm.agent.otel.java.jvm.thread.count'
+        '{service_name="%s",jvm_thread_daemon="true"}[60s])))'
     ),
 }
 APPROVED_SERVICES = frozenset({"commerce-gateway", "commerce-order", "commerce-payment"})

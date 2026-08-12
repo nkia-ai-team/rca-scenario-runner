@@ -780,8 +780,12 @@ def test_f12h_fixed_apm_kcm_and_cpu_limit_queries(tmp_path) -> None:
         ' and on(service_name) '
         '(max without(grade) '
         '(max_over_time(apm.agent.otel.java.span_count{service_name="commerce-product"}[60s])) > 0)',
-        'max (kcm.pod.cpu_throttled_time{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"})',
-        'max (kcm.pod.network_rx_error{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"}) + max (kcm.pod.network_tx_error{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"})',
+        'max (last_over_time(kcm.pod.cpu_throttled_time'
+        '{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"}[120s]))',
+        'max (last_over_time(kcm.pod.network_rx_error'
+        '{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"}[120s])) '
+        '+ max (last_over_time(kcm.pod.network_tx_error'
+        '{namespace="rca-testbed-commerce",pod=~"testbed-product-.*"}[120s]))',
     ]
 
     tampered = dict(F12_PRODUCT_TARGET)
@@ -883,8 +887,8 @@ def test_jvm_daemon_thread_count_is_approved_for_f21_targets(tmp_path) -> None:
     assert rendered == (
         "max without(grade,target_id,host_name,process_pid,os_description,"
         "os_type,host_arch) (sum without(jvm_thread_state) "
-        "(apm.agent.otel.java.jvm.thread.count"
-        '{service_name="core-banking-api",jvm_thread_daemon="true"}))'
+        "(last_over_time(apm.agent.otel.java.jvm.thread.count"
+        '{service_name="core-banking-api",jvm_thread_daemon="true"}[60s])))'
     )
 
 
@@ -1659,6 +1663,53 @@ def test_f15r_flap_and_f15t1_food_payment_observations(tmp_path) -> None:
         )
     )
     assert tagged["quality"] == "good" and tagged["value"] == 3
+
+
+def test_every_prometheus_template_bounds_its_own_staleness() -> None:
+    """모든 PromQL 템플릿은 range selector 를 통해 읽어야 한다.
+
+    instant 읽기는 "지금 값"과 "VictoriaMetrics 가 아직 기억하는 마지막 값"을
+    **구분하지 못한다.** VM 은 instant 쿼리를 5분 staleness lookback 으로 답하고,
+    돌려주는 타임스탬프는 표본 시각이 아니라 **평가 시각**이다. 그래서 프로브는
+    몇 분 묵은 표본에 observed_at = now 를 찍고, 하류의 모든 신선도 검사(레지스트리
+    freshness_sec 포함)가 무의미해진다.
+
+    게이지는 주입이 가장 세게 물 때 멀어진다 — 그때가 노드가 메트릭 전송을 멈추는
+    때이기 때문이다. 6차 배치 F05-P run dcf596e9, mem-6250 단, VM 직접 조회:
+
+        06:12:00 -> 06:19:30   94.35 .. 95.38 %   (mem-5500 단, 정상 전송)
+        06:20:00 -> 06:21:00   49.49 %            (mem-6250 시작, 표본 3개)
+        06:21:30 -> 06:26:30   -- 표본 없음 --      <- 피해 구간 전체
+        06:27:00 ->            46.32 %            (노드 회복)
+
+    러너는 49.4902299532 를 14틱 연속 usable=True 로 읽었고 그동안 observed_at 은
+    06:21:09 -> 06:24:49 로 전진했다. 229초 묵은 표본을 fresh 로 판정한 것이고,
+    그 노드는 502 를 반환하며 gateway p95 가 16.8초였다. success 는
+    node_mem_util >= 92 를 요구해 도달 불가였고 escalate 는 < 92 로 발화해,
+    사다리는 **실제로 작동하던 단에서 도망쳤다.**
+
+    창 크기는 메트릭의 실측 표본 간격의 2배다(스크레이프 하나를 놓쳐도 견디고
+    진짜 구멍은 잡는다). 2026-08-11 max(count_over_time(<metric>[10m])) 실측:
+    kcm.node.* / kcm.pod.* 60s -> [120s], db.client.* / apm.agent.otel.java.* 10s -> [60s].
+
+    같은 시점 구·신 대조(VM, time= 고정): 표본이 흐르는 틱에서는 두 쿼리가 **같은 값**을
+    돌려주고(95.3811912927 / 46.316511926) 구멍 안에서만 갈린다 —
+    구 쿼리 49.4902299532, 신 쿼리 빈 결과 -> LiveProbeError -> unusable.
+
+    이 가드는 형태만 고정한다. 창 크기가 그 메트릭에 맞는지는 사람이 재야 한다.
+    """
+    import re
+
+    from app.live_probes import PROMETHEUS_TEMPLATES
+
+    ranged = re.compile(
+        r"(last_over_time|max_over_time|min_over_time|avg_over_time|rate|irate|increase)\s*\("
+    )
+    for template_id, promql in PROMETHEUS_TEMPLATES.items():
+        assert ranged.search(promql), (
+            f"{template_id} 가 instant selector 로 읽는다 — stale 표본을 fresh 로 판정한다. "
+            f"range selector(예: last_over_time(...[2x 표본간격]))로 감쌀 것: {promql}"
+        )
 
 
 def test_node_utilization_templates_read_the_system_series() -> None:
