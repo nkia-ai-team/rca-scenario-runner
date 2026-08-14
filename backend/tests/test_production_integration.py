@@ -695,6 +695,7 @@ def test_capture_invoker_can_stream_model_from_fixed_remote_observer(tmp_path) -
         runs_root=runs,
         model_source=tmp_path / "missing-model.json",
         model_ssh_target="root@192.168.230.104",
+        model_exec_mode="docker",
         process_runner=process,
     )
     job = SimpleNamespace(run_id="run-remote")
@@ -703,6 +704,67 @@ def test_capture_invoker_can_stream_model_from_fixed_remote_observer(tmp_path) -
 
     assert json.loads((runs / "run-remote" / "model.json").read_text())["version"] == 2
     assert len(calls) == 1
+
+
+def test_capture_invoker_streams_model_via_kubectl_on_k8s(tmp_path) -> None:
+    """2026-08-13 k3s 이관 후 observer 는 Deployment 다 — docker exec 는 Exited
+    껍데기를 친다(그리고 캡처가 통째로 실패한다, 2026-08-14 파일럿 실측)."""
+    runs = tmp_path / "runs"
+    (runs / "run-k8s").mkdir(parents=True)
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(argv)
+        assert argv[:3] == ["ssh", "-i", "/root/.ssh/tb_key"]
+        assert argv[-12:] == [
+            "sudo", "-n", "kubectl",
+            "-n", "polestar",
+            "exec", "deployment/ai-observer",
+            "-c", "ai-observer",
+            "--", "cat",
+            "/var/lib/lucida/ai-models/stream-anomaly/global/v1/model.json",
+        ]
+        assert "docker" not in argv
+        return subprocess.CompletedProcess(argv, 0, '{"version": 3}\n', "")
+
+    invoker = ProductionCaptureInvoker(
+        runs_root=runs,
+        model_source=tmp_path / "missing-model.json",
+        model_ssh_target="ydkim@192.168.230.119",
+        model_exec_mode="k8s",
+        process_runner=process,
+    )
+
+    invoker.snapshot_model(SimpleNamespace(run_id="run-k8s"), idempotency_key="k8s-model")
+
+    assert json.loads((runs / "run-k8s" / "model.json").read_text())["version"] == 3
+    assert len(calls) == 1
+
+
+def test_capture_invoker_auto_mode_falls_back_to_docker_without_k8s(tmp_path) -> None:
+    """auto 는 워크로드가 실재할 때만 k8s 를 고른다 — 없으면 docker 로 남는다."""
+    runs = tmp_path / "runs"
+    (runs / "run-auto").mkdir(parents=True)
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(argv)
+        if "get" in argv:  # 평면 탐지 probe — 실패시킨다
+            return subprocess.CompletedProcess(argv, 1, "", "not found")
+        assert "docker" in argv
+        return subprocess.CompletedProcess(argv, 0, '{"version": 4}\n', "")
+
+    invoker = ProductionCaptureInvoker(
+        runs_root=runs,
+        model_source=tmp_path / "missing-model.json",
+        model_ssh_target="ydkim@192.168.230.119",
+        model_exec_mode="auto",
+        process_runner=process,
+    )
+
+    invoker.snapshot_model(SimpleNamespace(run_id="run-auto"), idempotency_key="auto-model")
+
+    assert json.loads((runs / "run-auto" / "model.json").read_text())["version"] == 4
 
 
 async def test_capture_worker_isolates_one_failed_job_and_completes_another(tmp_path) -> None:

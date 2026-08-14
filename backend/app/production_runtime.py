@@ -990,19 +990,79 @@ class ProductionCaptureInvoker:
         capture_script: Path = TRUSTED_CAPTURE_SCRIPT,
         output_root: Path = Path("/data/eval-cases"),
         model_source: Path = Path(MODEL_PATH),
-        model_container: str = "lucida-ai-observer",
+        model_container: str | None = None,
         model_ssh_target: str | None = None,
         model_ssh_key: Path = Path("/root/.ssh/tb_key"),
+        model_exec_mode: str | None = None,
         process_runner: ProcessRunner = subprocess.run,
     ) -> None:
         self.runs_root = runs_root
         self.capture_script = capture_script
         self.output_root = output_root
         self.model_source = model_source
-        self.model_container = model_container
+        self.model_container = model_container or os.environ.get(
+            "MODEL_CONTAINER", "lucida-ai-observer"
+        )
         self.model_ssh_target = model_ssh_target
         self.model_ssh_key = model_ssh_key
         self.process_runner = process_runner
+        # 모델을 꺼내는 평면. 2026-08-13 k3s 이관으로 observer 가 컨테이너에서
+        # Deployment 가 됐다 — docker exec 는 Exited 껍데기를 친다.
+        #   auto(기본) : k8s 워크로드가 실재하면 k8s, 아니면 docker
+        #   docker/k8s : 강제
+        self.model_exec_mode = (
+            model_exec_mode or os.environ.get("MODEL_EXEC_MODE", "auto")
+        ).strip().lower()
+        self.model_k8s_namespace = os.environ.get("MODEL_K8S_NAMESPACE", "polestar")
+        self.model_k8s_workload = os.environ.get(
+            "MODEL_K8S_WORKLOAD", "deployment/ai-observer"
+        )
+        self.model_k8s_container = os.environ.get("MODEL_K8S_CONTAINER", "ai-observer")
+        # 119 의 ydkim 은 평 kubectl 권한이 없다 — sudo -n 이 필요하다.
+        self.model_kubectl = os.environ.get("MODEL_KUBECTL", "sudo -n kubectl")
+        self._model_mode_cache: str | None = None
+
+    def _ssh_prefix(self) -> list[str]:
+        return [
+            "ssh", "-i", str(self.model_ssh_key),
+            "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+            "-o", "ConnectTimeout=10", str(self.model_ssh_target),
+        ]
+
+    def _resolve_model_mode(self) -> str:
+        """docker | k8s. auto 면 AI 호스트에 워크로드가 실재하는지로 정한다."""
+        if self.model_exec_mode in {"docker", "k8s"}:
+            return self.model_exec_mode
+        if self._model_mode_cache:
+            return self._model_mode_cache
+        mode = "docker"
+        if self.model_ssh_target:
+            probe = self.process_runner(
+                [
+                    *self._ssh_prefix(),
+                    *self.model_kubectl.split(),
+                    "-n", self.model_k8s_namespace,
+                    "get", self.model_k8s_workload,
+                ],
+                check=False, capture_output=True, text=True,
+                env=_trusted_environment(), timeout=30,
+            )
+            if getattr(probe, "returncode", 1) == 0:
+                mode = "k8s"
+        self._model_mode_cache = mode
+        return mode
+
+    def _model_cat_argv(self) -> list[str]:
+        """ssh 대상에서 model.json 을 stdout 으로 뱉는 명령."""
+        if self._resolve_model_mode() == "k8s":
+            return [
+                *self.model_kubectl.split(),
+                "-n", self.model_k8s_namespace,
+                "exec", self.model_k8s_workload,
+                "-c", self.model_k8s_container,
+                "--", "cat", MODEL_PATH,
+            ]
+        return ["docker", "exec", self.model_container, "cat", MODEL_PATH]
 
     def snapshot_model(self, job: CaptureJob, *, idempotency_key: str) -> None:
         checkpoint = self.runs_root / job.run_id / "model.json"
@@ -1014,12 +1074,7 @@ class ProductionCaptureInvoker:
             shutil.copyfile(self.model_source, temporary)
         elif self.model_ssh_target:
             completed = self.process_runner(
-                [
-                    "ssh", "-i", str(self.model_ssh_key),
-                    "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-                    "-o", "ConnectTimeout=10", self.model_ssh_target,
-                    "docker", "exec", self.model_container, "cat", MODEL_PATH,
-                ],
+                [*self._ssh_prefix(), *self._model_cat_argv()],
                 check=True,
                 capture_output=True,
                 text=True,

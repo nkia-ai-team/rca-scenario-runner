@@ -68,6 +68,12 @@ services:
       - CAPTURE_STATE_PATH=/app/state/capture-jobs.json
       - LIVE_QUEUE_STATE_PATH=/app/state/live-queue.json
       - LIVE_CONTROLLER_REGISTRY_PATH=/opt/lucida/scenario-contracts/registry/controllers.json
+      # v3 연속 사이클(캡처) 모드. 비면 v2 시나리오 런으로 돈다.
+      # CYCLE_SCENARIOS 는 승인 목록의 부분집합만 허용된다(오타는 거부됨).
+      - CYCLE_MODE=${CYCLE_MODE:-}
+      - CYCLE_SCENARIOS=${CYCLE_SCENARIOS:-}
+      # 모델 스냅샷 평면. 비우면 auto(워크로드 실재 여부로 판별).
+      - MODEL_EXEC_MODE=${MODEL_EXEC_MODE:-}
       # 패스 종류. smoke면 케이스를 만들고 지키는 일(내보내기·간격·격리검사·야간창·
       # 골든리셋)이 함께 꺼진다 — 판정에 관여하는 것은 무엇도 바뀌지 않는다.
       # 근거와 규칙은 backend/app/pass_mode.py. 기본값은 dataset.
