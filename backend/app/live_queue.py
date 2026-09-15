@@ -1042,8 +1042,13 @@ class LiveScenarioQueue:
             return self._restart_cycle(state, evidence_error)
         job = self._capture_job(state.current_run_id)
         if job is None:
-            return self._pause(state, f"capture was not scheduled: {state.current_run_id}")
-        t2 = parse_utc(job.t2, field="t2")
+            if capture_enabled():
+                return self._pause(state, f"capture was not scheduled: {state.current_run_id}")
+            # 스모크 패스 × 사이클: 캡처 잡이 없는 것이 정상이다. t2 는 캡처 계약이
+            # 아니라 쿨다운 시계의 기점으로만 쓰이므로 주입 종료 직후(지금)로 둔다.
+            t2 = self.clock.now()
+        else:
+            t2 = parse_utc(job.t2, field="t2")
         now = self.clock.now()
         # Write phases.json at cooldown ENTRY (t2), not cooldown end. All phase
         # boundaries are deterministic once t2 is known (cooldown.end = t2 +
@@ -1053,7 +1058,8 @@ class LiveScenarioQueue:
         # missing, only --topology-bundle present → capture aborts. Writing here
         # guarantees phases.json exists well before any capture fire. (2026-07-25,
         # exposed on the production run — shortened smoke cooldown 5m<20m hid it.)
-        self._write_cycle_phases(state)
+        if capture_enabled():
+            self._write_cycle_phases(state)
         state = state.model_copy(
             update={
                 "phase": "cycle_cooldown",
@@ -1074,7 +1080,8 @@ class LiveScenarioQueue:
         that skipped the entry write."""
         if not self._transition_due(state):
             return state
-        self._write_cycle_phases(state)
+        if capture_enabled():
+            self._write_cycle_phases(state)
         now = self.clock.now()
         state = state.model_copy(
             update={
@@ -1092,17 +1099,19 @@ class LiveScenarioQueue:
         cycle. Capture retries are owned by the scheduler; a terminal failure
         pauses (resume table: capture -> retry capture only)."""
         assert state.current_run_id is not None
-        job = self._capture_job(state.current_run_id)
-        if job is None:
-            return self._pause(state, f"capture job disappeared: {state.current_run_id}")
-        if job.status == "failed":
-            return self._pause(state, f"capture failed: {state.current_run_id}: {job.failure}")
-        if job.status != "completed":
-            return state
-        if not (
-            self.runner.artifact_store.root / state.current_run_id / "capture-complete.json"
-        ).is_file():
-            return self._pause(state, f"capture completion evidence missing: {state.current_run_id}")
+        if capture_enabled():
+            job = self._capture_job(state.current_run_id)
+            if job is None:
+                return self._pause(state, f"capture job disappeared: {state.current_run_id}")
+            if job.status == "failed":
+                return self._pause(state, f"capture failed: {state.current_run_id}: {job.failure}")
+            if job.status != "completed":
+                return state
+            if not (
+                self.runner.artifact_store.root / state.current_run_id / "capture-complete.json"
+            ).is_file():
+                return self._pause(state, f"capture completion evidence missing: {state.current_run_id}")
+        # 스모크 패스는 캡처 산출물 없이 곧장 다음 사이클로 — 면제·해동은 동일하게 수행한다.
         # Exempt this completed run from the next cycle's clean-window overlap gate
         # (its captured residue is separated by the next reset + 2h normal lead-in).
         self._write_cycle_clean_window_excuse(

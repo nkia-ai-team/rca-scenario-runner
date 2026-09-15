@@ -56,6 +56,7 @@ from app.live_probes import (
     TAGGED_SESSION_SQL,
 )
 from app.adaptive_runtime import AdaptiveRuntime
+from app.level_pins import load_level_pins, pin_controller_spec, resolve_pinned_level
 
 
 TRUSTED_RUNS_ROOT = Path("/var/lib/lucida/scenario-runs")
@@ -600,13 +601,20 @@ def production_runtime(
     session_profile_id = approved if evaluation else profile_id
     if not isinstance(session_profile_id, str) or not session_profile_id:
         raise RuntimeError("evaluation requires an approved fixed profile id")
+    spec = scenario.controller
+    pinned_level_id = resolve_pinned_level(
+        load_level_pins(), scenario_id=scenario.id, catalog_slug=catalog_slug
+    )
+    if pinned_level_id is not None:
+        spec = pin_controller_spec(spec, pinned_level_id)
     return AdaptiveRuntime.create(
         run_id=run_id,
         scenario_id=scenario.id,
         fencing_token=fencing_token,
         profile_id=session_profile_id,
         approved_profile_id=approved,
-        spec=scenario.controller,
+        spec=spec,
+        pinned_level_id=pinned_level_id,
         clock=clock,
         skip_isolation_checks=skip_isolation_checks,
         eligibility_probe=(

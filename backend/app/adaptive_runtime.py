@@ -176,6 +176,12 @@ class ControllerSession(StrictModel):
     # gates (the cycle time axis provides separation). Persisted so restart keeps
     # the same decision. Default False = v2 behaviour unchanged.
     skip_isolation_checks: bool = False
+    # Level id the pin registry fixed this run to, or None for a normal ladder.
+    # The spec already carries only the pinned level; this field exists so
+    # state.json/result.json say *why* the ladder has one rung (auditability —
+    # a pinned run and a genuinely single-level scenario must stay tellable
+    # apart in the artifacts).
+    pinned_level_id: str | None = None
 
     @model_validator(mode="after")
     def validate_evaluation_profile(self) -> "ControllerSession":
@@ -186,6 +192,10 @@ class ControllerSession(StrictModel):
                 raise ValueError("evaluation requires the exactly approved fixed profile")
             if len(self.spec.adaptive.levels) != 1:
                 raise ValueError("evaluation requires exactly one fixed level")
+        if self.pinned_level_id is not None:
+            level_ids = [level.id for level in self.spec.adaptive.levels]
+            if level_ids != [self.pinned_level_id]:
+                raise ValueError("a pinned session must carry exactly the pinned level")
         return self
 
     @property
@@ -217,6 +227,7 @@ class ControllerSession(StrictModel):
                 "kind": "fixed" if self.spec.adaptive.mode.value == "evaluation" else "adaptive_ladder",
                 "id": self.profile_id,
             },
+            "pinned_level_id": self.pinned_level_id,
             "approved_profile_id": self.approved_profile_id,
             "t1": _format_utc(self.t1),
             "t2": _format_utc(self.t2),
@@ -285,6 +296,7 @@ class AdaptiveRuntime:
         poller: ObservationPoller,
         applier: ProfileApplier,
         skip_isolation_checks: bool = False,
+        pinned_level_id: str | None = None,
     ) -> "AdaptiveRuntime":
         session = ControllerSession(
             run_id=run_id,
@@ -295,6 +307,7 @@ class AdaptiveRuntime:
             spec=spec,
             created_at=_aware(clock.now()),
             skip_isolation_checks=skip_isolation_checks,
+            pinned_level_id=pinned_level_id,
         )
         return cls(
             session,
