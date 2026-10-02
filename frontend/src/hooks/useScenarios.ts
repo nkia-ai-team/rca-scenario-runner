@@ -8,11 +8,23 @@ function toView(s: ApiScenario): ScenarioView {
   // presentationFor is keyed by within-domain short_id ("01", "02", ...)
   // so the legacy tone/tag map keeps working across all domains.
   const p = presentationFor(s.short_id);
-  const hops = s.propagation
-    .split(/\s*(?:→|->|>)\s*/)
-    .map((x) => x.trim())
-    .filter(Boolean);
-  return { ...s, num: p.num, tag: p.tag, tone: p.tone, propagationHops: hops };
+  // 현행 시나리오는 서버가 단계 리스트를 준다. 문장 안의 ">"(예: "p95 > 2s")를
+  // 화살표로 오인해 쪼개지 않도록 그쪽을 우선한다.
+  const hops =
+    s.propagation_steps ??
+    s.propagation
+      .split(/\s*(?:→|->|>)\s*/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+  return {
+    ...s,
+    num: p.num,
+    code: p.code,
+    // 현행 시나리오의 태그는 관측 도메인("DPM, KCM") — 어디서 보일지가 곧 분류다.
+    tag: s.cause_domain ?? p.tag,
+    tone: p.tone,
+    propagationHops: hops,
+  };
 }
 
 export function useScenarios() {

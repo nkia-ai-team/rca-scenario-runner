@@ -13,6 +13,7 @@ from app.runner import get_runner
 from app.scenarios import get_scenario, list_domains, list_scenarios
 from app.coordinator import get_coordinator
 from app.manifests import ScenarioManifest, get_manifest, load_manifests
+from app.live_catalog import domains_of, list_live_scenarios
 from app.watchdog import WatchdogDecision, WatchdogRequest, decide_watchdog
 from app.live_queue import LiveQueueState, OperationalReadiness, get_live_queue
 from app.pass_mode import isolation_checks_enabled
@@ -44,9 +45,17 @@ async def healthz() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
+def _live_scenarios() -> list[Scenario]:
+    """Current manifest-backed catalog; empty when the deployment mounts none."""
+    return list_live_scenarios(get_runner().scenario_metadata_path)
+
+
 @app.get("/api/scenarios", response_model=list[Scenario])
 async def api_list_scenarios() -> list[Scenario]:
-    return list_scenarios()
+    # The UI lists what runs today. The in-repo legacy catalog (earlier testbed
+    # generations) is only the fallback for deployments without live manifests;
+    # its ids stay resolvable through the routes below either way.
+    return _live_scenarios() or list_scenarios()
 
 
 @app.get("/api/scenario-manifests", response_model=list[ScenarioManifest])
@@ -66,7 +75,8 @@ async def api_get_scenario_manifest(scenario_id: str) -> ScenarioManifest:
 
 @app.get("/api/domains", response_model=list[Domain])
 async def api_list_domains() -> list[Domain]:
-    return list_domains()
+    live = _live_scenarios()
+    return domains_of(live) if live else list_domains()
 
 
 @app.get("/api/active", response_model=ActiveRun)
@@ -126,6 +136,8 @@ async def api_watchdog_decision(request: WatchdogRequest) -> WatchdogDecision:
 @app.get("/api/scenarios/{scenario_id}", response_model=Scenario)
 async def api_get_scenario(scenario_id: str) -> Scenario:
     scenario = get_scenario(scenario_id)
+    if scenario is None:
+        scenario = next((s for s in _live_scenarios() if s.id == scenario_id), None)
     if scenario is None:
         raise HTTPException(status_code=404, detail=f"Scenario {scenario_id} not found")
     return scenario
