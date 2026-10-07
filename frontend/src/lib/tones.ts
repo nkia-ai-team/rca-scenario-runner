@@ -46,12 +46,39 @@ const PRESENTATION: Record<string, { tone: Tone; tag: string; num: string }> = {
   "04": { tone: "rose", tag: "Load", num: "04" },
 };
 
-export function presentationFor(scenarioId: string) {
-  return (
-    PRESENTATION[scenarioId] ?? {
-      tone: "violet" as Tone,
+// 현행(manifest) 시나리오 id — "F04-H". 숫자는 장애 계열, 접미사는 변형이다
+// (R 같은 원인에 다른 대상 / H 같은 증상에 다른 원인 / P 부분 유사 / 그 외 G, S, T, Q).
+const LIVE_ID = /^F(\d+)-([A-Z])/;
+const VARIANT_TONE: Record<string, Tone> = {
+  R: "violet",
+  H: "amber",
+  P: "emerald",
+};
+
+export interface Presentation {
+  tone: Tone;
+  tag: string;
+  num: string;
+  // 화면에 찍는 식별 코드 — 레거시는 "S01", 현행은 id 그대로("F04-H").
+  code: string;
+}
+
+export function presentationFor(scenarioId: string): Presentation {
+  const live = LIVE_ID.exec(scenarioId);
+  if (live) {
+    return {
+      tone: VARIANT_TONE[live[2]] ?? "rose",
       tag: "Scenario",
-      num: scenarioId,
-    }
-  );
+      num: live[1],
+      code: scenarioId,
+    };
+  }
+  const legacy = PRESENTATION[scenarioId];
+  if (legacy) return { ...legacy, code: `S${legacy.num}` };
+  return {
+    tone: "violet",
+    tag: "Scenario",
+    num: scenarioId,
+    code: `S${scenarioId}`,
+  };
 }

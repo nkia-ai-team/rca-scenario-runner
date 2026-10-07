@@ -26,6 +26,7 @@ from app.adaptive_runtime import (
     CleanupResult,
     EligibilityEvidence,
     EligibilityRequest,
+    stderr_detail,
 )
 from app.capture_orchestration import CaptureJob, MODEL_PATH
 from app.observations import (
@@ -33,6 +34,7 @@ from app.observations import (
     ApprovedQueryRegistry,
     BusinessProbeAdapter,
     CaptureStatusAdapter,
+    ClickHouseAdapter,
     DatabaseAdapter,
     HttpProbeAdapter,
     HostProbeAdapter,
@@ -42,12 +44,19 @@ from app.observations import (
     PrometheusAdapter,
 )
 from app.live_probes import (
+    BASELINE_PAID_ORDERS_SQL,
+    BLOCKED_SESSION_SQL,
+    COMMERCE_OUTBOX_UNPUBLISHED_SQL,
     INDEX_PRESENT_SQL,
+    INVENTORY_ZERO_STOCK_SQL,
     PAYMENT_DUPLICATE_SINCE_T1_SQL,
+    PG_SLOW_ACTIVE_QUERY_SQL,
+    RESTOCK_MOVEMENT_SQL,
     LiveProbeSet,
     TAGGED_SESSION_SQL,
 )
 from app.adaptive_runtime import AdaptiveRuntime
+from app.level_pins import load_level_pins, pin_controller_spec, resolve_pinned_level
 
 
 TRUSTED_RUNS_ROOT = Path("/var/lib/lucida/scenario-runs")
@@ -59,6 +68,25 @@ TRUSTED_CATALOG = TRUSTED_CONTRACT_ROOT / "catalog.json"
 TRUSTED_SCENARIO_METADATA = TRUSTED_CONTRACT_ROOT / "registry" / "scenario-metadata.json"
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+# Approved database probes whose SQL is fully self-contained: there is no
+# parameter to bind through PGOPTIONS, so approval is the whole contract.
+#
+# 2026-07-30: all five were reaching the dispatch's "not approved" branch, and
+# LiveProbes wraps its checks in _safe_bool — so the refusal surfaced as a plain
+# False instead of an error. baseline-business-success, which 44 of 44 live
+# scenarios require in preflight, could therefore never pass; the first live run
+# after the judging-contract repair was blocked on it while commerce was serving
+# 192 PAID orders per five minutes against a threshold of 5. The four
+# observation probes below were dead the same way, F04-H's unpublished-outbox
+# evidence among them.
+PARAMETERLESS_DATABASE_PROBES = {
+    BASELINE_PAID_ORDERS_SQL: "paid_count",
+    COMMERCE_OUTBOX_UNPUBLISHED_SQL: "unpublished_count",
+    PG_SLOW_ACTIVE_QUERY_SQL: "slow_active_count",
+    INVENTORY_ZERO_STOCK_SQL: "zero_stock_count",
+    RESTOCK_MOVEMENT_SQL: "restock_count",
+}
 
 
 class SystemClock:
@@ -198,6 +226,126 @@ class RunArtifactStore:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
+    @staticmethod
+    def _target_fields(plan: dict[str, Any]) -> dict[str, Any]:
+        """The plan with the mechanism fingerprints masked out.
+
+        `executor_sha256` identifies the code that performs the injection and its
+        undo; `plan_digest` is a hash over the whole plan and therefore moves with
+        it. Everything else — scenario, profile parameters, approved levels — is
+        the target, and a repair that changes any of it is not a repair.
+        """
+        masked = json.loads(json.dumps(plan))
+        masked.pop("plan_digest", None)
+        for instance in masked.get("profile_instances", []):
+            if isinstance(instance, dict):
+                instance.pop("executor_sha256", None)
+        return masked
+
+    def repair_capsule_contracts(
+        self, run_dir: Path, contract_root: Path, *, reason: str, now: datetime,
+        process_runner: ProcessRunner = subprocess.run,
+    ) -> dict[str, Any]:
+        """Re-materialize a dirty run's contract tree from the live trusted root.
+
+        The capsule freezes two different things: `plan.json` says *what* was
+        applied, and `capsule/contracts` says *how* to undo it. Freezing the first
+        is the whole point — cleanup must target exactly what injection created.
+        Freezing the second permanently is what deadlocks us: if the executor that
+        cleans up is itself defective, the run can never reach a verified-clean
+        state, and because DIRTY is global that wedges every scenario, not just
+        the failed one. 2026-07-30: F21-P died on an unquoted `&`, and the same
+        defect sat inside its capsule, so its own cleanup could not run.
+
+        Repair therefore replaces the mechanism while holding the target fixed:
+
+        - The plan is recompiled from the repaired tree and every field that
+          describes the target must come back byte-identical. Only the mechanism
+          fingerprints may move: each instance's `executor_sha256`, and
+          `plan_digest`, which is derived from them. Leaving plan.json frozen
+          instead does not work — the plan is *compiled from* the contracts, so a
+          stale copy stops matching a recompile and `_plan()` refuses the run
+          before cleanup ever starts. Naming the two fields that may move is also
+          a stronger check than comparing bytes: it says what a repair is allowed
+          to be.
+        - The previous hash manifest is preserved in `capsule-repair.json` with
+          the reason and timestamp, so the swap is recorded rather than hidden.
+        - Repair is explicit, never automatic on cleanup failure. A capsule that
+          silently re-arms itself from the live tree is not frozen at all.
+        - It clears nothing by itself. Cleanup and recovery still have to pass
+          before `clear_dirty`, so "no residue" stays machine-verified — repair
+          only lets the machine get to the question.
+        """
+        capsule = self.verify_capsule(run_dir)
+        if not contract_root.is_dir() or contract_root.is_symlink():
+            raise RuntimeError("trusted contract root must be a real directory")
+        contracts = run_dir / "capsule" / "contracts"
+        previous_manifest_sha256 = capsule["hash_manifest_sha256"]
+        previous_plan_sha256 = capsule["plan_sha256"]
+
+        staging = Path(tempfile.mkdtemp(prefix=f".{run_dir.name}.repair.", dir=self.root))
+        try:
+            rebuilt = staging / "contracts"
+            shutil.copytree(contract_root, rebuilt, symlinks=False)
+            hashes: dict[str, str] = {}
+            for path in sorted(rebuilt.rglob("*")):
+                if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                    raise RuntimeError("repaired capsule contains a link or special file")
+                if path.is_dir():
+                    os.chmod(path, 0o750)
+                    continue
+                relative = path.relative_to(rebuilt).as_posix()
+                executable = bool(path.stat().st_mode & 0o111)
+                os.chmod(path, 0o750 if executable else 0o640)
+                hashes[relative] = file_sha256(path)
+            atomic_json(staging / "hashes.json", {"schema_version": 1, "files": hashes})
+            manifest_sha256 = file_sha256(staging / "hashes.json")
+
+            # Compile from the staged tree, before anything is swapped in, so a
+            # repair that would move the target is refused without having written
+            # a byte. A half-repaired run is worse than a stuck one.
+            stored_plan = json.loads((run_dir / "plan.json").read_text(encoding="utf-8"))
+            repaired_plan = compile_trusted_plan(
+                capsule["scenario_slug"],
+                dispatcher=rebuilt / "run-scenario.sh",
+                process_runner=process_runner,
+            )
+            if self._target_fields(repaired_plan) != self._target_fields(stored_plan):
+                raise RuntimeError("capsule repair would change the cleanup target")
+            atomic_json(staging / "plan.json", repaired_plan)
+            plan_sha256 = file_sha256(staging / "plan.json")
+
+            shutil.rmtree(contracts)
+            os.replace(rebuilt, contracts)
+            os.replace(staging / "hashes.json", run_dir / "capsule" / "hashes.json")
+            os.replace(staging / "plan.json", run_dir / "plan.json")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+        record_path = run_dir / "capsule-repair.json"
+        record: dict[str, Any] = {"schema_version": 1, "repairs": []}
+        if record_path.is_file():
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        repair = {
+            "reason": reason,
+            "repaired_at": now.isoformat(),
+            "contract_root": str(contract_root.resolve()),
+            "previous_hash_manifest_sha256": previous_manifest_sha256,
+            "hash_manifest_sha256": manifest_sha256,
+            "previous_plan_sha256": previous_plan_sha256,
+            "plan_sha256": plan_sha256,
+        }
+        record["repairs"].append(repair)
+        atomic_json(record_path, record)
+        atomic_json(
+            run_dir / "capsule.json",
+            {**capsule, "hash_manifest_sha256": manifest_sha256, "plan_sha256": plan_sha256},
+        )
+        # The plan is deliberately re-verified after the rewrite: a repair that
+        # moved the target would be a different run wearing this run's id.
+        self.verify_capsule(run_dir)
+        return repair
+
     def verify_capsule(self, run_dir: Path) -> dict[str, Any]:
         if run_dir.parent != self.root or run_dir.is_symlink():
             raise RuntimeError("capsule escaped the trusted runs root")
@@ -242,6 +390,64 @@ class RunArtifactStore:
             if capsule.get("binding") != expected_binding:
                 raise RuntimeError("capsule profile binding was modified")
         return capsule
+
+    def find_orphaned_dirty_run(self, scenario_id: str) -> tuple[str, int] | None:
+        """The newest run of this scenario that is dirty and whose effect never ended.
+
+        A run whose cleanup was refused keeps a level change with no
+        `effect_ended_at`, and `_run_intervals` then treats its interval as open
+        forever — so it overlaps every future clean window and blocks every start.
+        External cleanup is the way out, but it needs the coordinator to still be
+        holding the run as DIRTY. The coordinator forgets (a later lease clears
+        it) while the run's own record stays dirty, and then nothing can close it:
+        F15-T2-run-d5b1ae8a blocked every live start from 2026-08-03 that way.
+
+        Match on the run's own evidence rather than the coordinator's memory. The
+        cleanup shape is deliberately specific: `persist_session` writes a nested
+        {"cleanup": ...} document, while a completed external cleanup writes the
+        flat {"succeeded": true, "effect_ended_at": ...} that `_run_intervals`
+        reads. Only the latter closes the interval.
+        """
+        best: tuple[datetime, str, int] | None = None
+        if not self.root.is_dir():
+            return None
+        for run_dir in self.root.iterdir():
+            if not run_dir.is_dir():
+                continue
+            try:
+                state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+                lease = json.loads((run_dir / "lease.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if state.get("scenario_id") != scenario_id or state.get("status") != "dirty":
+                continue
+            try:
+                cleanup = json.loads((run_dir / "cleanup.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cleanup = {}
+            if cleanup.get("succeeded") is True and cleanup.get("effect_ended_at"):
+                continue
+            changes = state.get("level_changes") or []
+            if not any(
+                (change.get("applied_at") or change.get("started_at"))
+                and not (change.get("effect_ended_at") or change.get("ended_at"))
+                for change in changes
+            ):
+                continue
+            token = lease.get("fencing_token")
+            run_id = lease.get("run_id") or run_dir.name
+            if not isinstance(token, int) or token <= 0:
+                continue
+            marker = state.get("terminal_at") or state.get("created_at") or ""
+            try:
+                when = datetime.fromisoformat(marker.replace("Z", "+00:00"))
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if best is None or when > best[0]:
+                best = (when, run_id, token)
+        return None if best is None else (best[1], best[2])
 
     def bind_lease(self, run_dir: Path, *, run_id: str, fencing_token: int) -> None:
         self.verify_capsule(run_dir)
@@ -346,6 +552,7 @@ def production_runtime(
     process_runner: ProcessRunner = subprocess.run,
     live_probes: LiveProbeSet | None = None,
     artifact_fallback: bool = False,
+    skip_isolation_checks: bool = False,
 ) -> AdaptiveRuntime:
     if run_dir is not None:
         store = RunArtifactStore(run_dir.parent)
@@ -388,19 +595,28 @@ def production_runtime(
         "host_probe": HostProbeAdapter(reader, clock=clock.now),
         "business_probe": BusinessProbeAdapter(reader, clock=clock.now),
         "capture_status": CaptureStatusAdapter(reader, clock=clock.now),
+        "clickhouse": ClickHouseAdapter(reader, clock=clock.now),
     }
     evaluation = scenario.controller.adaptive.mode.value == "evaluation"
     session_profile_id = approved if evaluation else profile_id
     if not isinstance(session_profile_id, str) or not session_profile_id:
         raise RuntimeError("evaluation requires an approved fixed profile id")
+    spec = scenario.controller
+    pinned_level_id = resolve_pinned_level(
+        load_level_pins(), scenario_id=scenario.id, catalog_slug=catalog_slug
+    )
+    if pinned_level_id is not None:
+        spec = pin_controller_spec(spec, pinned_level_id)
     return AdaptiveRuntime.create(
         run_id=run_id,
         scenario_id=scenario.id,
         fencing_token=fencing_token,
         profile_id=session_profile_id,
         approved_profile_id=approved,
-        spec=scenario.controller,
+        spec=spec,
+        pinned_level_id=pinned_level_id,
         clock=clock,
+        skip_isolation_checks=skip_isolation_checks,
         eligibility_probe=(
             ArtifactEligibilityProbe(evidence_path, clock=clock)
             if asynchronous_probes is None
@@ -448,6 +664,11 @@ def _configured_live_probes(
         if sql == TAGGED_SESSION_SQL and len(parameters) == 1:
             pgoptions = f"-c lucida.scenario_tag={parameters[0]}"
             result_field = "tagged_count"
+        elif sql == BLOCKED_SESSION_SQL and parameters in (
+            ("inventory_schema.inventory",), ("payment_schema.payments",)
+        ):
+            pgoptions = f"-c lucida.lock_relation={parameters[0]}"
+            result_field = "blocked_count"
         elif sql == INDEX_PRESENT_SQL and parameters == (
             "product_schema", "products", "idx_products_name"
         ):
@@ -464,6 +685,9 @@ def _configured_live_probes(
                 raise RuntimeError("payment duplicate probe t1 is invalid") from error
             pgoptions = f"-c lucida.payment_t1={parameters[0]}"
             result_field = "duplicate_count"
+        elif sql in PARAMETERLESS_DATABASE_PROBES and not parameters:
+            pgoptions = ""
+            result_field = PARAMETERLESS_DATABASE_PROBES[sql]
         else:
             raise RuntimeError("database probe query is not approved")
         environment = _trusted_environment()
@@ -640,7 +864,15 @@ class TrustedDispatcherApplier:
 
     def cleanup(self, request: CleanupRequest) -> CleanupResult:
         existing = self._cleaned.get(request.idempotency_key)
-        if existing is not None:
+        # Only a cleanup that actually succeeded is a final answer. Caching a
+        # failure here turns the first attempt into the only one, and because
+        # DIRTY is global that pins every scenario behind one stuck run. The
+        # same rule lives in profile-control.py; this layer sits above it and
+        # short-circuits before the call, so fixing only the lower one leaves
+        # the deadlock in place — measured on 2026-07-30, when a repaired
+        # capsule and a fixed executor still could not get a second attempt.
+        # Cleanup is idempotent by construction, so re-running costs nothing.
+        if existing is not None and existing.succeeded:
             return existing
         plan = self._plan()
         digest = plan["plan_digest"]
@@ -649,30 +881,46 @@ class TrustedDispatcherApplier:
             if not self.profile_control.is_file():
                 raise RuntimeError("trusted per-profile control API is unavailable")
             response = None
+            failures: list[str] = []
             intended = self._intended_profiles()
             cleanup_order = [self.primary_profile, *reversed(self.companion_profiles)]
             for profile_id in [item for item in cleanup_order if not intended or item in intended]:
                 operation_key = f"{request.idempotency_key}:{profile_id}"
                 self._journal(operation_key, profile_id, "cleanup", "intent")
-                completed = self.process_runner(
-                    [
-                        str(self.profile_control), "--scenario", self.scenario_slug,
-                        "--profile", profile_id, "--action", "cleanup",
-                        "--run-id", request.run_id, "--fencing-token", str(request.fencing_token),
-                        "--idempotency-key", operation_key,
-                        "--plan-digest", digest, "--confirm", confirmation,
-                    ],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    env=_trusted_environment(),
-                )
-                current = json.loads(completed.stdout)
+                # Every intended profile gets its attempt, whatever the ones
+                # before it did. Abandoning the rest after the first failure left
+                # F01-R run 0104bd01's companion surge running its full 15m, and
+                # the next attempt's preflight then refused (correctly) because a
+                # tagged k6 was still up: one failed cleanup became two failed
+                # scenarios. The profiles are independent effects, so a failure to
+                # undo one says nothing about the others.
+                try:
+                    completed = self.process_runner(
+                        [
+                            str(self.profile_control), "--scenario", self.scenario_slug,
+                            "--profile", profile_id, "--action", "cleanup",
+                            "--run-id", request.run_id, "--fencing-token", str(request.fencing_token),
+                            "--idempotency-key", operation_key,
+                            "--plan-digest", digest, "--confirm", confirmation,
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        env=_trusted_environment(),
+                    )
+                    current = json.loads(completed.stdout)
+                except Exception as error:
+                    failures.append(f"{profile_id}:{type(error).__name__}{stderr_detail(error)}")
+                    continue
                 self._journal(operation_key, profile_id, "cleanup", "complete")
                 if current["succeeded"] is not True:
-                    response = current
-                    break
+                    failures.append(f"{profile_id}:{current.get('reason') or 'refused'}")
+                    continue
                 response = current
+            if failures:
+                # Still fails closed — the run stays dirty — but every effect that
+                # could be undone has been, and the reason names each that could not.
+                return self._record_cleanup_failure(request, "; ".join(failures))
             assert response is not None
             effect_ended_at = (
                 datetime.fromisoformat(response["effect_ended_at"].replace("Z", "+00:00"))
@@ -688,13 +936,20 @@ class TrustedDispatcherApplier:
                 reason=response.get("reason"),
             )
         except Exception as error:  # fail closed at the dispatcher boundary
-            result = CleanupResult(
-                run_id=request.run_id,
-                fencing_token=request.fencing_token,
-                idempotency_key=request.idempotency_key,
-                succeeded=False,
-                reason=f"trusted_dispatcher:{type(error).__name__}",
+            return self._record_cleanup_failure(
+                request, f"trusted_dispatcher:{type(error).__name__}{stderr_detail(error)}"
             )
+        self._cleaned[request.idempotency_key] = result
+        return result
+
+    def _record_cleanup_failure(self, request: CleanupRequest, reason: str) -> CleanupResult:
+        result = CleanupResult(
+            run_id=request.run_id,
+            fencing_token=request.fencing_token,
+            idempotency_key=request.idempotency_key,
+            succeeded=False,
+            reason=reason,
+        )
         self._cleaned[request.idempotency_key] = result
         return result
 
@@ -743,19 +998,79 @@ class ProductionCaptureInvoker:
         capture_script: Path = TRUSTED_CAPTURE_SCRIPT,
         output_root: Path = Path("/data/eval-cases"),
         model_source: Path = Path(MODEL_PATH),
-        model_container: str = "lucida-ai-observer",
+        model_container: str | None = None,
         model_ssh_target: str | None = None,
         model_ssh_key: Path = Path("/root/.ssh/tb_key"),
+        model_exec_mode: str | None = None,
         process_runner: ProcessRunner = subprocess.run,
     ) -> None:
         self.runs_root = runs_root
         self.capture_script = capture_script
         self.output_root = output_root
         self.model_source = model_source
-        self.model_container = model_container
+        self.model_container = model_container or os.environ.get(
+            "MODEL_CONTAINER", "lucida-ai-observer"
+        )
         self.model_ssh_target = model_ssh_target
         self.model_ssh_key = model_ssh_key
         self.process_runner = process_runner
+        # 모델을 꺼내는 평면. 2026-08-13 k3s 이관으로 observer 가 컨테이너에서
+        # Deployment 가 됐다 — docker exec 는 Exited 껍데기를 친다.
+        #   auto(기본) : k8s 워크로드가 실재하면 k8s, 아니면 docker
+        #   docker/k8s : 강제
+        self.model_exec_mode = (
+            model_exec_mode or os.environ.get("MODEL_EXEC_MODE", "auto")
+        ).strip().lower()
+        self.model_k8s_namespace = os.environ.get("MODEL_K8S_NAMESPACE", "polestar")
+        self.model_k8s_workload = os.environ.get(
+            "MODEL_K8S_WORKLOAD", "deployment/ai-observer"
+        )
+        self.model_k8s_container = os.environ.get("MODEL_K8S_CONTAINER", "ai-observer")
+        # 119 의 ydkim 은 평 kubectl 권한이 없다 — sudo -n 이 필요하다.
+        self.model_kubectl = os.environ.get("MODEL_KUBECTL", "sudo -n kubectl")
+        self._model_mode_cache: str | None = None
+
+    def _ssh_prefix(self) -> list[str]:
+        return [
+            "ssh", "-i", str(self.model_ssh_key),
+            "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+            "-o", "ConnectTimeout=10", str(self.model_ssh_target),
+        ]
+
+    def _resolve_model_mode(self) -> str:
+        """docker | k8s. auto 면 AI 호스트에 워크로드가 실재하는지로 정한다."""
+        if self.model_exec_mode in {"docker", "k8s"}:
+            return self.model_exec_mode
+        if self._model_mode_cache:
+            return self._model_mode_cache
+        mode = "docker"
+        if self.model_ssh_target:
+            probe = self.process_runner(
+                [
+                    *self._ssh_prefix(),
+                    *self.model_kubectl.split(),
+                    "-n", self.model_k8s_namespace,
+                    "get", self.model_k8s_workload,
+                ],
+                check=False, capture_output=True, text=True,
+                env=_trusted_environment(), timeout=30,
+            )
+            if getattr(probe, "returncode", 1) == 0:
+                mode = "k8s"
+        self._model_mode_cache = mode
+        return mode
+
+    def _model_cat_argv(self) -> list[str]:
+        """ssh 대상에서 model.json 을 stdout 으로 뱉는 명령."""
+        if self._resolve_model_mode() == "k8s":
+            return [
+                *self.model_kubectl.split(),
+                "-n", self.model_k8s_namespace,
+                "exec", self.model_k8s_workload,
+                "-c", self.model_k8s_container,
+                "--", "cat", MODEL_PATH,
+            ]
+        return ["docker", "exec", self.model_container, "cat", MODEL_PATH]
 
     def snapshot_model(self, job: CaptureJob, *, idempotency_key: str) -> None:
         checkpoint = self.runs_root / job.run_id / "model.json"
@@ -767,12 +1082,7 @@ class ProductionCaptureInvoker:
             shutil.copyfile(self.model_source, temporary)
         elif self.model_ssh_target:
             completed = self.process_runner(
-                [
-                    "ssh", "-i", str(self.model_ssh_key),
-                    "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-                    "-o", "ConnectTimeout=10", self.model_ssh_target,
-                    "docker", "exec", self.model_container, "cat", MODEL_PATH,
-                ],
+                [*self._ssh_prefix(), *self._model_cat_argv()],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -829,6 +1139,20 @@ class ProductionCaptureInvoker:
             normal_dir = normal_marker.read_text(encoding="utf-8").strip()
             if normal_dir:
                 args.extend(["--normal-segment", normal_dir])
+        # Capture contract v3 (spec §2.2): in cycle mode the queue drops the
+        # continuous-cycle phase log next to the run; forward it so meta.json
+        # gets phases[] and the capture window is [cycle_start, t2+30m].
+        phases_file = self.runs_root / job.run_id / "phases.json"
+        if phases_file.is_file():
+            args.extend(["--phases-json", str(phases_file)])
+        # Cycle topology bundle (2026-07-24 EventCluster contract): the queue drops
+        # a marker with the per-cycle bundle dir of periodic topology snapshots;
+        # forward it so the case includes the raw topology graph + service tree.
+        topology_marker = self.runs_root / job.run_id / "topology-bundle.path"
+        if topology_marker.is_file():
+            topology_dir = topology_marker.read_text(encoding="utf-8").strip()
+            if topology_dir:
+                args.extend(["--topology-bundle", topology_dir])
         environment = _trusted_environment()
         environment["MODEL_SOURCE"] = str(checkpoint)
         try:

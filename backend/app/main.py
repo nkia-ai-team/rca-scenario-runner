@@ -1,3 +1,4 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,8 +13,10 @@ from app.runner import get_runner
 from app.scenarios import get_scenario, list_domains, list_scenarios
 from app.coordinator import get_coordinator
 from app.manifests import ScenarioManifest, get_manifest, load_manifests
+from app.live_catalog import domains_of, list_live_scenarios
 from app.watchdog import WatchdogDecision, WatchdogRequest, decide_watchdog
 from app.live_queue import LiveQueueState, OperationalReadiness, get_live_queue
+from app.pass_mode import isolation_checks_enabled
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -42,9 +45,17 @@ async def healthz() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
+def _live_scenarios() -> list[Scenario]:
+    """Current manifest-backed catalog; empty when the deployment mounts none."""
+    return list_live_scenarios(get_runner().scenario_metadata_path)
+
+
 @app.get("/api/scenarios", response_model=list[Scenario])
 async def api_list_scenarios() -> list[Scenario]:
-    return list_scenarios()
+    # The UI lists what runs today. The in-repo legacy catalog (earlier testbed
+    # generations) is only the fallback for deployments without live manifests;
+    # its ids stay resolvable through the routes below either way.
+    return _live_scenarios() or list_scenarios()
 
 
 @app.get("/api/scenario-manifests", response_model=list[ScenarioManifest])
@@ -64,7 +75,8 @@ async def api_get_scenario_manifest(scenario_id: str) -> ScenarioManifest:
 
 @app.get("/api/domains", response_model=list[Domain])
 async def api_list_domains() -> list[Domain]:
-    return list_domains()
+    live = _live_scenarios()
+    return domains_of(live) if live else list_domains()
 
 
 @app.get("/api/active", response_model=ActiveRun)
@@ -80,7 +92,11 @@ async def api_live_queue() -> LiveQueueState:
 
 @app.get("/api/live-queue/readiness", response_model=OperationalReadiness)
 async def api_live_queue_readiness() -> OperationalReadiness:
-    return get_live_queue().readiness()
+    # readiness() shells out to the capture self-check (up to 120s). Run on a
+    # thread: served inline it froze the event loop, starving the coordinator
+    # heartbeat until the active run's 30s lease expired and every subsequent
+    # operation died on fencing rejection (#31, 2026-08-03 batch — F15-T2).
+    return await asyncio.to_thread(get_live_queue().readiness)
 
 
 @app.post("/api/live-queue/start", response_model=LiveQueueState)
@@ -121,6 +137,8 @@ async def api_watchdog_decision(request: WatchdogRequest) -> WatchdogDecision:
 async def api_get_scenario(scenario_id: str) -> Scenario:
     scenario = get_scenario(scenario_id)
     if scenario is None:
+        scenario = next((s for s in _live_scenarios() if s.id == scenario_id), None)
+    if scenario is None:
         raise HTTPException(status_code=404, detail=f"Scenario {scenario_id} not found")
     return scenario
 
@@ -129,7 +147,21 @@ async def api_get_scenario(scenario_id: str) -> Scenario:
 async def api_run(scenario_id: str) -> RunInfo:
     runner = get_runner()
     try:
-        return await runner.start(scenario_id=scenario_id, mode="run")
+        # 큐(live_queue.py:702)와 같은 판단을 쓴다. 이 엔드포인트만 pass mode 를
+        # 읽지 않아, smoke pass 에서 큐는 통과하는 런이 단독 실행으로는
+        # check_failed:clean-window 로 거부됐다 — 같은 시나리오·같은 클러스터·같은
+        # 순간인데 진입 경로에 따라 답이 갈렸다. isolation 게이트는 capture 창 쌍을
+        # 떼어놓기 위한 것이고 smoke pass 에는 그 쌍이 없다(pass_mode.py:82-87).
+        #
+        # 2026-08-12 에 이걸로 4종 단독 재실행이 통째로 막혔다. 겸사겸사 드러난 것:
+        # 08-07~09 의 F15-T2 런 넷이 status=dirty / effect_ended=None 으로 닫히지
+        # 않아 227 개 런의 overlapping_run_ids 에 영구히 들어간다. 게이트가 켜져
+        # 있었더라도 아무도 통과하지 못했을 상태다(별건으로 남긴다).
+        return await runner.start(
+            scenario_id=scenario_id,
+            mode="run",
+            skip_isolation_checks=not isolation_checks_enabled(),
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
@@ -139,10 +171,22 @@ async def api_run(scenario_id: str) -> RunInfo:
 
 
 @app.post("/api/scenarios/{scenario_id}/cleanup", response_model=RunInfo)
-async def api_cleanup(scenario_id: str) -> RunInfo:
+async def api_cleanup(scenario_id: str, repair_capsule: bool = False) -> RunInfo:
+    """Clean up a DIRTY run.
+
+    `repair_capsule` re-cuts the run's frozen contract tree from the live trusted
+    root before cleaning. Use it when the capsule's own executor is the defect —
+    otherwise the run cannot clean itself, and since DIRTY is global that blocks
+    every scenario. The run's plan is left untouched and re-verified, and the
+    swap is recorded in `capsule-repair.json`. Cleanup and recovery must still
+    pass on their own merits; this changes what code runs, not what counts as
+    clean.
+    """
     runner = get_runner()
     try:
-        return await runner.start(scenario_id=scenario_id, mode="cleanup")
+        return await runner.start(
+            scenario_id=scenario_id, mode="cleanup", repair_capsule=repair_capsule
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:

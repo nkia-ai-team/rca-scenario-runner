@@ -36,10 +36,104 @@ EXPECTED_KUBE_NODES = frozenset({"tb-cp", "tb-w1", "tb-w2", "tb-w3"})
 LOADGEN_HOST = "192.168.122.206"
 LOADGEN_USER = "nkia"
 LOADGEN_KEY = "/root/.ssh/tb_key"
+# k6 live-summary fields, keyed by query id. This mapping is the *only*
+# allowlist for loadgen observations — a second hand-maintained id set used to
+# guard it, and loadgen.food_create_429_rate was added here but not there, so
+# F06-P's sole success condition failed closed on every tick (2026-07-29).
+LOADGEN_FIELDS = {
+    "loadgen.achieved_rps": "achieved_rps",
+    "loadgen.checkout_5xx_rate": "checkout_5xx_rate",
+    "loadgen.write_step_status_rate": "business_nonok_rate",
+    "loadgen.read_step_status_rate": "read_nonok_rate",
+    "loadgen.food_create_status_rate": "business_5xx_rate",
+    "loadgen.transfer_2xx_rate": "business_2xx_rate",
+    # F23-R: business_409_rate is computed by the north-south monitor
+    # (business_step status==409 fraction) alongside business_5xx_rate.
+    "loadgen.checkout_409_rate": "business_409_rate",
+    # F06-P: 하류 rate limit(429)은 4xx의 또 다른 부분집합이라
+    # business_nonok_rate로는 검증 거절과 구분되지 않고, business_5xx_rate로는
+    # 아예 보이지 않는다 — 앱이 하류 상태코드를 5xx로 승격하지 않고 그대로
+    # 전파하기 때문이다.
+    "loadgen.food_create_429_rate": "business_429_rate",
+    # F17-P dual-arm reuse: direct arm 2xx rate / control arm reject rate, both
+    # already emitted per business_step/read_step tagging.
+    "loadgen.frozen_bypass_completed_rate": "business_2xx_rate",
+    "loadgen.normal_path_reject_rate": "read_nonok_rate",
+}
+# Observation plane separation (2026-07-29): a loadgen observation may name a
+# domain, in which case it reads that domain's *baseline* live document instead
+# of the scenario's own k6 output. Without this every loadgen observation was
+# only available for the one domain the scenario itself flooded, which is what
+# blocked F15-G/T3/T4 and forced surge scripts to double as observation vehicles.
+# Deliberately not a new id space: 10 fields x 3 domains would fork LOADGEN_FIELDS,
+# and a forked allowlist is exactly what killed F06-P.
+APPROVED_LOADGEN_DOMAINS = frozenset({"commerce", "core-banking", "food-delivery"})
 TARGET_HEALTH_URL = "http://192.168.122.77:30080/health"
 PROMETHEUS_URL = os.environ.get(
     "PROMETHEUS_URL", "http://192.168.230.119:18428/api/v1/query"
 )
+# Error rate is read from the trace table rather than from the APM rollup.
+# 2026-07-30, same 60-minute window: agg_service_golden_signals reported 323
+# requests for commerce-gateway against 6,321 root spans in otel_traces_local,
+# and 1-4 requests for commerce-order / commerce-payment / food-delivery-payment
+# against 226-288. The rollup is an AggregatingMergeTree whose req_count and
+# error_count are plain UInt64 columns, so same-minute insert blocks discard all
+# but one row — the loss factor runs 20x to 288x and varies per service. The
+# surviving block held ~1 request, which made every threshold (2/5/10/30%) decide
+# on whether that single sampled request happened to fail. The traces themselves
+# are intact and lag only ~3s, so we count the real denominator here.
+CLICKHOUSE_URL = os.environ.get("CLICKHOUSE_URL", "http://192.168.230.119:18123/")
+CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "lucida")
+CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
+# 60s trailing window: it matches the update interval the timing contracts were
+# verified against, and one window carries no rows in common with the next.
+#
+# The error test is the HTTP response status, not the span status. Measured over
+# 48h: SERVER spans never carry status_code='ERROR' in this testbed — every one
+# of the 3,204 ERROR spans in the last hour sat on CLIENT or INTERNAL spans,
+# because the Spring instrumentation records the downstream failure on the
+# outbound span and the inbound span keeps status UNSET. A span-status test would
+# have returned a constant 0, which is the dead-observation class this change
+# exists to remove. `http.response.status_code >= 500` is also what the scenarios
+# mean by an error: 502 dominates the 48h 5xx history (10,063 of 10,430).
+#
+# Verified against the 2026-07-28 23:55 commerce-payment outage window:
+# food-delivery-order 96.3636% (53/55), food-delivery-dispatch 35.2941% (18/51).
+# `HAVING count() > 0` rather than the `if(count() = 0, 0, ...)` this carried until
+# 2026-08-07. That fold answered "no spans in the window" with an error rate of
+# 0.0 — a manufactured clean bill of health for a service that produced no
+# evidence at all. It is the same defect as the APM percentile gauge publishing 0
+# for an empty window (see apm-agent-percentile95-v1), but it lands in the
+# opposite and worse direction: p95=0 breaks a `gte` gate, while error_rate=0
+# *satisfies* the "this alternative cause is not happening" reading. Every
+# consumer of this query is a discriminator asking exactly that question, so the
+# window where a service dies and stops emitting spans is the window where it was
+# reported healthy.
+#
+# Measured over the runs still inside ClickHouse trace retention (2026-08-04
+# onward), reconstructing each tick's 60s window from per-second span counts:
+# F19-P 87 zero-ticks of which 34 had no spans at all (12 consecutive at worst),
+# F20-R 13 of 90, F20-Q 2 of 22, F06-P 1 of 64. The `success`-role consumers are
+# nearly clean (F01-P 2 of 40, F08-P/F06-H/F17-R 0) because they only read the
+# service their own load is driving.
+#
+# Zero rows now reach _clickhouse_observation as an empty result and become a
+# LiveProbeError, i.e. unusable — the same contract the APM guard uses. Unusable
+# in a must_rule_out set holds the judgement rather than answering it, and that is
+# the defensible side: "the discriminator could not be read" is a true statement,
+# "the alternative cause is absent" was not.
+CLICKHOUSE_TEMPLATES = {
+    "trace-service-error-rate-v1": (
+        "SELECT round(100.0 * countIf("
+        "toUInt16OrZero(span_attributes['http.response.status_code']) >= 500"
+        ") / count(), 4) AS value "
+        "FROM lucida.otel_traces_local "
+        "WHERE service_name = '%s' AND span_kind = 'SERVER' "
+        "AND timestamp > now() - INTERVAL 60 SECOND "
+        "HAVING count() > 0 "
+        "FORMAT JSON"
+    ),
+}
 
 APPROVED_CHECK_IDS = frozenset(
     {
@@ -48,50 +142,276 @@ APPROVED_CHECK_IDS = frozenset(
         "coordinator-clean",
         "clean-window",
         "baseline-traffic",
+        # "traffic is flowing" and "transactions are succeeding" are different
+        # questions; only the second one would have caught the 2026-07-28
+        # missing-seed-account outage. See BASELINE_PAID_ORDERS_SQL.
+        "baseline-business-success",
         "target-health",
+        # F05-P starves a worker node's memory and then measures the impact on
+        # the services that node hosts. If they are not on it, the scenario is
+        # a no-op that cannot fail loudly. The manifest has asked for this check
+        # since it was written; the runner never implemented it, so F05-P died
+        # at "unknown approved check ids" instead — which is how nobody noticed
+        # that the 2026-07-28 nodeSelector pinning had moved the whole commerce
+        # cohort off the node F05-P was hogging. See WORKER_COHORT_PLACEMENT.
+        "worker-cohort-placement",
     }
 )
 
+# 2026-08-11: every template here now reads through a range selector, and that
+# is a contract (test_every_prometheus_template_bounds_its_own_staleness), not a
+# style. An *instant* PromQL read cannot tell "this is the current value" from
+# "this is the last value VictoriaMetrics still remembers" — VM answers an
+# instant query from its 5-minute staleness lookback, and the timestamp it
+# returns is the **evaluation** time, not the sample's. So the probe stamps
+# observed_at = now on a sample that may be minutes old, and every downstream
+# freshness check (the registry's freshness_sec included) is answered by a clock
+# that is telling the truth about the wrong thing.
+#
+# The gauges go blind exactly when the injection bites hardest, which is when
+# the node stops shipping metrics at all. F05-P run dcf596e9 (6th batch), rung
+# mem-6250, measured against VM directly:
+#
+#   06:12:00 -> 06:19:30   94.35 .. 95.38 %   (rung mem-5500, healthy reporting)
+#   06:20:00 -> 06:21:00   49.49 %            (rung mem-6250 starts, 3 samples)
+#   06:21:30 -> 06:26:30   -- no samples --   <- the whole damage window
+#   06:27:00 ->            46.32 %            (node recovered)
+#
+# The runner read 49.4902299532 for 14 consecutive ticks with usable=True while
+# observed_at advanced 06:21:09 -> 06:24:49 — a 229-second-old sample served as
+# fresh, on a node that was returning 502s with a 16.8s gateway p95. success
+# needed node_mem_util >= 92 (unreachable) and escalate fired on < 92, so the
+# ladder climbed away from the rung that was working.
+#
+# Window = 2x the metric's measured sample spacing, so one missed scrape is
+# tolerated and a real hole is caught:
+#   kcm.node.* / kcm.pod.*                 60s spacing -> [120s]
+#   db.client.* / apm.agent.otel.java.*    10s spacing -> [60s]
+# (measured 2026-08-11 via max(count_over_time(<metric>[10m])) against VM.)
+# No samples in the window -> empty result -> LiveProbeError -> unusable, which
+# is the fail-closed side: a withheld read holds the judgement, a stale read
+# decides it wrongly. The templates that already carried max_over_time /
+# last_over_time were correct for this reason and are unchanged.
 PROMETHEUS_TEMPLATES = {
+    # kcm.node.cpu_utilization is NOT host CPU busy-ness — it tracks the pod
+    # CPU *requests* scheduled onto the node, so it sits flat wherever the
+    # scheduler left it and never moves when the CPU actually saturates.
+    # Contrast experiment on tb-w3 (2026-08-04, 2 of 4 cores burned for 150s):
+    #   /proc/stat busy          8.6% idle -> 59.9% under burn
+    #   cpu_utilization          9.2%      -> 9.0%    (blind)
+    #   system_cpu_utilization  10.6%      -> 60.6%   (tracks, within 1pp)
+    #   cpu_usage/cpu_capacity  425m/4000  -> 2424m/4000 = 60.6%
+    # F09-R aborted on `node_cpu_util < 50` and F15-P required `>= 80` against
+    # the blind series.
+    #
+    # 2026-08-07: the memory twin DOES have this defect. The 08-04 note here said
+    # it did not ("mem_utilization 58.3 vs 57.2 real"), but that comparison was
+    # made without a pod-external memory load — at rest both series read the same
+    # system number, so they look equivalent. They only diverge once something
+    # outside the pod accounting allocates. F05-P run 1f444bc5 measured it, same
+    # node (tb-w1), same window, 5500MiB memhog:
+    #   18:22  system_mem_utilization 51.80%   mem_utilization 55.35%
+    #   18:23                         93.12%                   52.02%  <- diverge
+    #   18:29                         93.74%                   46.85%
+    # mem_usage/mem_capacity = 45.80% matches mem_utilization, which pins it as
+    # pod/cgroup-scoped accounting. memhog is an ssh-launched process outside any
+    # pod, so that accounting cannot see it — exactly the CPU story.
+    # The rung reached and held the 92% success threshold for 6.5 minutes and the
+    # controller saw 46%; it escalated into 6250MiB, which killed the node.
     "kcm-node-cpu-utilization-v1": (
-        'max without(grade) (kcm.node.cpu_utilization{node="%s"})'
+        'max without(grade) '
+        '(last_over_time(kcm.node.system_cpu_utilization{node="%s"}[120s]))'
     ),
     # 실측(2026-07-21): 메트릭명은 mem_utilization(memory_ 아님), 단위 퍼센트,
-    # grade 라벨 중복은 max로 붕괴.
+    # grade 라벨 중복은 max로 붕괴. 2026-08-07: system_ 계열로 교체(위 참조).
     "kcm-node-memory-utilization-v1": (
-        'max without(grade) (kcm.node.mem_utilization{node="%s"})'
+        'max without(grade) '
+        '(last_over_time(kcm.node.system_mem_utilization{node="%s"}[120s]))'
     ),
     "http-server-duration-p95-v1": (
         'histogram_quantile(0.95, sum by (le) '
         '(rate(http_server_request_duration_seconds_bucket{service_name=~"%s"}[2m])))'
     ),
+    # Two defects in one read, both measured 2026-08-07 against VictoriaMetrics.
+    #
+    # (1) The APM agent republishes a *running* aggregate every ~2.5s but stamps
+    # every publication of a minute with that minute's boundary, so one series
+    # carries ~24 samples at one identical timestamp. VM keeps an arbitrary one,
+    # so a plain instant read lands anywhere on the minute's partial curve —
+    # including the leading 0.0 published before the minute's first transaction
+    # completed. commerce-payment at 08:17Z: a single timestamp holding
+    # 19.82/61.27/146.3/262.52 with span_count climbing 1..7 alongside. F20-R
+    # run fa6749a8 (05:07-05:18Z) is the same disease: the raw read gave
+    # 0.0/39389/46503/30016/20467/30010/... while the collapsed read gives a flat
+    # 43128/45390/46503/44530/30501/30518/... — the underlying signal never
+    # oscillated, only the read did, and the sawtooth left order_p95>=1500 with
+    # six qualifying ticks but never two in a row against consecutive_ticks: 3.
+    # max_over_time collapses the cluster deterministically. `max` and not
+    # `last`: samples sharing a timestamp have no defined order, and
+    # last_over_time returned 235.7 where the cluster's final value was 366.43
+    # (08:23Z). The running p95 is non-decreasing in practice as the minute
+    # fills, so the max is the completed minute.
+    #
+    # (2) A window that completed no transaction still publishes p95=0, which is
+    # indistinguishable *in this series* from a genuinely instant response — so
+    # "p95==0 is unusable" cannot be decided from p95 alone. span_count over the
+    # same window is the discriminator, and `and on(...)` evaluates it at the
+    # same instant over the same window rather than as a second racing read
+    # (a separate instant query would draw its own arbitrary sub-sample: at
+    # 05:07Z the raw span_count read 0 while the minute in fact carried 3 spans).
+    # No samples -> empty result -> LiveProbeError -> unusable, which is the
+    # defensive side: a withheld read holds the judgement, while a fake 0.0 both
+    # breaks consecutive-tick gates and can *satisfy* an `lt` escalate condition
+    # and drive a level change on absent traffic.
+    #
+    # The 60s window is also what enforces freshness here, exactly as in the GC
+    # ratio template below: it is stricter than the registry's 120s
+    # freshness_sec, which never reaches PromQL, so a read that returns at all
+    # is necessarily fresh.
+    # 2026-08-12: `offset 30s` 추가. 창 폭 60초는 그대로다.
+    #
+    # 이 게이지는 "지금 이 순간"을 물으면 값이 아직 도착하지 않아 자주 빈다. 원인은
+    # 창 정렬이 아니라 **적재 지연**이다 — 그래서 과거 시각으로 재조회하면 결손이
+    # 재현되지 않는다(그 사이 적재가 끝나 있다). 실시간으로 재야 보인다.
+    # commerce-order, 10초 간격 30 표본, 2026-08-12 실측:
+    #
+    #     현행 [60s]        결손  7/30 = 23%
+    #     [60s] offset 15s  결손  2/30 =  7%
+    #     [60s] offset 30s  결손  0/30 =  0%
+    #
+    # 결손은 그냥 손실이 아니라 **판정을 되돌린다**: 스트릭은 독립 표본을 세는데
+    # consecutive_ticks 2~3 을 채우는 동안 하나만 비어도 D0 의 hold 상한(2x독립창)을
+    # 넘기면 0 으로 리셋된다. 7차 사이클에서 F15-H(25/53 unusable)·F15-T2(35/72)가
+    # 스트릭 1 을 못 넘었고, F20-R 은 escalate 틱에 결손이 떨어져
+    # decision_observation_unavailable 로 abort 했다 — 수리 4종 중 셋이 이것으로 죽었다.
+    #
+    # 백로그 #23 은 offset 15s 를 권고했고 당시 실측은 결손 0% 였다. 지금은 15s 로
+    # 7% 가 남는다 — 지연이 커졌다. 값을 그대로 옮겨오지 말고 다시 잴 것.
+    # 창을 넓히는 것은 여전히 금지다(폭 60초는 항상 정확히 한 분 클러스터를 고르지만
+    # 90초는 둘을 걸쳐 max_over_time 이 나쁜 분을 회복 후에도 붙든다). offset 은 폭을
+    # 건드리지 않는다. 대가는 위반·회복이 **똑같이** 30초 늦는 균일 이동이다.
     "apm-agent-percentile95-v1": (
-        'max without(grade) (apm.agent.otel.java.percentile95{service_name="%s"})'
+        'max without(grade) '
+        '(max_over_time(apm.agent.otel.java.percentile95'
+        '{service_name="%s"}[60s] offset 30s))'
+        ' and on(service_name) '
+        '(max without(grade) '
+        '(max_over_time(apm.agent.otel.java.span_count'
+        '{service_name="%s"}[60s] offset 30s)) > 0)'
     ),
+    # Same publisher, same two defects as the percentile gauge above, and the
+    # same guard. Measured 2026-08-07: error_rate also arrives as ~24 samples
+    # sharing one minute-boundary timestamp, so a plain instant read draws an
+    # arbitrary point of the minute's running aggregate, and an empty window
+    # publishes 0 — which for an error *rate* reads as "this service is healthy"
+    # at exactly the moment it stopped serving. That is the false-negative
+    # direction the ClickHouse twin had.
+    #
+    # No controller binds prometheus.apm_service_error_rate today (the trace-table
+    # query clickhouse.service_error_rate is what the scenarios use), so this is
+    # closed while the blast radius is zero rather than left for whoever wires it
+    # next and inherits the bug silently.
     "apm-agent-error-rate-v1": (
-        'max without(grade) (apm.agent.otel.java.error_rate{service_name="%s"})'
+        'max without(grade) '
+        '(max_over_time(apm.agent.otel.java.error_rate'
+        '{service_name="%s"}[60s] offset 30s))'
+        ' and on(service_name) '
+        '(max without(grade) '
+        '(max_over_time(apm.agent.otel.java.span_count'
+        '{service_name="%s"}[60s] offset 30s)) > 0)'
     ),
+    # The bare sum() this used until 2026-07-30 also summed `grade`, which the
+    # APM pipeline fans every series out across (13 copies of one measurement —
+    # see the daemon-thread note below). Pending sits at 0 at rest so the 13x
+    # inflation was invisible, but it only leaves 0 during the very faults these
+    # gates judge: F21-Q's `pool-is-the-bottleneck > 2` would have disqualified
+    # the run on a single genuinely-pending connection. Collapse grade first,
+    # then sum across pools/instances as before.
     "otel-hikari-pending-v1": (
-        'sum(db.client.connections.pending_requests{service_name="%s"})'
+        'sum(max without(grade) '
+        '(last_over_time(db.client.connections.pending_requests'
+        '{service_name="%s"}[60s])))'
     ),
+    # Parameterized on 2026-07-28. It used to hardcode testbed-product, which
+    # made the throttling signal exist for F12-H and for nothing else — F09-P
+    # throttles testbed-inventory and was rejected before it reached PromQL.
+    # 2026-08-04: `max without(grade)` collapses the 13 grade copies but keeps
+    # `pod`, so a Deployment mid-rollout answers with one series per pod and the
+    # single-series guard rejects the read. That is exactly when these scenarios
+    # are looking: F12-H's 100m rung kills the pod, so the observation went
+    # unusable at the only ticks that mattered. Collapse everything — across
+    # pods we want the worst one, which is what max already means here.
     "kcm-pod-cpu-throttled-time-v1": (
-        'max without(grade) (kcm.pod.cpu_throttled_time{namespace="rca-testbed-commerce",'
-        'pod=~"testbed-product-.*"})'
+        'max (last_over_time(kcm.pod.cpu_throttled_time'
+        '{namespace="%s",pod=~"%s-.*"}[120s]))'
     ),
+    # Old-gen occupancy immediately after a collection, as a fraction of the
+    # pool limit. This is the GC-pressure signal: a heap that cannot be reclaimed
+    # keeps climbing here even though used/committed look busy either way.
+    # jvm.gc.duration is not collected, so this stands in for it (F09-H).
+    #
+    # Divide per pod (host_name), THEN aggregate. The old form aggregated
+    # numerator and denominator independently with max by (service_name), so
+    # during a rollout — which is exactly what a k8s.env heap injection causes —
+    # it divided one pod's used_after_last_gc by another pod's limit. VM's 5min
+    # staleness lookback kept dead pods alive longer than the 4m min_hold, so
+    # the query never once read a single pod cleanly: run 4cc52147's "0.324" was
+    # a baseline pod's numerator over an injected pod's denominator, while the
+    # real heap-160 pod sat at 0.5085 (measured 2026-08-06). last_over_time[90s]
+    # is what actually enforces freshness — the registry's freshness_sec never
+    # reaches PromQL.
+    "otel-jvm-old-gen-after-gc-ratio-v1": (
+        'max('
+        'max by (host_name) (last_over_time(apm.agent.otel.java.jvm.memory.used_after_last_gc'
+        '{service_name="%s",jvm_memory_pool_name="Tenured Gen"}[90s]))'
+        ' / '
+        'max by (host_name) (last_over_time(apm.agent.otel.java.jvm.memory.limit'
+        '{service_name="%s",jvm_memory_pool_name="Tenured Gen"}[90s]))'
+        ')'
+    ),
+    # Smallest live pod's Tenured limit in MiB — a noise-free step function
+    # (256Mi heap -> 170.69, 208 -> 138.69, 160 -> 106.69; SerialGC NewRatio=2).
+    # Reads "did the heap injection actually land": run 4793c9f4 froze at the
+    # baseline ratio for its whole run because the rollout never delivered an
+    # injected pod into the query's view, and no ratio threshold can express
+    # that (a fresh baseline pod legitimately reads 0.29).
+    "otel-jvm-tenured-limit-mib-v1": (
+        'min(max by (host_name) (last_over_time(apm.agent.otel.java.jvm.memory.limit'
+        '{service_name="%s",jvm_memory_pool_name="Tenured Gen"}[90s]))) / 1048576'
+    ),
+    # Same single-series collapse as the throttle template above. This one also
+    # ignored its own declared parameters and hardcoded F12-H's target, so the
+    # namespace/deployment in the manifest were decorative — any other scenario
+    # asking this question would silently have been answered about
+    # testbed-product.
     "kcm-workload-network-error-rate-v1": (
-        'max without(grade) (kcm.pod.network_rx_error{namespace="rca-testbed-commerce",'
-        'pod=~"testbed-product-.*"}) + max without(grade) '
-        '(kcm.pod.network_tx_error{namespace="rca-testbed-commerce",'
-        'pod=~"testbed-product-.*"})'
+        'max (last_over_time(kcm.pod.network_rx_error'
+        '{namespace="%s",pod=~"%s-.*"}[120s])) '
+        '+ max (last_over_time(kcm.pod.network_tx_error'
+        '{namespace="%s",pod=~"%s-.*"}[120s]))'
     ),
     # F21-Q/P: no Tomcat-thread-pool metric exists in the APM pipeline —
-    # apm.agent.otel.java.jvm.thread.count (non-daemon sum) is the approved
-    # approximation (live-verified 2026-07-24, jvm_thread_state/host/pid labels
-    # collapsed via `sum without`).
-    "otel-jvm-nondaemon-thread-count-v1": (
-        'sum without(grade,target_id,host_name,process_pid,os_description,os_type,'
-        'host_arch,jvm_thread_state) (apm.agent.otel.java.jvm.thread.count'
-        '{service_name="%s",jvm_thread_daemon="false"})'
+    # Tomcat's http-nio-*-exec worker threads are DAEMON threads, so the
+    # non-daemon filter this query used until 2026-07-28 excluded exactly the
+    # pool the thread-saturation scenarios (F21-P, F21-Q) are about. Measured on
+    # VictoriaMetrics 119:18428 over 24h: non-daemon sits flat at 4-5 and never
+    # moves, while daemon runs ~40 at rest and climbs to ~80 under load. A gate
+    # of "busy threads >= 180" against the non-daemon count could never fire.
+    #
+    # 2026-07-30: that ~40 was the per-grade truth, but the query summed `grade`
+    # away — the APM pipeline emits 13 identical copies of every series under
+    # distinct grade ids, so the gate read ~570 instead of ~44. Everything
+    # downstream inverted: success (>=180) held at rest, must_rule_out (<60)
+    # could never fire, and recovery (<60) could never complete. States DO
+    # partition the thread set, so they are still summed; grade and the instance
+    # labels are collapsed with max (max-threads is per JVM — with replicas we
+    # want the worst instance, not their sum). Measured after the fix: 42-45 at
+    # rest for core-banking-api, 39-43 for food-delivery-order.
+    "otel-jvm-daemon-thread-count-v1": (
+        'max without(grade,target_id,host_name,process_pid,os_description,'
+        'os_type,host_arch) (sum without(jvm_thread_state) '
+        '(last_over_time(apm.agent.otel.java.jvm.thread.count'
+        '{service_name="%s",jvm_thread_daemon="true"}[60s])))'
     ),
 }
 APPROVED_SERVICES = frozenset({"commerce-gateway", "commerce-order", "commerce-payment"})
@@ -110,15 +430,54 @@ APPROVED_APM_SERVICES = frozenset(
 # F21-Q/P: JVM non-daemon thread sum approximates the Tomcat 200-thread pool
 # (no Tomcat-specific metric exists in the pipeline — see PROMETHEUS_TEMPLATES).
 APPROVED_JVM_THREAD_SERVICES = frozenset({"food-delivery-order", "core-banking-api"})
+# F09-H: heap pressure on commerce order.
+APPROVED_GC_SERVICES = frozenset({"commerce-order"})
+# (namespace, deployment, container) allowed to be asked about CPU throttling.
+THROTTLE_TARGETS = {
+    ("rca-testbed-commerce", "testbed-product", "product-service"),
+    ("rca-testbed-commerce", "testbed-inventory", "inventory-service"),
+    # F21-P (2026-07-31): the injected cause itself — transfer is the only
+    # service being throttled, so this is the observation that proves the fault
+    # landed. It was missing on the first calibration run and the observation
+    # read error for the whole injection; the scenario could not show its own
+    # cause. test_observation_targets_are_allowlisted now fails on any such gap.
+    ("rca-testbed-banking", "testbed-transfer", "transfer-service"),
+}
 # F19-P: Hikari pending gauge (OTel semconv db.client.connections.pending_requests,
 # live-verified 2026-07-24 on VictoriaMetrics 119:18428).
 # F20-P: transfer's own Hikari pool occupied by the trunc() full-scan stats
 # query — the decisive "own connection pool contention" signal for F20-P.
-APPROVED_HIKARI_SERVICES = frozenset({"food-delivery-order", "core-banking-transfer"})
+# F02-H: commerce order's pool backing up is what separates "the storage is
+# saturated" from "the application got slower" — the wait is on the DB side.
+APPROVED_HIKARI_SERVICES = frozenset(
+    {"food-delivery-order", "core-banking-transfer", "commerce-order"}
+)
 APPROVED_NODE_TARGETS = frozenset({"tb-w1", "tb-w2", "tb-w3"})
+# scenario_id -> (node, namespace, workloads that must actually be running on it).
+# Server-side on purpose: the scenario may not nominate the node it is about to
+# be judged against, exactly as APPROVED_K8S_TARGETS keeps selectors out of
+# manifest reach. Placement moved once already (2026-07-28) and every scenario
+# that named a node by hand went stale silently.
+WORKER_COHORT_PLACEMENT = {
+    "F05-P": (
+        "tb-w1",
+        "rca-testbed-commerce",
+        (
+            "testbed-gateway",
+            "testbed-cart",
+            "testbed-inventory",
+            "testbed-redis",
+            "testbed-kafka",
+            "testbed-payment",
+        ),
+    ),
+}
 APPROVED_BUSINESS_KEYS = frozenset({"checkout", "order-1"})
 APPROVED_K8S_TARGETS = {
     ("rca-testbed-commerce", "api-gateway"): "app=testbed-gateway",
+    # F05-P names the gateway by its real Deployment name; the api-gateway key
+    # above predates it and is the container's name, kept for older manifests.
+    ("rca-testbed-commerce", "testbed-gateway"): "app=testbed-gateway",
     ("rca-testbed-commerce", "testbed-payment"): "app=testbed-payment",
     ("rca-testbed-commerce", "testbed-inventory"): "app=testbed-inventory",
     ("rca-testbed-commerce", "testbed-cart"): "app=testbed-cart",
@@ -144,6 +503,11 @@ APPROVED_K8S_TARGETS = {
     # F21-P watches the banking api pod while its Tomcat 200 thread pool
     # saturates (109 kubectl-verified 2026-07-24: app=testbed-api).
     ("rca-testbed-banking", "testbed-api"): "app=testbed-api",
+    # F14-P's recovery gate watches the ledger pod after its table-readonly
+    # injection clears. Missing here through the whole 2026-08-03 batch, so
+    # recovery could never be verified and the run always aged into DIRTY
+    # (kubectl-verified 2026-08-03: app=testbed-ledger).
+    ("rca-testbed-banking", "testbed-ledger"): "app=testbed-ledger",
     # F24-Q (+ F02-P live defect repair) watches the restaurant pod while its
     # Hikari/Tomcat pool saturates under load.north_south flood on NodePort
     # 30181 (109 k8s manifest-verified 2026-07-24: app=testbed-restaurant).
@@ -154,16 +518,114 @@ F12_PRODUCT_TARGET = {
     "deployment": "testbed-product",
     "container": "product-service",
 }
-ORACLE_TAG_CONTRACT = {"client_identifier": "rca-F01-P-oracle-lock"}
+# (namespace, deployment) allowed to be asked about pod network errors. F12-H
+# uses this as the discriminator that separates "CPU starvation" from "the
+# network broke"; the template used to hardcode this pair.
+NETWORK_ERROR_TARGETS = {
+    ("rca-testbed-commerce", "testbed-product"),
+}
+# Every Oracle lock scenario, not just F01-P. The tag used to be frozen into a
+# single contract dict *and* hand-encoded as chr() codes inside the SQL, so
+# F08-G and F15-G had no way to be observed at all and pointed their Oracle
+# observations at the PostgreSQL probe instead — which cannot see an Oracle
+# session, so the gate could never pass.
+# PostgreSQL side. F01-R and F06-H are absent on purpose: their injectors now
+# impersonate the real application (G6/L1), so they are observed through
+# database.blocked_session_count instead of a name. The three that remain still
+# tag, and F15-G was missing here — which is why its lock was invisible to its
+# own controller.
+APPROVED_SESSION_TAGS = frozenset({
+    "rca-F02-G-batch-heavy-sql",
+    "rca-F15-G-inventory-lock",
+    "rca-F15-T1-inventory-lock",
+})
+# The manifests stopped naming the scenario in the session tag — an `rca-F01-P-*`
+# identifier is a level-2 answer leak, so all three Oracle locks now impersonate a
+# plausible DBA session. This allowlist kept the old names and therefore rejected
+# every real tag with "Oracle session tag is not allowlisted", which left F01-P,
+# F08-G and F15-G unable to verify recovery and wedged the queue with a global
+# DIRTY (2026-08-03). The old names are dead: no manifest emits them.
+APPROVED_ORACLE_TAGS = frozenset({
+    "dba-maintenance",
+})
+
+
+def _oracle_string_literal(value: str) -> str:
+    """Render a string as chr()||chr() so it can ride inside the nested
+    printf/sqlplus shell pipeline without a single quote of its own."""
+    if not value or not all(32 <= ord(ch) < 127 for ch in value):
+        raise LiveProbeError("Oracle tag is not printable ASCII")
+    return "||".join(f"chr({ord(ch)})" for ch in value)
+
+
+def _oracle_sqlplus(query: str) -> str:
+    """Build the sh -lc argument for a single-value Oracle probe.
+
+    The container switch prints "Session altered.", so the display settings must
+    already be in force when it runs. All four Oracle probes had the two lines the
+    other way round, which put that sentence ahead of the digits and made the
+    fullmatch check reject every reading — measured 2026-07-30: the probes had never
+    once returned a value. Emitting the order from one place keeps the next probe
+    from reintroducing it.
+    """
+    return (
+        "printf 'set pages 0 feedback off heading off\\n"
+        "alter session set container=FREEPDB1;\\n"
+        f"{query}\\n"
+        "exit;\\n' | sqlplus -s / as sysdba"
+    )
 MYSQL_INDEX_CONTRACT = {
     "database": "fooddelivery", "table": "menus", "index": "idx_menus_category"
 }
 OUTBOX_UNPUBLISHED_CONTRACT = {"namespace": "rca-testbed-banking"}
+# F04-H decisive evidence: commerce order_schema.outbox_events rows the halted
+# relay has not published. The banking counterpart above goes through sqlplus on
+# testbed-oracle-0 and is therefore unusable here — commerce lives on
+# PostgreSQL, so this one rides the same database_client as the other commerce
+# probes. Baseline sits near zero because the relay drains every 2s
+# (OutboxRelay @Scheduled), which is what makes a monotone climb decisive.
+COMMERCE_OUTBOX_UNPUBLISHED_CONTRACT = {
+    "db_host": "192.168.122.77",
+    "db_port": 30432,
+    "db_name": "commerce",
+    "db_user": "commerce",
+    "schema": "order_schema",
+    "table": "outbox_events",
+}
+COMMERCE_OUTBOX_UNPUBLISHED_SQL = (
+    "SELECT count(*) AS unpublished_count FROM order_schema.outbox_events "
+    "WHERE published_at IS NULL"
+)
+# Preflight: did a real business transaction complete recently? "Load is
+# flowing" (baseline-traffic) does not answer that — it only proves k6 is
+# running, and k6 keeps running happily while every checkout fails.
+#
+# 2026-07-28: commerce checkout failed 100% for a full day because the banking
+# seed account 'commerce-merchant' went missing in the Oracle re-seed. Nothing
+# caught it. Scenarios that certify damage as "checkout 5xx >= 5%" were
+# trivially true with no injection at all, and scenarios that require a healthy
+# checkout were trivially false. A whole day of runs would have been fiction.
+#
+# A PAID order is the widest single assertion available: it clears order ->
+# payment -> core-banking transfer, so one query covers the cross-domain path
+# that no per-service health endpoint sees.
+BASELINE_PAID_ORDERS_SQL = (
+    "SELECT count(*) AS paid_count FROM order_schema.orders "
+    "WHERE status = 'PAID' AND created_at >= now() - interval '5 minutes'"
+)
+# Baseline commerce runs continuously and yields ~24 PAID orders/min (measured
+# 2026-07-28: 245 in 10 minutes). Five in five minutes is a ~96% drop — far
+# below normal jitter, so this trips on a broken path, not on a slow one.
+BASELINE_PAID_ORDERS_MIN = 5
 HOST_PROBE_CONTRACTS = {
     "F02-H": ("192.168.122.184", "fio", "/opt/local-path-provisioner/pvc-5d71e22a-1225-4505-a7cc-5cf29dad4cf5_rca-testbed-commerce_pgdata-testbed-postgres-0"),
     "F10-R": ("192.168.122.184", "watermark", "/opt/local-path-provisioner/pvc-5d71e22a-1225-4505-a7cc-5cf29dad4cf5_rca-testbed-commerce_pgdata-testbed-postgres-0"),
     "F10-H": ("192.168.122.14", "fio", "/opt/local-path-provisioner/pvc-3439d85f-f921-4b19-8808-c679506a31dd_rca-testbed-food_mysqldata-testbed-mysql-0"),
-    "F10-P": ("192.168.122.184", "fio", "/opt/local-path-provisioner/pvc-01f9e717-727a-4227-a09b-584ec371c99f_rca-testbed-banking_oracledata-testbed-oracle-0"),
+    # 2026-07-28: Oracle moved to tb-w2 when the domain-worker placement was
+    # pinned with nodeSelector, and its local-path PV had to be reprovisioned —
+    # so both the host and the PVC uuid changed. The old pair pointed at a
+    # directory that no longer exists on a node the injection never touches.
+    "F10-P": ("192.168.122.11", "fio", "/opt/local-path-provisioner/pvc-2c369013-b180-417a-9eda-da922c78b6ee_rca-testbed-banking_oracledata-testbed-oracle-0"),
     "F15-P": ("192.168.122.11", "pressure", ""),
 }
 HOST_PROBE_SCRIPT = br'''#!/usr/bin/env bash
@@ -171,7 +633,7 @@ set -euo pipefail
 scenario="$1"; mode="$2"; target="$3"
 state_root=/var/lib/lucida/scenario-profile-state
 pidfile="$state_root/${scenario}.pid"
-active=false; artifact=false; used=0
+active=false; artifact=false; used=0; io_util=0
 if [[ -s "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then active=true; fi
 case "$mode" in
  fio) [[ -e "$target/.lucida-${scenario}-fio" ]] && artifact=true ;;
@@ -180,13 +642,77 @@ case "$mode" in
  *) exit 2 ;;
 esac
 if [[ -n "$target" ]]; then used=$(df -P "$target" | awk 'NR==2{gsub(/%/,"",$5); print $5}'); fi
+# Disk busy percentage for the device backing $target, from /proc/diskstats
+# io_ticks (ms spent with I/O in flight). Partitions report io_ticks
+# unreliably, so resolve the parent disk first.
+# Averaged since the previous probe call (state file below): a 1s spot sample
+# swung 41..98 tick-to-tick under constant-rate fio and broke every
+# 3-consecutive-tick judgment while the device stayed saturated (batch #25,
+# F10-P). The interval average measures what the judgment actually asks --
+# "was the device busy over this tick" -- with no added probe latency. First
+# call, device change, or a stale (>120s) interval falls back to a 1s sample.
+if [[ -n "$target" ]]; then
+  src=$(df -P "$target" | awk 'NR==2{print $1}')
+  dev=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)
+  [[ -z "$dev" ]] && dev=$(basename "$src")
+  iostate="$state_root/${scenario}.iosample"
+  now_ms=$(date +%s%3N)
+  t1=$(awk -v d="$dev" '$3==d{print $13}' /proc/diskstats)
+  pdev=""; pticks=""; pms=""
+  { [[ -s "$iostate" ]] && read -r pdev pticks pms < "$iostate"; } || true
+  if [[ -n "$t1" && "$pdev" == "$dev" && -n "$pticks" && -n "$pms" ]] \
+     && (( now_ms > pms )) && (( now_ms - pms <= 120000 )) && (( t1 >= pticks )); then
+    io_util=$(( (t1 - pticks) * 100 / (now_ms - pms) ))
+  elif [[ -n "$t1" ]]; then
+    t0=$t1
+    sleep 1
+    t1=$(awk -v d="$dev" '$3==d{print $13}' /proc/diskstats)
+    if [[ -n "$t1" && "$t1" -ge "$t0" ]]; then
+      io_util=$(( (t1 - t0) / 10 ))
+    fi
+    now_ms=$(date +%s%3N)
+  fi
+  (( io_util > 100 )) && io_util=100
+  if [[ -n "$t1" ]]; then
+    # state_root is created by the executors; a host where none ever ran must
+    # degrade to the 1s fallback, not fail the whole probe.
+    { printf '%s %s %s\n' "$dev" "$t1" "$now_ms" > "$iostate"; } 2>/dev/null || true
+  fi
+fi
 clean=true; $active && clean=false; $artifact && clean=false
-printf '{"active":%s,"clean":%s,"filesystem_used_percent":%s}\n' "$active" "$clean" "$used"
+printf '{"active":%s,"clean":%s,"filesystem_used_percent":%s,"disk_io_utilization":%s}\n' \
+  "$active" "$clean" "$used" "$io_util"
 '''
 TAGGED_SESSION_SQL = (
     "SELECT count(*) AS tagged_count FROM pg_stat_activity "
     "WHERE application_name = current_setting('lucida.scenario_tag')"
 )
+# Successor to TAGGED_SESSION_SQL for the PostgreSQL lock scenarios (F01-R,
+# F06-H). Those injectors no longer wear a scenario-encoded application_name —
+# the tag was the answer written in plain text in the captured data (quality
+# charter L1), so the injecting session now presents itself as "PostgreSQL JDBC
+# Driver" exactly like the app. A name-based count therefore always returns 0.
+#
+# The replacement counts the injection's *victims* instead of its signature:
+# sessions that are blocked (pg_blocking_pids) while touching the target
+# relation. This is strictly better evidence — a held lock nobody waits on is
+# not an incident (charter G3), so what the controller needs to confirm is that
+# the lock actually bites. Covers both lock scopes: a row-lock waiter blocks on
+# transactionid while holding a granted relation lock on the target, and a
+# table-lock waiter blocks on the relation itself. Both match on l.relation.
+BLOCKED_SESSION_SQL = (
+    "SELECT count(*) AS blocked_count FROM pg_stat_activity a "
+    "WHERE cardinality(pg_blocking_pids(a.pid)) > 0 "
+    "AND EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid "
+    "AND l.relation = to_regclass(current_setting('lucida.lock_relation')))"
+)
+# Only relations an approved db.lock level actually targets may be probed.
+BLOCKED_SESSION_RELATIONS = frozenset(
+    {"inventory_schema.inventory", "payment_schema.payments"}
+)
+# F14-P's reconciliation window. Pinned so a widened window cannot quietly turn a
+# stale backlog into a fresh "damage" reading.
+LEDGER_UNMATCHED_CONTRACT = {"window_minutes": 5, "grace_seconds": 60}
 INDEX_PRESENT_SQL = (
     "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_indexes "
     "WHERE schemaname = current_setting('lucida.index_schema') "
@@ -238,9 +764,29 @@ INVENTORY_STOCK_CONTRACT = {
 INVENTORY_ZERO_STOCK_SQL = (
     "SELECT count(*) AS zero_stock_count FROM inventory_schema.inventory WHERE stock = 0"
 )
-# F23-R must_rule_out companion: RESTOCK movement rows in the last 12 minutes
-# (batch period 10m + margin) — zero rows means the reconciliation batch has
-# stopped running, not merely that stock hasn't hit zero yet.
+# F23-R must_rule_out companion: RESTOCK movement rows in the recent window —
+# zero rows means the reconciliation batch has stopped running, not merely that
+# stock hasn't hit zero yet.
+#
+# The lookback has to stay a small multiple of the batch period or the
+# discriminator goes blind in the direction that matters: rows written before the
+# injection keep answering "still running" long after the batch has stopped.
+# testbed-services 52f23b6 rescaled restock from a 600s burst to a 60s steady
+# supply, which made the 12m window (10m period + margin) a stale scale, and the
+# registry moved to 5.
+#
+# The window is defined once here because the contract and the SQL are compared
+# and executed separately: parameters must match the registry *exactly*
+# (`!= RESTOCK_MOVEMENT_CONTRACT` below) while the SQL is a module constant keyed
+# into production_runtime's PARAMETERLESS_DATABASE_PROBES, so it cannot be built
+# from the parameters the way the ledger window is. Editing one and not the other
+# does not fail loudly — it rejects every tick at runtime.
+#
+# The wider lesson from 2026-08-07: a registry parameter change needs the runner's
+# allowlist contract to move with it. Synchronizing the four faces inside
+# testbed-services still leaves this fifth one in another repo, and the only thing
+# that catches it is test_every_live_controller_observation_passes_the_probe_allowlists.
+RESTOCK_MOVEMENT_WINDOW_MINUTES = 5
 RESTOCK_MOVEMENT_CONTRACT = {
     "db_host": "192.168.122.77",
     "db_port": 30432,
@@ -249,11 +795,12 @@ RESTOCK_MOVEMENT_CONTRACT = {
     "schema": "inventory_schema",
     "table": "inventory_movements",
     "movement_type": "RESTOCK",
-    "window_minutes": 12,
+    "window_minutes": RESTOCK_MOVEMENT_WINDOW_MINUTES,
 }
 RESTOCK_MOVEMENT_SQL = (
     "SELECT count(*) AS restock_count FROM inventory_schema.inventory_movements "
-    "WHERE movement_type = 'RESTOCK' AND created_at >= now() - interval '12 minutes'"
+    "WHERE movement_type = 'RESTOCK' AND created_at >= now() - interval "
+    f"'{RESTOCK_MOVEMENT_WINDOW_MINUTES} minutes'"
 )
 DEPLOYMENT_REPLICAS_CONTRACT = {
     "namespace": "rca-testbed-commerce",
@@ -266,6 +813,11 @@ APPROVED_DEPLOYMENT_REPLICA_TARGETS = frozenset(
         ("rca-testbed-commerce", "testbed-product"),
         ("rca-testbed-banking", "testbed-transfer"),
         ("rca-testbed-commerce", "testbed-user"),
+        # F05-P watches gateway availableReplicas collapse while tb-w1 drains.
+        # Unlisted until the widened allowlist guard flagged it (2026-08-03) —
+        # the scenario skipped for other reasons in the batch, so this probe
+        # had never actually run.
+        ("rca-testbed-commerce", "testbed-gateway"),
     }
 )
 F05_PAYMENT_TARGET = {
@@ -305,6 +857,20 @@ F25_H_POSTGRES_TARGET = {
     "namespace": "rca-testbed-commerce",
     "deployment": "testbed-postgres",
     "container": "postgres",
+}
+# F05-P must_rule_out: a rising kafka restart count would mean the broker is
+# crashlooping rather than the node draining — restart-count query only.
+F05_KAFKA_TARGET = {
+    "namespace": "rca-testbed-commerce",
+    "deployment": "testbed-kafka",
+    "container": "kafka",
+}
+# F09-H must_rule_out: a rising order restart count would mean crashloop, not
+# the injected heap pressure — restart-count query only.
+F09_ORDER_TARGET = {
+    "namespace": "rca-testbed-commerce",
+    "deployment": "testbed-order",
+    "container": "order-service",
 }
 F05_PAYMENT_BASELINE_RESOURCES = {
     "requests": {"cpu": "200m", "memory": "512Mi"},
@@ -370,6 +936,10 @@ class ProbePaths:
     runs: Path = Path("/var/lib/lucida/scenario-runs")
     baseline_status: Path = Path("/app/state/loadgen/baseline-status.json")
     loadgen_summary: Path = Path("/app/state/loadgen/latest-summary.json")
+    # Per-domain baseline live documents, published continuously by the resident
+    # loadgen units (see testbed-services docs/spec-scenario-observation-plane.md).
+    # The filename carries the domain: baseline-<domain>-live.json.
+    baseline_summary_dir: Path = Path("/app/state/loadgen")
     capture_root: Path = Path("/var/lib/lucida/scenario-runs")
     profile_state: Path = Path("/var/lib/lucida/scenario-profile-state")
 
@@ -417,9 +987,21 @@ class LiveProbeSet:
             "coordinator-clean": lambda: coordinator_clean,
             "clean-window": lambda: not overlap_ids,
             "baseline-traffic": self._baseline_active,
+            "baseline-business-success": self._baseline_business_succeeds,
             "target-health": self._target_healthy,
+            "worker-cohort-placement": self._worker_cohort_is_placed,
         }
-        results = {check: _safe_bool(checks[check]) for check in request.checks}
+        results: dict[str, bool] = {}
+        errors: dict[str, str] = {}
+        for check in request.checks:
+            try:
+                results[check] = checks[check]() is True
+            except Exception as error:
+                # Preserve the reason instead of collapsing it into a bare
+                # False — an exception here is a broken probe or a transient
+                # transport failure, not evidence the precondition is unmet.
+                results[check] = False
+                errors[check] = f"{type(error).__name__}: {error}"
         baseline_active = (
             results["baseline-traffic"]
             if "baseline-traffic" in results
@@ -430,6 +1012,7 @@ class LiveProbeSet:
             source="live-probes:v1",
             quality="good",
             check_results=results,
+            check_errors=errors,
             clean_window_start=window_start,
             clean_window_end=_aware(request.requested_at),
             overlapping_run_ids=sorted(overlap_ids),
@@ -443,6 +1026,7 @@ class LiveProbeSet:
                 "loadgen_summary": self._loadgen_observation,
                 "http_probe": self._http_observation,
                 "prometheus": self._prometheus_observation,
+                "clickhouse": self._clickhouse_observation,
                 "kubernetes": self._kubernetes_observation,
                 "database": self._database_observation,
                 "host_probe": self._host_observation,
@@ -493,6 +1077,32 @@ class LiveProbeSet:
         names = {item["metadata"]["name"] for item in document["items"]}
         return names == EXPECTED_KUBE_NODES
 
+    def _worker_cohort_is_placed(self) -> bool:
+        placement = WORKER_COHORT_PLACEMENT.get(self.scenario_id)
+        if placement is None:
+            raise LiveProbeError(
+                f"no worker cohort placement is registered for {self.scenario_id}"
+            )
+        node, namespace, cohort = placement
+        result = self._kubectl("get", "pods", "-n", namespace, "-o", "json")
+        document = json.loads(result.stdout)
+        hosted: dict[str, set[str]] = {}
+        for item in document["items"]:
+            app = (item["metadata"].get("labels") or {}).get("app")
+            node_name = (item.get("spec") or {}).get("nodeName")
+            if not app or not node_name:
+                continue
+            if (item.get("status") or {}).get("phase") != "Running":
+                continue
+            hosted.setdefault(app, set()).add(node_name)
+        missing = [name for name in cohort if node not in hosted.get(name, set())]
+        if missing:
+            raise LiveProbeError(
+                f"{node} does not host {sorted(missing)} — the cohort this scenario "
+                "measures is not on the node it starves"
+            )
+        return True
+
     def _baseline_active(self) -> bool:
         if self.paths.baseline_status.is_file():
             document = _read_json(self.paths.baseline_status)
@@ -522,6 +1132,15 @@ class LiveProbeSet:
         )
         return result.stdout.strip() == "active"
 
+    def _baseline_business_succeeds(self) -> bool:
+        response = self.database_client(
+            BASELINE_PAID_ORDERS_SQL, (), credentials=self.database_credentials,
+        )
+        count = response.get("paid_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise LiveProbeError("baseline paid-order count is invalid")
+        return count >= BASELINE_PAID_ORDERS_MIN
+
     def _target_healthy(self) -> bool:
         response = self.http_client("GET", TARGET_HEALTH_URL, timeout=5.0)
         return 200 <= int(response["status"]) < 300
@@ -544,6 +1163,16 @@ class LiveProbeSet:
             for run_dir in self.paths.runs.iterdir():
                 if not run_dir.is_dir() or run_dir.name == exclude_run_id:
                     continue
+                # Not every directory under the runs root is a run. The topology
+                # collector keeps its per-cycle store in cycle-topology/ here, and
+                # _run_intervals' fail-safe treats a directory it cannot read a
+                # timeline from as an open interval — so from 2026-07-26 that one
+                # directory silently blocked the clean-window gate for every
+                # scenario, forever. The fail-safe is right for a run whose
+                # timeline is missing; it must not apply to something that never
+                # was one.
+                if not _is_run_directory(run_dir):
+                    continue
                 # Excused failed attempt (mode-aware retry, 2026-07-20): its short,
                 # cleanly-recovered residue is accepted inside the shortened window.
                 if (run_dir / "clean-window-excused.json").is_file():
@@ -555,41 +1184,29 @@ class LiveProbeSet:
         return overlaps, coordinator_clean
 
     def _loadgen_observation(self, query: ApprovedQuery) -> tuple[float, datetime, str]:
-        if query.parameters or query.query_id not in {
-            "loadgen.achieved_rps", "loadgen.checkout_5xx_rate",
-            "loadgen.write_step_status_rate", "loadgen.read_step_status_rate",
-            "loadgen.food_create_status_rate", "loadgen.transfer_2xx_rate",
-            "loadgen.checkout_409_rate", "loadgen.frozen_bypass_completed_rate",
-            "loadgen.normal_path_reject_rate",
-        }:
+        if query.query_id not in LOADGEN_FIELDS:
             raise LiveProbeError("unsupported loadgen query")
-        document = self._loadgen_live_document()
-        field = {
-            "loadgen.achieved_rps": "achieved_rps",
-            "loadgen.checkout_5xx_rate": "checkout_5xx_rate",
-            "loadgen.write_step_status_rate": "business_nonok_rate",
-            "loadgen.read_step_status_rate": "read_nonok_rate",
-            "loadgen.food_create_status_rate": "business_5xx_rate",
-            "loadgen.transfer_2xx_rate": "business_2xx_rate",
-            # F23-R: business_409_rate is computed by the north-south monitor
-            # (business_step status==409 fraction) alongside business_5xx_rate.
-            "loadgen.checkout_409_rate": "business_409_rate",
-            # F17-P dual-arm reuse: direct arm 2xx rate / control arm reject
-            # rate, both already emitted per business_step/read_step tagging.
-            "loadgen.frozen_bypass_completed_rate": "business_2xx_rate",
-            "loadgen.normal_path_reject_rate": "read_nonok_rate",
-        }[query.query_id]
+        if set(query.parameters) - {"domain"}:
+            raise LiveProbeError("unsupported loadgen query")
+        domain = query.parameters.get("domain")
+        # No domain means the historical behaviour: read the scenario's own k6
+        # output. The 43 live controllers pass no parameters and are untouched.
+        document = (
+            self._baseline_live_document(domain) if domain else self._loadgen_live_document()
+        )
+        field = LOADGEN_FIELDS[query.query_id]
         value = document.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
             raise LiveProbeError(f"k6 {field} is invalid")
         if field.endswith("_rate") and value > 1:
             raise LiveProbeError(f"k6 {field} is outside [0,1]")
-        return float(value), _parse_time(document["observed_at"]), f"k6:{field}"
+        source = f"k6:baseline:{domain}:{field}" if domain else f"k6:{field}"
+        return float(value), _parse_time(document["observed_at"]), source
 
     def _http_observation(self, query: ApprovedQuery) -> tuple[int, datetime, str]:
-        if query.parameters:
-            raise LiveProbeError("unsupported http query")
         if query.query_id == "http.target_health":
+            if query.parameters:
+                raise LiveProbeError("unsupported http query")
             response = self.http_client("GET", TARGET_HEALTH_URL, timeout=5.0)
             status = int(response["status"])
             if not 0 <= status <= 599:
@@ -597,11 +1214,26 @@ class LiveProbeSet:
             return status, _response_time(response, self.clock), "http:target-health"
         if query.query_id != "http.entry_health":
             raise LiveProbeError("unsupported http query")
-        document = self._loadgen_live_document()
+        # `domain` reads the standing baseline unit's document instead of the
+        # scenario's own k6 output — the only entry view that survives when the
+        # scenario has no load companion (F14-P, F15-P, F15-T1) or when the
+        # injection destroys the journey's own step precondition (F16-H: killing
+        # testbed-user login means the scenario k6 never emits a checkout, so
+        # its own entry_status stays null for the whole run, 2026-08-06). The
+        # baseline unit keeps a pre-fault token cache and keeps probing. Same
+        # switch _loadgen_observation already has; do NOT fork a new query_id
+        # for this (the LOADGEN_FIELDS fork is what broke F06-P).
+        if set(query.parameters) - {"domain"}:
+            raise LiveProbeError("unsupported http query")
+        domain = query.parameters.get("domain")
+        document = (
+            self._baseline_live_document(domain) if domain else self._loadgen_live_document()
+        )
         status = document.get("entry_status")
         if isinstance(status, bool) or not isinstance(status, int) or not 0 <= status <= 599:
             raise LiveProbeError("checkout entry status is unavailable")
-        return status, _parse_time(document["observed_at"]), "k6:checkout-entry-status"
+        source = f"k6:baseline:{domain}:entry_status" if domain else "k6:checkout-entry-status"
+        return status, _parse_time(document["observed_at"]), source
 
     def _prometheus_observation(self, query: ApprovedQuery) -> tuple[float, datetime, str]:
         if query.template_id not in PROMETHEUS_TEMPLATES:
@@ -621,7 +1253,9 @@ class LiveProbeSet:
             service = query.parameters["service_name"]
             if service not in APPROVED_APM_SERVICES:
                 raise LiveProbeError("APM service_name is not allowlisted")
-            promql = PROMETHEUS_TEMPLATES[query.template_id] % service
+            # Both name the service twice — once for the value, once for the
+            # span-count guard it is joined against.
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % (service, service)
         elif query.query_id == "prometheus.hikari_pending_connections":
             if set(query.parameters) != {"service_name"}:
                 raise LiveProbeError("Hikari pending query requires the fixed service parameter")
@@ -629,7 +1263,7 @@ class LiveProbeSet:
             if service not in APPROVED_HIKARI_SERVICES:
                 raise LiveProbeError("Hikari service_name is not allowlisted")
             promql = PROMETHEUS_TEMPLATES[query.template_id] % service
-        elif query.query_id == "prometheus.jvm_nondaemon_thread_count":
+        elif query.query_id == "prometheus.jvm_daemon_thread_count":
             if set(query.parameters) != {"service_name"}:
                 raise LiveProbeError("JVM thread query requires the fixed service parameter")
             service = query.parameters["service_name"]
@@ -637,17 +1271,39 @@ class LiveProbeSet:
                 raise LiveProbeError("JVM thread service_name is not allowlisted")
             promql = PROMETHEUS_TEMPLATES[query.template_id] % service
         elif query.query_id == "prometheus.container_cpu_throttled_time":
-            if dict(query.parameters) != F12_PRODUCT_TARGET:
+            if set(query.parameters) != {"namespace", "deployment", "container"}:
+                raise LiveProbeError("CPU throttle query requires the fixed target parameters")
+            target = (
+                query.parameters["namespace"],
+                query.parameters["deployment"],
+                query.parameters["container"],
+            )
+            if target not in THROTTLE_TARGETS:
                 raise LiveProbeError("CPU throttle target is not allowlisted")
-            promql = PROMETHEUS_TEMPLATES[query.template_id]
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % (target[0], target[1])
+        elif query.query_id == "prometheus.jvm_old_gen_after_gc_ratio":
+            if set(query.parameters) != {"service_name"}:
+                raise LiveProbeError("GC ratio query requires the fixed service parameter")
+            service = query.parameters["service_name"]
+            if service not in APPROVED_GC_SERVICES:
+                raise LiveProbeError("GC service_name is not allowlisted")
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % (service, service)
+        elif query.query_id == "prometheus.jvm_tenured_limit_mib":
+            if set(query.parameters) != {"service_name"}:
+                raise LiveProbeError("GC ratio query requires the fixed service parameter")
+            service = query.parameters["service_name"]
+            if service not in APPROVED_GC_SERVICES:
+                raise LiveProbeError("GC service_name is not allowlisted")
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % service
         elif query.query_id == "prometheus.pod_network_error_rate":
-            expected = {
-                "namespace": F12_PRODUCT_TARGET["namespace"],
-                "deployment": F12_PRODUCT_TARGET["deployment"],
-            }
-            if dict(query.parameters) != expected:
+            if set(query.parameters) != {"namespace", "deployment"}:
+                raise LiveProbeError("network error query requires the fixed target parameters")
+            target = (query.parameters["namespace"], query.parameters["deployment"])
+            if target not in NETWORK_ERROR_TARGETS:
                 raise LiveProbeError("network error target is not allowlisted")
-            promql = PROMETHEUS_TEMPLATES[query.template_id]
+            promql = PROMETHEUS_TEMPLATES[query.template_id] % (
+                target[0], target[1], target[0], target[1],
+            )
         elif query.query_id in {
             "prometheus.node_cpu_utilization", "prometheus.node_memory_utilization"
         }:
@@ -671,8 +1327,29 @@ class LiveProbeSet:
         if payload.get("status") not in {None, "success"}:
             raise LiveProbeError("prometheus query did not succeed")
         result = payload["data"]["result"]
-        if len(result) != 1:
-            raise LiveProbeError("prometheus query requires exactly one series")
+        if not result:
+            # "no data" and "ambiguous data" are opposite failures with opposite
+            # repairs, and this used to report both as the same sentence. On
+            # 2026-07-31 F21-P burned a whole run with api_p95/transfer_p95/
+            # api_busy_threads reading "requires exactly one series" from the
+            # first settling tick — the APM plane was simply empty, but the
+            # message sent the reader looking for a fan-out that was not there.
+            if query.query_id in {
+                "prometheus.apm_service_p95", "prometheus.apm_service_error_rate"
+            }:
+                # The span-count guard in the template turns "the window carried
+                # no completed transaction" into this same empty result, and that
+                # is the common case by far — say so, or the reader goes looking
+                # for a missing APM series that is sitting right there.
+                raise LiveProbeError(
+                    "APM gauge has no usable sample: the service completed no transaction in "
+                    "the 60s window ending 30s ago, or the APM series is absent"
+                )
+            raise LiveProbeError("prometheus query returned no series")
+        if len(result) > 1:
+            raise LiveProbeError(
+                f"prometheus query returned {len(result)} series, expected exactly one"
+            )
         timestamp, value = result[0]["value"]
         numeric = float(value)
         timestamp_value = float(timestamp)
@@ -682,6 +1359,51 @@ class LiveProbeSet:
             numeric,
             datetime.fromtimestamp(timestamp_value, timezone.utc),
             f"prometheus:{query.template_id}",
+        )
+
+    def _clickhouse_observation(self, query: ApprovedQuery) -> tuple[float, datetime, str]:
+        if query.template_id not in CLICKHOUSE_TEMPLATES:
+            raise LiveProbeError("unsupported clickhouse query")
+        if set(query.parameters) != {"service_name"}:
+            raise LiveProbeError("clickhouse query requires the fixed service parameter")
+        service = query.parameters["service_name"]
+        if service not in APPROVED_APM_SERVICES:
+            raise LiveProbeError("clickhouse service_name is not allowlisted")
+        # The allowlist is the boundary that keeps scenario input out of the SQL,
+        # exactly as APPROVED_SERVICES does for PromQL.
+        sql = CLICKHOUSE_TEMPLATES[query.template_id] % service
+        response = self.http_client(
+            "POST",
+            CLICKHOUSE_URL,
+            body=sql.encode("utf-8"),
+            headers={
+                "X-ClickHouse-User": CLICKHOUSE_USER,
+                "X-ClickHouse-Key": CLICKHOUSE_PASSWORD,
+                "Content-Type": "text/plain; charset=utf-8",
+            },
+            timeout=10.0,
+        )
+        payload = _response_json(response)
+        rows = payload.get("data")
+        if isinstance(rows, list) and not rows:
+            # The HAVING guard in the template turns "no SERVER span in the 60s
+            # window" into zero rows. Name it, or the reader hunts for a broken
+            # query when the service simply produced nothing to judge.
+            raise LiveProbeError(
+                "trace error rate has no usable sample: the service produced no "
+                "SERVER span in the last 60s"
+            )
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise LiveProbeError("clickhouse query requires exactly one row")
+        numeric = float(rows[0]["value"])
+        if not math.isfinite(numeric) or numeric < 0 or numeric > 100:
+            raise LiveProbeError("clickhouse query returned an invalid percentage")
+        # The window is trailing and evaluated server-side, so the observation is
+        # current as of the request rather than of some upstream batch boundary.
+        return (
+            numeric,
+            _aware(self.clock()),
+            f"clickhouse:{query.template_id}",
         )
 
     def _kubernetes_observation(self, query: ApprovedQuery) -> tuple[Any, datetime, str]:
@@ -711,6 +1433,10 @@ class LiveProbeSet:
                 target = F15_FOOD_PAYMENT_TARGET
             elif parameters == F17_TRANSFER_TARGET and query.query_id == "kubernetes.container_restart_count":
                 target = F17_TRANSFER_TARGET
+            elif parameters == F05_KAFKA_TARGET and query.query_id == "kubernetes.container_restart_count":
+                target = F05_KAFKA_TARGET
+            elif parameters == F09_ORDER_TARGET and query.query_id == "kubernetes.container_restart_count":
+                target = F09_ORDER_TARGET
             elif parameters == F20_FOOD_ORDER_TARGET and query.query_id in {
                 "kubernetes.container_memory_current_bytes",
                 "kubernetes.container_memory_limit_bytes",
@@ -966,12 +1692,18 @@ class LiveProbeSet:
 
     def _database_observation(self, query: ApprovedQuery) -> tuple[Any, datetime, str]:
         if query.query_id == "database.oracle_tagged_session_count":
-            if dict(query.parameters) != ORACLE_TAG_CONTRACT:
+            if set(query.parameters) != {"client_identifier"}:
+                raise LiveProbeError("Oracle session probe requires client_identifier")
+            tag = query.parameters["client_identifier"]
+            if tag not in APPROVED_ORACLE_TAGS:
                 raise LiveProbeError("Oracle session tag is not allowlisted")
             result = self._kubectl(
                 "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
                 "sh", "-lc",
-                "printf 'alter session set container=FREEPDB1;\\nset pages 0 feedback off heading off\\nselect count(*) from v$session where client_identifier=chr(114)||chr(99)||chr(97)||chr(45)||chr(70)||chr(48)||chr(49)||chr(45)||chr(80)||chr(45)||chr(111)||chr(114)||chr(97)||chr(99)||chr(108)||chr(101)||chr(45)||chr(108)||chr(111)||chr(99)||chr(107);\\nexit;\\n' | sqlplus -s / as sysdba",
+                _oracle_sqlplus(
+                    "select count(*) from v$session where client_identifier="
+                    f"{_oracle_string_literal(tag)};"
+                ),
             )
             raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
@@ -997,12 +1729,28 @@ class LiveProbeSet:
             result = self._kubectl(
                 "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
                 "sh", "-lc",
-                "printf 'alter session set container=FREEPDB1;\\nset pages 0 feedback off heading off\\nselect count(*) from banking.outbox_events where published_at is null;\\nexit;\\n' | sqlplus -s / as sysdba",
+                _oracle_sqlplus(
+                    "select count(*) from banking.outbox_events where published_at is null;"
+                ),
             )
             raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
                 raise LiveProbeError("outbox unpublished count is invalid")
             return int(raw), _aware(self.clock()), "database:outbox-unpublished-count"
+        if query.query_id == "database.commerce_outbox_unpublished_count":
+            if dict(query.parameters) != COMMERCE_OUTBOX_UNPUBLISHED_CONTRACT:
+                raise LiveProbeError("commerce outbox count target is not allowlisted")
+            response = self.database_client(
+                COMMERCE_OUTBOX_UNPUBLISHED_SQL, (), credentials=self.database_credentials,
+            )
+            count = response.get("unpublished_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise LiveProbeError("commerce outbox unpublished count is invalid")
+            return (
+                count,
+                _response_time(response, self.clock),
+                "database:commerce-outbox-unpublished-count",
+            )
         if query.query_id == "database.payment_duplicate_order_count_since_t1":
             state = self._f06_pulse_state(query)
             started_at = _parse_time(state.get("started_at"))
@@ -1077,18 +1825,60 @@ class LiveProbeSet:
             result = self._kubectl(
                 "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
                 "sh", "-lc",
-                "printf 'alter session set container=FREEPDB1;\\n"
-                "set pages 0 feedback off heading off\\n"
-                "select count(*) from banking.transfers t join banking.accounts a "
-                "on a.id in (t.from_account, t.to_account) "
-                "where a.status in (''FROZEN'',''CLOSED'') and t.status=''COMPLETED'' "
-                f"and t.created_at >= to_timestamp(''{since}'', ''YYYY-MM-DD HH24:MI:SS'');\\n"
-                "exit;\\n' | sqlplus -s / as sysdba",
+                _oracle_sqlplus(
+                    "select count(*) from banking.transfers t join banking.accounts a "
+                    "on a.id in (t.from_account, t.to_account) "
+                    f"where a.status in ({_oracle_string_literal('FROZEN')},"
+                    f"{_oracle_string_literal('CLOSED')}) "
+                    f"and t.status={_oracle_string_literal('COMPLETED')} "
+                    f"and t.created_at >= to_timestamp({_oracle_string_literal(since)}, "
+                    f"{_oracle_string_literal('YYYY-MM-DD HH24:MI:SS')});"
+                ),
             )
             raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
                 raise LiveProbeError("integrity violation count is invalid")
             return int(raw), _aware(self.clock()), "database:integrity-violation-count"
+        if query.query_id == "database.ledger_unmatched_transfer_count":
+            # F14-P decisive evidence: transfers that COMMITTED but whose ledger
+            # rows never landed, because the consumer swallowed the write error
+            # and still committed the offset.
+            #
+            # Deliberately NOT the double-entry imbalance.  recordTransfer writes
+            # DEBIT and CREDIT in one transaction, so this defect drops both and
+            # (DEBIT - CREDIT) stays exactly 0 forever -- the reconciliation batch
+            # is structurally blind to it.  Asserting on imbalance would have been
+            # a success condition that can never fire.
+            #
+            # Windowed rather than since-t1 so the signal also falls back to 0
+            # once writes resume, which is what the recovery gate needs.  The
+            # grace tail excludes transfers whose ledger write is still in flight.
+            parameters = dict(query.parameters)
+            if parameters != LEDGER_UNMATCHED_CONTRACT:
+                raise LiveProbeError("ledger reconciliation window is not allowlisted")
+            window = int(parameters["window_minutes"])
+            grace = int(parameters["grace_seconds"])
+            result = self._kubectl(
+                "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
+                "sh", "-lc",
+                _oracle_sqlplus(
+                    "select count(*) from banking.transfers t "
+                    f"where t.status={_oracle_string_literal('COMPLETED')} "
+                    # sys_extract_utc: created_at is stored UTC-naive, so comparing it
+                    # against a plain systimestamp would shift the window by the DB
+                    # host's offset.
+                    f"and t.created_at >= sys_extract_utc(systimestamp) - "
+                    f"numtodsinterval({window}, {_oracle_string_literal('MINUTE')}) "
+                    f"and t.created_at < sys_extract_utc(systimestamp) - "
+                    f"numtodsinterval({grace}, {_oracle_string_literal('SECOND')}) "
+                    "and not exists (select 1 from banking.ledger_entries le "
+                    "where le.transfer_ref = t.transfer_ref);"
+                ),
+            )
+            raw = result.stdout.strip()
+            if not re.fullmatch(r"[0-9]+", raw):
+                raise LiveProbeError("ledger unmatched transfer count is invalid")
+            return int(raw), _aware(self.clock()), "database:ledger-unmatched-transfer-count"
         if query.query_id == "business.order_duplicate_count_since_t1":
             # F15-R non-idempotency guard: a 429-retry that creates a second
             # payment row for one order is the duplicate signature that would
@@ -1108,6 +1898,21 @@ class LiveProbeSet:
                 _response_time(response, self.clock),
                 "database:order-duplicate-count-since-t1",
             )
+        if query.query_id == "database.blocked_session_count":
+            if set(query.parameters) != {"schema", "table"}:
+                raise LiveProbeError("blocked session probe requires schema and table")
+            relation = f"{query.parameters['schema']}.{query.parameters['table']}"
+            if relation not in BLOCKED_SESSION_RELATIONS:
+                raise LiveProbeError("blocked session relation is not allowlisted")
+            response = self.database_client(
+                BLOCKED_SESSION_SQL,
+                (relation,),
+                credentials=self.database_credentials,
+            )
+            count = response.get("blocked_count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise LiveProbeError("blocked session count is invalid")
+            return count, _response_time(response, self.clock), "database:blocked-session-count"
         if query.query_id != "database.tagged_session_count" or set(query.parameters) - {"scenario_tag"}:
             raise LiveProbeError("unsupported database query")
         tag = query.parameters.get("scenario_tag") or (
@@ -1116,15 +1921,7 @@ class LiveProbeSet:
         if (
             not isinstance(tag, str)
             or len(tag) > 96
-            or not (
-                tag.startswith("lucida:")
-                or tag in {
-                    "rca-F01-R-inventory-lock",
-                    "rca-F02-G-batch-heavy-sql",
-                    "rca-F06-H-payment-lock",
-                    "rca-F15-T1-inventory-lock",
-                }
-            )
+            or not (tag.startswith("lucida:") or tag in APPROVED_SESSION_TAGS)
         ):
             raise LiveProbeError("database scenario tag is invalid")
         response = self.database_client(
@@ -1172,9 +1969,23 @@ class LiveProbeSet:
             value = payload.get("filesystem_used_percent")
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
                 raise LiveProbeError("filesystem utilization is invalid")
+        elif query.query_id == "host.disk_io_utilization":
+            # The storage-saturation scenarios (F02-H, F10-H, F10-P) need to show
+            # that the device is busy, not merely that the database is slow —
+            # without it "storage saturation" is indistinguishable from a lock,
+            # a slow query, or a starved pool. KCM exposes node CPU and memory
+            # but no per-device I/O, so this is measured on the host directly.
+            if not target:
+                raise LiveProbeError("host scenario has no filesystem target")
+            value = payload.get("disk_io_utilization")
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+                raise LiveProbeError("disk utilization is invalid")
         else:
             raise LiveProbeError("unsupported host query")
-        if query.query_id != "host.filesystem_used_percent" and not isinstance(value, bool):
+        if query.query_id not in (
+            "host.filesystem_used_percent",
+            "host.disk_io_utilization",
+        ) and not isinstance(value, bool):
             raise LiveProbeError("host state is invalid")
         return value, _aware(self.clock()), f"host:{scenario_id}:{query.query_id}"
 
@@ -1216,16 +2027,29 @@ class LiveProbeSet:
                 if not isinstance(value, bool):
                     raise LiveProbeError("mock flap fault state is invalid")
             return value, observed_at, f"mock-flap:{query.query_id}"
-        if query.query_id != "business.checkout_invariant" or set(query.parameters) - {"business_key"}:
+        if query.query_id != "business.checkout_invariant" or set(query.parameters) - {
+            "business_key", "domain"
+        }:
             raise LiveProbeError("unsupported business query")
         key = query.parameters.get("business_key", "checkout")
         if key not in APPROVED_BUSINESS_KEYS:
             raise LiveProbeError("business key is not allowlisted")
-        document = self._loadgen_live_document()
+        # Same split the loadgen observations already had: without a domain this
+        # reads the scenario's own k6 output, which exists only while that scenario
+        # runs. business_ok is published in the resident baseline document too, and
+        # this probe was the one instrument left out of the 07-29 change — so F08-H
+        # and F11-R were the only success gates a no-fault sweep could not read.
+        domain = query.parameters.get("domain")
+        document = (
+            self._baseline_live_document(domain) if domain else self._loadgen_live_document()
+        )
         business_ok = document.get("business_ok")
         if not isinstance(business_ok, bool):
             raise LiveProbeError("checkout business outcome is unavailable")
-        return business_ok, _parse_time(document["observed_at"]), "k6:checkout-business-outcome"
+        source = (
+            f"k6:baseline:{domain}:business_ok" if domain else "k6:checkout-business-outcome"
+        )
+        return business_ok, _parse_time(document["observed_at"]), source
 
     def _f15r_flap_state(self, query: ApprovedQuery) -> dict[str, Any]:
         if dict(query.parameters) != {"scenario_id": "F15-R"}:
@@ -1249,8 +2073,58 @@ class LiveProbeSet:
             raise LiveProbeError("mock pulse state belongs to another scenario")
         return document
 
+    def _baseline_live_document(self, domain: str) -> dict[str, Any]:
+        """Read a domain's resident baseline live document.
+
+        Separates the observation plane from the injection plane: this document
+        exists whether or not the running scenario pours load into that domain,
+        because the resident loadgen unit publishes it continuously.
+        """
+        if domain not in APPROVED_LOADGEN_DOMAINS:
+            raise LiveProbeError("loadgen domain is not allowlisted")
+        local = self.paths.baseline_summary_dir / f"baseline-{domain}-live.json"
+        if local.parent != self.paths.baseline_summary_dir:
+            raise LiveProbeError("baseline summary path escaped the trusted root")
+        if local.is_file():
+            document = _read_json(local)
+        else:
+            completed = self.process_runner(
+                [
+                    "ssh", "-i", LOADGEN_KEY,
+                    "-o", "BatchMode=yes",
+                    "-o", "StrictHostKeyChecking=yes",
+                    "-o", "ConnectTimeout=10",
+                    f"{LOADGEN_USER}@{LOADGEN_HOST}",
+                    "cat", "--", f"/tmp/rca-baseline-{domain}-live.json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=_read_only_environment(),
+                timeout=15,
+            )
+            document = json.loads(completed.stdout)
+        if not isinstance(document, dict):
+            raise LiveProbeError("baseline live observation is not an object")
+        if document.get("domain") != domain:
+            raise LiveProbeError("baseline live observation belongs to another domain")
+        # A baseline document must never carry a scenario identity — if it does,
+        # a scenario's own k6 output has been mistaken for the resident baseline.
+        if "scenario_id" in document:
+            raise LiveProbeError("baseline live observation claims a scenario identity")
+        observed_at = _parse_time(document.get("observed_at"))
+        age = (_aware(self.clock()) - observed_at).total_seconds()
+        if not -CLOCK_SKEW_TOLERANCE_SEC <= age <= 30:
+            raise LiveProbeError("baseline live observation is stale or from the future")
+        return document
+
     def _loadgen_live_document(self) -> dict[str, Any]:
-        if self.scenario_id is None or not re.fullmatch(r"F[0-9]{2}-[A-Z]", self.scenario_id):
+        # T-suffixed ids (F15-T1..T4) are timeline compositions and were excluded
+        # by the single-letter pattern, so F15-T1 could never read its own load
+        # summary — achieved_rps failed the probe on every tick.
+        if self.scenario_id is None or not re.fullmatch(
+            r"F[0-9]{2}-(?:[A-Z]|T[1-4])", self.scenario_id
+        ):
             raise LiveProbeError("loadgen observation requires an allowlisted scenario id")
         if self.paths.loadgen_summary.is_file():
             document = _read_json(self.paths.loadgen_summary)
@@ -1331,6 +2205,23 @@ class SnapshotProducer:
         return evidence, document
 
 
+# Written when a run is created or as it progresses; a real run carries at least
+# one even if it crashed before recording a timeline.
+RUN_DIRECTORY_MARKERS = (
+    "plan.json",
+    "lease.json",
+    "capsule.json",
+    "state.json",
+    "result.json",
+    "timeline.json",
+    "cleanup.json",
+)
+
+
+def _is_run_directory(run_dir: Path) -> bool:
+    return any((run_dir / marker).is_file() for marker in RUN_DIRECTORY_MARKERS)
+
+
 def _run_intervals(run_dir: Path) -> list[tuple[datetime, datetime]]:
     intervals: list[tuple[datetime, datetime]] = []
     readable_no_effect = False
@@ -1390,13 +2281,6 @@ def _run_intervals(run_dir: Path) -> list[tuple[datetime, datetime]]:
 
 def _intersects(left_start: datetime, left_end: datetime, right_start: datetime, right_end: datetime) -> bool:
     return left_start <= right_end and right_start <= left_end
-
-
-def _safe_bool(action: Callable[[], bool]) -> bool:
-    try:
-        return action() is True
-    except Exception:
-        return False
 
 
 def _read_json(path: Path) -> dict[str, Any]:

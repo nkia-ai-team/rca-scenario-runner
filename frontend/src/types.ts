@@ -63,6 +63,9 @@ export interface ApiScenario {
   difficulty: number | null;
   // 관측 가능한 시그널 기반 채점 기준. UI 의 "RCA 채점 기준" 섹션에 표시.
   expected_rca_root_cause: string | null;
+  // 현행(manifest) 시나리오에서만 채워진다 — 관측 도메인("DPM, KCM")과 전파 단계.
+  cause_domain: string | null;
+  propagation_steps: string[] | null;
   expected_clusters: Record<string, unknown> | null;
   expected_incidents: Record<string, unknown> | null;
 }
@@ -107,6 +110,7 @@ export type Tone = "violet" | "amber" | "emerald" | "rose";
 
 export interface ScenarioView extends ApiScenario {
   num: string;
+  code: string;
   tone: Tone;
   tag: string;
   propagationHops: string[];

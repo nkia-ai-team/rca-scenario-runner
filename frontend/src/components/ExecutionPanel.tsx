@@ -94,7 +94,7 @@ export function ExecutionPanel({ exec, elapsed, onCopy, onDownload }: Props) {
                 <>
                   <Pill tone={scn.tone}>{scn.tag}</Pill>
                   <span className="mono text-[11px] text-[var(--ink-3)]">
-                    S{scn.num}
+                    {scn.code}
                   </span>
                   <span className="tick-dot" />
                   <span className="mono text-[11px] text-[var(--ink-3)]">

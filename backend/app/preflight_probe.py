@@ -6,8 +6,10 @@ Signal sources were fixed empirically (2026-07-21, 119 live):
   measured 0.083 while k6 delivered 4.0 iters/s, so it is unusable here).
 - entry p95: apm.agent.otel.java.percentile95{commerce-gateway} in **ms** (87.47
   measured at baseline) -> /1000.
-- user 5xx: apm.agent.otel.java.error_rate is **percent 0-100** (order=100
-  during F01-R injection) -> /100.
+- user 5xx: counted from otel_traces_local SERVER spans (2026-07-30). It used to
+  read apm.agent.otel.java.error_rate, but that rollup discards all but one
+  insert block per service-minute, so the gateway ratio came from ~5 of the ~105
+  requests actually served — one sampled failure read as 20% against a 1% floor.
 - active alarms: vmalert firing list via the VM select endpoint /api/v1/alerts.
 - open incidents: observer 18087 via the manager session (incident_close).
 - pool residue: max db.client.connections.pending_requests over commerce apps.
@@ -27,6 +29,15 @@ from datetime import datetime
 from typing import Mapping
 
 from app.incident_close import open_incident_count
+# Single source for the trace endpoint and its credentials: a second copy of an
+# allowlist or an endpoint is how F06-P's only success condition drifted away
+# from the canonical one and failed every tick.
+from app.live_probes import (
+    CLICKHOUSE_PASSWORD,
+    CLICKHOUSE_TEMPLATES,
+    CLICKHOUSE_URL,
+    CLICKHOUSE_USER,
+)
 
 DEFAULT_VM_URL = "http://192.168.230.119:18428"
 LOADGEN_KEY = "/root/.ssh/tb_key"
@@ -37,7 +48,6 @@ DIURNAL_RPS_FLOOR = 1.0
 _TIMEOUT_SEC = 10
 
 P95_QUERY = 'max(apm.agent.otel.java.percentile95{service_name="commerce-gateway"}) / 1000'
-ERROR_RATE_QUERY = 'max(apm.agent.otel.java.error_rate{service_name="commerce-gateway"}) / 100'
 POOL_PENDING_QUERY = 'max(db.client.connections.pending_requests{service_name=~"commerce-.*"})'
 
 
@@ -54,7 +64,7 @@ class ProductionPreflightProbe:
             "baseline_loadgen_alive": 1.0 if alive else 0.0,
             "achieved_rps": iters_per_sec,
             "diurnal_rps_floor": DIURNAL_RPS_FLOOR,
-            "user_5xx_rate": self._vm_scalar(ERROR_RATE_QUERY),
+            "user_5xx_rate": self._gateway_5xx_fraction(),
             "entry_p95_sec": self._vm_scalar(P95_QUERY),
             "active_alarms": float(self._firing_alarm_count()),
             "open_incidents": float(open_incident_count()),
@@ -76,6 +86,30 @@ class ProductionPreflightProbe:
         alive = bool(lines) and lines[0].strip() == "active"
         rates = re.findall(r"([0-9]+(?:\.[0-9]+)?) iters/s", result.stdout)
         return alive, float(rates[-1]) if rates else 0.0
+
+    def _gateway_5xx_fraction(self) -> float:
+        """Entry-point 5xx share, counted from traces rather than the APM rollup.
+
+        The rollup keeps roughly one insert block per service-minute, so at the
+        gateway it surfaced ~5 requests of the ~105 actually served. A single
+        sampled failure then reads as 20% against a 1% floor and the gate goes
+        dirty on a healthy system, while real errors outside the surviving block
+        are invisible. Same defect, same fix as clickhouse.service_error_rate.
+        """
+        sql = CLICKHOUSE_TEMPLATES["trace-service-error-rate-v1"] % "commerce-gateway"
+        request = urllib.request.Request(
+            CLICKHOUSE_URL,
+            data=sql.encode("utf-8"),
+            headers={
+                "X-ClickHouse-User": CLICKHOUSE_USER,
+                "X-ClickHouse-Key": CLICKHOUSE_PASSWORD,
+            },
+            method="POST",
+        )
+        with self.urlopen(request, timeout=_TIMEOUT_SEC) as response:
+            document = json.loads(response.read())
+        # Percent on the wire; the R6 thresholds are fractions.
+        return float(document["data"][0]["value"]) / 100
 
     def _vm_scalar(self, promql: str, *, default: float | None = None) -> float:
         query = urllib.parse.urlencode({"query": promql})

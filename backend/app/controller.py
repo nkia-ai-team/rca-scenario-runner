@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.adaptive import (
     AdaptiveLevel,
@@ -13,6 +13,7 @@ from app.adaptive import (
     Condition,
     ConditionSet,
 )
+from app.observations import APPROVED_ADAPTERS
 
 
 _DURATION = re.compile(r"^(\d+)(s|m|h)?$")
@@ -42,18 +43,22 @@ class StrictModel(BaseModel):
 
 class AdapterQuery(StrictModel):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
-    adapter: Literal[
-        "loadgen_summary",
-        "http_probe",
-        "prometheus",
-        "kubernetes",
-        "database",
-        "business_probe",
-        "capture_status",
-    ]
+    # Derived from APPROVED_ADAPTERS rather than restated: this literal was a
+    # second hand-maintained copy and it went stale — host_probe was added to the
+    # runtime for the 2026-07-28 storage-IO trio (F02-H/F10-H/F10-P) but not here,
+    # so loading their manifests raised a validation error and blocked the whole
+    # deploy path (deploy-live-promotions.sh loads every manifest before publishing).
+    adapter: str
     query_id: str = Field(min_length=1)
     freshness_sec: int = Field(gt=0)
     parameters: dict[str, bool | int | float | str] = Field(default_factory=dict)
+
+    @field_validator("adapter")
+    @classmethod
+    def _adapter_is_approved(cls, value: str) -> str:
+        if value not in APPROVED_ADAPTERS:
+            raise ValueError(f"adapter is not approved: {value}")
+        return value
 
 
 class BaselinePlan(StrictModel):

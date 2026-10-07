@@ -8,7 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.live_queue import LIVE_SCENARIO_ORDER, LiveScenarioQueue
+from app.live_queue import (
+    LIVE_SCENARIO_ORDER,
+    PREFLIGHT_MAX_ATTEMPTS,
+    READINESS_PROBE_GRACE,
+    LiveScenarioQueue,
+)
 from app.models import RunInfo
 
 
@@ -52,10 +57,12 @@ class Runner:
         self.is_busy = False
         self.current = None
         self.started = []
+        self.skipped_isolation = []
         self.capture_worker_starts = 0
 
-    async def start(self, *, scenario_id: str, mode: str):
+    async def start(self, *, scenario_id: str, mode: str, skip_isolation_checks: bool = False):
         self.started.append((scenario_id, mode))
+        self.skipped_isolation.append(skip_isolation_checks)
         self.current = RunInfo(
             run_id=f"run-{scenario_id}",
             scenario_id=scenario_id,
@@ -112,6 +119,85 @@ def make_queue(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_capture_off_advances_without_an_export(tmp_path: Path, monkeypatch) -> None:
+    """A smoke pass must not spend the whole post-judging tail on a discarded case.
+
+    In a smoke pass no capture job is ever scheduled, so the queue has to advance
+    on the run's own evidence. Waiting for a job that will never appear — or
+    pausing on "capture was not scheduled" — stops the batch on every scenario.
+    """
+    monkeypatch.setenv("SCENARIO_PASS", "smoke")
+    queue, runner, _, scheduler, clock = make_queue(tmp_path)
+    await queue.start()
+
+    state = await queue.tick()
+    run_id = state.current_run_id
+    runner.current = runner.current.model_copy(
+        update={"status": "succeeded", "finished_at": clock.now(), "exit_code": 0}
+    )
+    # no scheduler.jobs entry, and no capture-complete.json on disk
+    assert run_id not in scheduler.jobs
+    state = await queue.tick()
+    assert state.phase == "waiting_capture"
+
+    runner.current = None
+    state = await queue.tick()
+    assert state.next_index == 1
+    assert state.completed_run_ids == [run_id]
+    assert state.reason is None
+
+
+@pytest.mark.asyncio
+async def test_smoke_pass_releases_the_capture_window_isolation_gates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The gates enforce capture-window separation, so they must follow the pass.
+
+    They are the runner's own eligibility checks, independent of the queue's
+    gap: on 2026-07-31 F06-R was blocked with check_failed:clean-window +
+    scenario_overlap 15m after the previous t2, while the queue believed it had
+    waited long enough. A pass that captures nothing has no windows to separate,
+    and the preflight gate — which measures cleanliness instead of assuming a
+    gap — still runs either way.
+    """
+    monkeypatch.setenv("SCENARIO_PASS", "smoke")
+    queue, runner, _, _, _ = make_queue(tmp_path)
+    await queue.start()
+    await queue.tick()
+    assert runner.skipped_isolation == [True]
+
+    monkeypatch.setenv("SCENARIO_PASS", "dataset")
+    (tmp_path / "dataset").mkdir()
+    queue2, runner2, _, _, _ = make_queue(tmp_path / "dataset")
+    await queue2.start()
+    await queue2.tick()
+    assert runner2.skipped_isolation == [False]
+
+
+@pytest.mark.asyncio
+async def test_every_run_records_which_batch_it_belongs_to(tmp_path: Path) -> None:
+    """배치 소속은 런 자신의 아티팩트에 남아야 한다.
+
+    큐 상태는 한 번에 한 배치만 들고 있어서, 다음 배치가 시작되면 이전 런의 소속이
+    사라진다. 그러면 배치 비교가 타임스탬프 추측이 되는데, 2026-08-09 에 세 가지
+    추측이 모두 틀렸다 — "최근 N개"는 배치 밖 런을 끌어왔고, 1시간 공백 탐지는
+    ~13분짜리 배치 간 간격을 못 봤고, 고정 크기 윈도는 배치 안 재시도(F20-R 이 한
+    배치에서 세 번 실행) 때문에 어긋났다.
+    """
+    queue, runner, _, _, _ = make_queue(tmp_path)
+    state = await queue.start()
+    state = await queue.tick()
+    run_id = state.current_run_id
+
+    marker = runner.artifact_store.root / run_id / "batch.json"
+    assert marker.is_file(), "런이 자기 배치 소속을 기록하지 않았다"
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    assert recorded["queue_id"] == state.queue_id
+    assert recorded["index"] == 0
+    assert recorded["started_at"] == state.started_at
+
+
+@pytest.mark.asyncio
 async def test_fixed_sequence_waits_for_capture_and_two_hour_clean_window(tmp_path: Path) -> None:
     queue, runner, _, scheduler, clock = make_queue(tmp_path)
     state = await queue.start()
@@ -133,7 +219,7 @@ async def test_fixed_sequence_waits_for_capture_and_two_hour_clean_window(tmp_pa
 
     scheduler.jobs[run_id].status = "completed"
     capture = runner.artifact_store.root / run_id / "capture-complete.json"
-    capture.parent.mkdir(parents=True)
+    capture.parent.mkdir(parents=True, exist_ok=True)
     capture.write_text("{}\n", encoding="utf-8")
     runner.current = None
     state = await queue.tick()
@@ -482,12 +568,17 @@ async def test_dirty_preflight_rechecks_every_five_minutes_then_skips(tmp_path: 
     state = await queue.tick()  # before recheck interval: no re-evaluation
     assert state.preflight_attempts == 1
 
-    clock.value += timedelta(minutes=5)
-    state = await queue.tick()  # attempt 2
-    assert state.preflight_attempts == 2
+    # Attempts 2..MAX-1 keep waiting: a dirty window after a destructive
+    # predecessor refills on its own, so the gate waits rather than forfeiting
+    # the case. Only the last attempt gives up.
+    for expected in range(2, PREFLIGHT_MAX_ATTEMPTS):
+        clock.value += timedelta(minutes=5)
+        state = await queue.tick()
+        assert state.preflight_attempts == expected
+        assert state.skipped_scenario_ids == []
 
     clock.value += timedelta(minutes=5)
-    state = await queue.tick()  # attempt 3 == MAX -> skip and advance
+    state = await queue.tick()  # attempt == MAX -> skip and advance
     assert runner.started == []
     assert state.skipped_scenario_ids == ["F01-R"]
     assert state.next_index == 1
@@ -518,18 +609,166 @@ async def test_preflight_clears_on_recheck_and_records_clean_after_wait(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_preflight_probe_failure_pauses_the_queue(tmp_path: Path) -> None:
+async def test_preflight_probe_failure_spends_the_recheck_budget_before_pausing(
+    tmp_path: Path,
+) -> None:
+    """A raising probe is transport, not a verdict (2026-08-04 batch).
+
+    119 answers this gate and resets connections under load; the batch used to
+    die on the first blip while a merely dirty verdict got 6 x 5m of rechecks.
+    Same budget for both, and a probe still broken at the end still pauses.
+    """
     class BrokenProbe:
         def collect(self, *, now):
-            return {"baseline_loadgen_alive": 1}  # missing required signals
+            raise ConnectionResetError(104, "Connection reset by peer")
 
-    queue, runner, _, _, _ = make_queue(tmp_path)
-    queue.preflight_probe = BrokenProbe()
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
     await queue.start()
+    queue.preflight_probe = BrokenProbe()
+
+    for attempt in range(1, PREFLIGHT_MAX_ATTEMPTS):
+        state = await queue.tick()
+        assert state.phase == "running", f"blip {attempt} must not end the batch"
+        assert state.preflight_attempts == attempt
+        assert "Connection reset by peer" in (state.reason or "")
+        clock.value += timedelta(minutes=5)
+
+    state = await queue.tick()
+    assert state.phase == "paused", "a probe still broken after the budget pauses"
+    assert "preflight probe failed" in (state.reason or "")
+    assert runner.started == []
+
+
+def _wait_in_clean_window(queue, clock) -> None:
+    """Park the queue on the between-scenarios tick that re-probes readiness."""
+    queue._write(
+        queue.snapshot().model_copy(
+            update={
+                "phase": "waiting_clean_window",
+                "clean_window_not_before": queue._format(
+                    clock.value - timedelta(minutes=1)
+                ),
+            }
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_readiness_probe_hiccup_waits_out_the_grace_and_records_why(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The batch-level gate must survive a partial poll, and say what broke.
+
+    Every other queue test runs with functional_readiness_enabled False, so the
+    readiness gate — the layer that actually paused the 2026-08-04 batch — was
+    never exercised: production pauses there before the per-scenario gate is
+    reached. Enable it here and use the production failure shape (a partial poll,
+    which build_preflight_checks raises on by design), on the clean-window tick
+    between two scenarios — where the batch actually stopped.
+    """
+    class PartialProbe:
+        def collect(self, *, now):
+            return {"baseline_loadgen_alive": 1.0}  # the other 7 signals missing
+
+    script = tmp_path / "capture.sh"
+    script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    script.chmod(0o755)
+    monkeypatch.setattr("app.incident_close.open_incident_count", lambda **kw: 0)
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.required_paths = {**queue.required_paths, "capture_script": script}
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    await queue.start()
+    queue.functional_readiness_enabled = True
+    _wait_in_clean_window(queue, clock)
+
+    queue.preflight_probe = PartialProbe()
+    queue._functional_cache = None  # the green TTL has expired
+    state = await queue.tick()
+    assert state.phase == "waiting_clean_window", (
+        "a single partial poll must not end the batch"
+    )
+    assert runner.started == []
+
+    clock.value += READINESS_PROBE_GRACE + timedelta(seconds=5)
+    state = await queue.tick()
+    assert state.phase == "paused", "a probe broken past the grace must pause"
+    assert "preflight_signals" in (state.reason or "")
+    # The point of the fix: the reason carries the swallowed exception.
+    assert "missing required signals" in (state.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_readiness_pauses_at_once_when_a_non_transient_check_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The grace is for the probes — a hard dependency failure still pauses now."""
+    script = tmp_path / "capture.sh"
+    script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    script.chmod(0o755)
+
+    def broken(**kwargs):
+        raise RuntimeError("incident api down")
+
+    monkeypatch.setattr("app.incident_close.open_incident_count", broken)
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.required_paths = {**queue.required_paths, "capture_script": script}
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    await queue.start()
+    queue.functional_readiness_enabled = True
+    _wait_in_clean_window(queue, clock)
+    queue._functional_cache = None
 
     state = await queue.tick()
     assert state.phase == "paused"
-    assert "preflight probe failed" in (state.reason or "")
+    assert "lucida_incident_api" in (state.reason or "")
+    assert "incident api down" in (state.reason or "")
+    assert runner.started == []
+
+
+@pytest.mark.asyncio
+async def test_smoke_pass_does_not_gate_the_batch_on_the_unused_capture_chain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A smoke pass exports nothing, so a broken 119 must not stop it.
+
+    Both 2026-08-04 pauses were the capture chain on a busy AP server, during a
+    pass that never captures. The dataset pass still proves the chain — losing a
+    case to an unprovable export is the loss this check exists to prevent — but
+    it gets the same grace as the probe rather than an instant stop.
+    """
+    script = tmp_path / "capture.sh"
+    script.write_text("#!/usr/bin/env bash\necho '[ERROR] clickhouse' >&2\nexit 1\n")
+    script.chmod(0o755)
+    monkeypatch.setattr("app.incident_close.open_incident_count", lambda **kw: 0)
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.required_paths = {**queue.required_paths, "capture_script": script}
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    await queue.start()
+    queue.functional_readiness_enabled = True
+    _wait_in_clean_window(queue, clock)
+
+    monkeypatch.setenv("SCENARIO_PASS", "smoke")
+    queue._functional_cache = None
+    readiness = queue.readiness()
+    assert "capture_self_check" not in readiness.checks
+    assert readiness.ready, "a smoke pass must not depend on the capture chain"
+
+    monkeypatch.setenv("SCENARIO_PASS", "dataset")
+    queue._functional_cache = None
+    readiness = queue.readiness()
+    assert readiness.checks["capture_self_check"] is False
+
+    state = await queue.tick()
+    assert state.phase == "waiting_clean_window", "dataset waits out the grace"
+    clock.value += READINESS_PROBE_GRACE + timedelta(seconds=5)
+    queue._functional_cache = None
+    state = await queue.tick()
+    assert state.phase == "paused"
+    assert "capture_self_check" in (state.reason or "")
     assert runner.started == []
 
 
@@ -578,6 +817,73 @@ def test_protection_window_defers_injection_starts_around_kst_midnight():
     for hour, minute in ((23, 20), (0, 0), (1, 30), (2, 29)):
         assert LiveScenarioQueue._protection_window_reason(at_kst(hour, minute)) is not None
     assert LiveScenarioQueue._protection_window_reason(at_kst(2, 30)) is None
+
+
+def test_protection_window_is_released_only_by_the_smoke_pass(monkeypatch):
+    """A pass that discards its captures should not lose ~3h of every 24h.
+
+    Only the declared smoke pass releases the window — unset or any other value
+    keeps the dataset-grade default, since forgetting it would silently poison
+    the shared daily normal prefix that every case of that day is built on.
+    """
+    from datetime import datetime, timezone
+
+    from app.live_queue import LiveScenarioQueue
+
+    midnight_kst = datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc)  # 00:00 KST
+
+    monkeypatch.delenv("SCENARIO_PASS", raising=False)
+    assert LiveScenarioQueue._protection_window_reason(midnight_kst) is not None
+
+    monkeypatch.setenv("SCENARIO_PASS", "dataset")
+    assert LiveScenarioQueue._protection_window_reason(midnight_kst) is not None
+
+    monkeypatch.setenv("SCENARIO_PASS", "smoke")
+    assert LiveScenarioQueue._protection_window_reason(midnight_kst) is None
+
+
+async def test_clean_window_tick_runs_off_the_event_loop():
+    """#31 (2026-08-03 batch): the clean-window tick re-probes readiness, which
+    shells out to the capture self-check for up to 120s. Served inline it froze
+    the event loop and starved the coordinator heartbeat until the active run's
+    30s lease expired — every later operation then died on fencing rejection.
+    The sync ticks must run on a thread so heartbeats keep flowing."""
+    import asyncio
+    import time
+    from types import SimpleNamespace
+
+    from app.live_queue import LiveScenarioQueue
+
+    state = SimpleNamespace(phase="waiting_clean_window", cycle_mode=False)
+    stub = SimpleNamespace(
+        _lock=asyncio.Lock(),
+        snapshot=lambda: state,
+        runner=SimpleNamespace(
+            coordinator=SimpleNamespace(
+                snapshot=lambda: SimpleNamespace(dirty_run=None)
+            )
+        ),
+        _append_promoted_if_available=lambda s: s,
+        _tick_clean_window=lambda s: (time.sleep(0.5), s)[1],
+    )
+
+    beats = 0
+
+    async def heartbeat() -> None:
+        nonlocal beats
+        while True:
+            await asyncio.sleep(0.02)
+            beats += 1
+
+    task = asyncio.create_task(heartbeat())
+    try:
+        result = await LiveScenarioQueue.tick(stub)
+    finally:
+        task.cancel()
+    assert result is state
+    # Inline execution starves the loop completely (0 beats in 0.5s); off-loop
+    # execution keeps it beating. Require a comfortable margin, not the ideal.
+    assert beats >= 5
 
 
 def test_functional_readiness_is_opt_in_and_gates_on_capture_self_check(tmp_path, monkeypatch):

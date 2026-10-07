@@ -153,7 +153,13 @@ async def test_external_fixed_and_adaptive_manifests_reach_controller_runtime(
 
     assert seen[0].id == selected.id
     assert seen[0].injection["catalog_slug"] == selected.slug
-    assert runner.get_current().status == "succeeded"
+    current = runner.get_current()
+    assert current.status == "succeeded"
+    # The status API tail and the on-disk log carry the same controller lines.
+    log_lines = runner.log_path(current.run_id).read_text(encoding="utf-8").splitlines()
+    assert current.log_tail == log_lines
+    assert current.log_tail[0].startswith(f"[BEGIN] run={current.run_id} ")
+    assert current.log_tail[-1].startswith("[END] status=clean")
 
 
 async def test_plan_only_external_manifest_is_refused_before_lease(tmp_path, monkeypatch) -> None:
@@ -288,6 +294,54 @@ async def test_external_dirty_cleanup_clears_only_after_profile_recovery(
     assert runner.get_current().dirty is (not cleanup_succeeds)
 
 
+async def test_refused_capsule_repair_leaves_a_readable_reason(tmp_path, monkeypatch) -> None:
+    """#21 (2026-08-03 batch): a refused capsule repair surfaced as HTTP 200
+    with no capsule-repair.json and no error anywhere — the reason lived only
+    in the process-local log ring. The refusal must land as a file next to the
+    run it refused to repair."""
+    selected = manifest("evaluation")
+    monkeypatch.setattr("app.runner.get_scenario", lambda _: None)
+    monkeypatch.setattr("app.runner.get_manifest", lambda _: selected)
+
+    coordinator = GlobalCoordinator(tmp_path / "coordinator.json")
+    runner_time = datetime.now(timezone.utc)
+    lease = coordinator.acquire(
+        run_id="dirty-run",
+        scenario_id=selected.id,
+        now=runner_time,
+        lease_sec=30,
+    )
+    coordinator.mark_dirty(
+        run_id=lease.run_id,
+        fencing_token=lease.fencing_token,
+        reason="initial cleanup failed",
+        now=runner_time,
+    )
+    store = RunArtifactStore(tmp_path / "runs")
+    (store.root / lease.run_id).mkdir(parents=True)
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("capsule repair would change the cleanup target")
+
+    monkeypatch.setattr(store, "repair_capsule_contracts", refuse)
+    runner = ScenarioRunner(
+        tmp_path,
+        tmp_path / "logs",
+        coordinator=coordinator,
+        artifact_store=store,
+    )
+    await runner.start(selected.id, "cleanup", repair_capsule=True)
+    assert runner._task is not None
+    await runner._task
+
+    assert coordinator.snapshot().dirty_run is not None
+    record = json.loads(
+        (store.root / lease.run_id / "manual-cleanup-error.json").read_text()
+    )
+    assert record["repair_capsule"] is True
+    assert "capsule repair would change the cleanup target" in record["error"]
+
+
 def test_every_live_controller_observation_binds_against_the_runner_registry():
     """Cross-repo contract: testbed-services controllers may only reference
     observation queries this runner can actually serve. This is the permanent
@@ -317,4 +371,93 @@ def test_every_live_controller_observation_binds_against_the_runner_registry():
                 registry.bind(spec)
             except Exception as error:
                 problems.append(f"{scenario_id}/{observation['id']}: {error}")
+    assert not problems, "\n".join(problems)
+
+
+def test_every_live_controller_observation_passes_the_probe_allowlists():
+    """Binding at the query registry is not enough: the live probes re-check the
+    resolved parameters against their own allowlists (APPROVED_APM_SERVICES,
+    THROTTLE_TARGETS, APPROVED_NODE_TARGETS, ...) just before issuing the query.
+
+    F21-P's 2026-07-31 calibration run is why this exists. Its throttle
+    observation bound cleanly against the registry and was rejected at probe
+    time because the banking target was missing from THROTTLE_TARGETS, so the
+    scenario spent an entire live run unable to observe its own injected cause.
+    The sibling test above would not have caught it.
+    """
+    from pathlib import Path
+
+    from app.live_probes import LiveProbeError, LiveProbeSet
+    from app.observations import ApprovedQueryRegistry
+
+    controllers_path = Path(__file__).resolve().parents[2].parent / (
+        "testbed-services/scripts/scenarios/registry/controllers.json"
+    )
+    catalog_path = Path(__file__).resolve().parents[2].parent / (
+        "testbed-services/scripts/scenarios/catalog.json"
+    )
+    if not controllers_path.is_file() or not catalog_path.is_file():
+        pytest.skip("external scenario registry is not checked out")
+
+    ready = {
+        row["id"]
+        for row in json.loads(catalog_path.read_text())["scenarios"]
+        if row["readiness"] == "ready"
+    }
+    controllers = json.loads(controllers_path.read_text())["controllers"]
+    registry = ApprovedQueryRegistry.from_path()
+
+    class _Reached(Exception):
+        """Raised by the stub transport once parameter validation has passed."""
+
+    def _stub(*args, **kwargs):
+        raise _Reached()
+
+    probes = LiveProbeSet(
+        process_runner=_stub,
+        http_client=_stub,
+        database_client=_stub,
+        database_credentials={},
+    )
+    # Only the adapters that gate on a parameter allowlist; the others need a
+    # live host or a subprocess and are covered by their own tests.
+    # `database` belongs here even though it shells out: its allowlist check runs
+    # before the subprocess, and everything past validation is swallowed below.
+    # Leaving it out is how the Oracle session tag drifted out of sync with the
+    # manifests unnoticed until it wedged the live queue (2026-08-03).
+    # `kubernetes` is the same shape: APPROVED_K8S_TARGETS is checked before
+    # kubectl runs. It was the one allowlist surface with no guard, which is how
+    # F14-P's recovery selector (banking/testbed-ledger) stayed unapproved
+    # through the whole 2026-08-03 batch and aged every run into DIRTY.
+    guarded = {
+        "prometheus": probes._prometheus_observation,
+        "clickhouse": probes._clickhouse_observation,
+        "database": probes._database_observation,
+        "loadgen_summary": probes._loadgen_observation,
+        "kubernetes": probes._kubernetes_observation,
+    }
+
+    problems = []
+    for scenario_id in sorted(ready & set(controllers)):
+        for observation in controllers[scenario_id]["observations"]:
+            probe = guarded.get(observation.get("adapter"))
+            if probe is None:
+                continue
+            if observation["adapter"] == "loadgen_summary" and not observation.get("parameters"):
+                # The unparameterized loadgen path reads the *running* scenario's own
+                # k6 output, so it needs a live run context this test cannot supply.
+                # The parameterized (domain) form is the one with an allowlist to check.
+                continue
+            spec = {"query_id": observation["query_id"]}
+            if observation.get("parameters"):
+                spec["parameters"] = observation["parameters"]
+            try:
+                probe(registry.bind(spec))
+            except _Reached:
+                continue
+            except LiveProbeError as error:
+                problems.append(f"{scenario_id}/{observation['id']}: {error}")
+            except Exception:
+                # Anything past validation (transport, parsing) is out of scope.
+                continue
     assert not problems, "\n".join(problems)

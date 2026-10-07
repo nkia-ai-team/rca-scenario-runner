@@ -21,6 +21,7 @@ APPROVED_ADAPTERS = frozenset({
     "host_probe",
     "business_probe",
     "capture_status",
+    "clickhouse",
 })
 FORBIDDEN_SCENARIO_KEYS = frozenset({"promql", "promql_template", "query", "query_text"})
 DEFAULT_REGISTRY_PATH = Path(__file__).with_name("observation_queries.json")
@@ -51,6 +52,12 @@ class ApprovedQuery:
     query_id: str
     adapter: str
     freshness_sec: int
+    # How often the *source* actually produces a new value. Distinct from
+    # freshness_sec, which only bounds how stale a value may be before it is
+    # unusable. 0 means the adapter queries the target at tick time, so every
+    # tick is an independent sample; 60 means re-reading before a minute has
+    # passed returns the same number again.
+    update_interval_sec: int
     template_id: str | None
     selector: str | None
     request_ref: str | None
@@ -81,6 +88,15 @@ class ApprovedQueryRegistry:
             freshness_sec = raw.get("freshness_sec")
             if isinstance(freshness_sec, bool) or not isinstance(freshness_sec, int) or freshness_sec <= 0:
                 raise ObservationContractError(f"query {query_id} requires positive freshness_sec")
+            update_interval_sec = raw.get("update_interval_sec")
+            if (
+                isinstance(update_interval_sec, bool)
+                or not isinstance(update_interval_sec, int)
+                or update_interval_sec < 0
+            ):
+                raise ObservationContractError(
+                    f"query {query_id} requires a non-negative update_interval_sec"
+                )
             allowed_parameters = raw.get("allowed_parameters", [])
             if (
                 not isinstance(allowed_parameters, list)
@@ -95,7 +111,8 @@ class ApprovedQueryRegistry:
             self._queries[query_id] = dict(raw)
         if registered_adapters != APPROVED_ADAPTERS:
             raise ObservationContractError(
-                "query registry must cover exactly the seven approved adapters"
+                "query registry must cover exactly the approved adapters: "
+                f"missing {sorted(APPROVED_ADAPTERS - registered_adapters)}"
             )
 
     @classmethod
@@ -136,6 +153,7 @@ class ApprovedQueryRegistry:
             query_id=query_id,
             adapter=spec["adapter"],
             freshness_sec=spec["freshness_sec"],
+            update_interval_sec=spec["update_interval_sec"],
             template_id=spec.get("template_id"),
             selector=spec.get("selector"),
             request_ref=spec.get("request_ref"),
@@ -213,6 +231,10 @@ class CaptureStatusAdapter(ReadOnlyObservationAdapter):
     adapter_id = "capture_status"
 
 
+class ClickHouseAdapter(ReadOnlyObservationAdapter):
+    adapter_id = "clickhouse"
+
+
 class ObservationPoller:
     def __init__(
         self,
@@ -281,6 +303,7 @@ def _normalize(raw: Mapping[str, Any], *, query: ApprovedQuery, now: datetime) -
             freshness=freshness,
             quality=quality,
             error=error_detail if quality == "error" and isinstance(error_detail, str) else None,
+            update_interval_sec=query.update_interval_sec,
         )
     except (KeyError, TypeError, ValueError):
         return _error_value(query, now)
@@ -293,6 +316,7 @@ def _error_value(query: ApprovedQuery, now: datetime) -> ObservedValue:
         source=f"{query.adapter}:{query.query_id}",
         freshness="fresh",
         quality="error",
+        update_interval_sec=query.update_interval_sec,
     )
 
 

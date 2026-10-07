@@ -28,6 +28,7 @@ export function ScenarioCard({
   const durationMin = Math.max(1, Math.round(scn.estimated_duration_sec / 60));
   const isThisRunning = status === "running";
   const runButtonDisabled = runDisabled || isThisRunning;
+  const longHops = scn.propagationHops.some((p) => p.length > 28);
 
   return (
     <div
@@ -51,8 +52,8 @@ export function ScenarioCard({
             <div className="num-serif text-[44px] leading-none text-[var(--ink)]">
               {scn.num}
             </div>
-            <div className="mt-1 mono text-[9.5px] uppercase tracking-[0.15em] text-[var(--ink-3)]">
-              S{scn.num}
+            <div className="mt-1 mono text-[9.5px] uppercase tracking-[0.15em] text-[var(--ink-3)] whitespace-nowrap">
+              {scn.code}
             </div>
           </div>
 
@@ -90,7 +91,7 @@ export function ScenarioCard({
             <div className="mt-3 flex items-center gap-3 text-[11.5px] text-[var(--ink-3)]">
               <span className="mono">≈ {durationMin}분</span>
               <span className="tick-dot" />
-              <span className="mono">{scn.expected_alarms.length} alarms</span>
+              <span className="mono">{scn.expected_alarms.length} signals</span>
               <span className="tick-dot" />
               <span className="mono">{scn.propagationHops.length} hops</span>
             </div>
@@ -123,24 +124,38 @@ export function ScenarioCard({
                 <div className="mono text-[10.5px] uppercase tracking-wider text-[var(--ink-3)] pt-0.5">
                   전파
                 </div>
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  {scn.propagationHops.map((p, i) => (
-                    <Fragment key={i}>
-                      <span className="mono text-[11px] text-[var(--ink)] bg-[var(--bg-2)] ring-1 ring-[var(--hair)] rounded-md px-1.5 py-0.5">
-                        {p}
-                      </span>
-                      {i < scn.propagationHops.length - 1 && (
-                        <Icon
-                          name="arr"
-                          className="w-3 h-3 text-[var(--ink-3)]"
-                        />
-                      )}
-                    </Fragment>
-                  ))}
-                </div>
+                {longHops ? (
+                  // 현행 시나리오의 단계는 문장이라 칩으로 이으면 줄바꿈이 깨진다 — 순서 목록으로 쌓는다.
+                  <ol className="space-y-1">
+                    {scn.propagationHops.map((p, i) => (
+                      <li key={i} className="flex items-start gap-2 text-[var(--ink)]">
+                        <span className="mono text-[10.5px] text-[var(--ink-3)] pt-[2px] tabular-nums">
+                          {i + 1}
+                        </span>
+                        <span className="text-[12px] leading-relaxed">{p}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {scn.propagationHops.map((p, i) => (
+                      <Fragment key={i}>
+                        <span className="mono text-[11px] text-[var(--ink)] bg-[var(--bg-2)] ring-1 ring-[var(--hair)] rounded-md px-1.5 py-0.5">
+                          {p}
+                        </span>
+                        {i < scn.propagationHops.length - 1 && (
+                          <Icon
+                            name="arr"
+                            className="w-3 h-3 text-[var(--ink-3)]"
+                          />
+                        )}
+                      </Fragment>
+                    ))}
+                  </div>
+                )}
 
                 <div className="mono text-[10.5px] uppercase tracking-wider text-[var(--ink-3)] pt-0.5">
-                  예상 알람
+                  관측 신호
                 </div>
                 <div>
                   <ul className="space-y-1">

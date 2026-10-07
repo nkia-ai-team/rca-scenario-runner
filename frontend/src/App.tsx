@@ -124,7 +124,7 @@ export default function App() {
             cur === "succeeded"
               ? `${runner.exec.scenario.name} cleanup 완료`
               : `${runner.exec.scenario.name} cleanup 실패`,
-          subtitle: `S${runner.exec.scenario.num} · exit ${runner.exec.exitCode ?? "?"}`,
+          subtitle: `${runner.exec.scenario.code} · exit ${runner.exec.exitCode ?? "?"}`,
         });
       } else {
         setToast({
@@ -133,7 +133,7 @@ export default function App() {
             cur === "succeeded"
               ? `${runner.exec.scenario.name} 실행 성공`
               : `${runner.exec.scenario.name} 실행 실패`,
-          subtitle: `S${runner.exec.scenario.num} · exit ${runner.exec.exitCode ?? "?"}`,
+          subtitle: `${runner.exec.scenario.code} · exit ${runner.exec.exitCode ?? "?"}`,
         });
       }
       const timer = setTimeout(() => setToast(null), 3200);
@@ -195,7 +195,7 @@ export default function App() {
                     · {occupiedScenario.domain_label} / {occupiedScenario.name}
                     {" "}
                     <span className="mono text-[11px] opacity-75">
-                      (S{occupiedScenario.num})
+                      ({occupiedScenario.code})
                     </span>
                   </span>
                 )}

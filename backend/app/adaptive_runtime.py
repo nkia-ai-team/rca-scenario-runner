@@ -35,6 +35,18 @@ from app.observations import (
 )
 
 
+def stderr_detail(error: BaseException, *, limit: int = 160) -> str:
+    """Reason suffix carrying a failed subprocess's stderr tail, or "" if none.
+
+    A reason of only the exception class name cannot be diagnosed from the run
+    artifacts — the operator sees "CalledProcessError" and has to reproduce the
+    call by hand to learn anything (F09-P run 2333e298, F01-R run 0104bd01).
+    Whitespace is collapsed so the tail stays one line inside a reason string.
+    """
+    tail = " ".join(str(getattr(error, "stderr", "") or "").split())[-limit:]
+    return f":{tail}" if tail else ""
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -63,6 +75,11 @@ class EligibilityEvidence(StrictModel):
     source: str = Field(min_length=1)
     quality: str = Field(pattern="^good$")
     check_results: dict[str, bool]
+    # A check that raised is recorded here as "ExceptionType: message" next to
+    # its False in check_results. Without this, a probe exception and a genuine
+    # negative were indistinguishable ("no detail"), which is how F08-G burned
+    # a live attempt on a transient error in the 2026-08-03 batch.
+    check_errors: dict[str, str] = Field(default_factory=dict)
     clean_window_start: datetime
     clean_window_end: datetime
     overlapping_run_ids: list[str] = Field(default_factory=list)
@@ -155,6 +172,16 @@ class ControllerSession(StrictModel):
     cleanup: CleanupEvidence | None = None
     recovery: RecoveryEvidence | None = None
     terminal_at: datetime | None = None
+    # v3 continuous cycle opts out of the clean-window/scenario_overlap isolation
+    # gates (the cycle time axis provides separation). Persisted so restart keeps
+    # the same decision. Default False = v2 behaviour unchanged.
+    skip_isolation_checks: bool = False
+    # Level id the pin registry fixed this run to, or None for a normal ladder.
+    # The spec already carries only the pinned level; this field exists so
+    # state.json/result.json say *why* the ladder has one rung (auditability —
+    # a pinned run and a genuinely single-level scenario must stay tellable
+    # apart in the artifacts).
+    pinned_level_id: str | None = None
 
     @model_validator(mode="after")
     def validate_evaluation_profile(self) -> "ControllerSession":
@@ -165,6 +192,10 @@ class ControllerSession(StrictModel):
                 raise ValueError("evaluation requires the exactly approved fixed profile")
             if len(self.spec.adaptive.levels) != 1:
                 raise ValueError("evaluation requires exactly one fixed level")
+        if self.pinned_level_id is not None:
+            level_ids = [level.id for level in self.spec.adaptive.levels]
+            if level_ids != [self.pinned_level_id]:
+                raise ValueError("a pinned session must carry exactly the pinned level")
         return self
 
     @property
@@ -196,6 +227,7 @@ class ControllerSession(StrictModel):
                 "kind": "fixed" if self.spec.adaptive.mode.value == "evaluation" else "adaptive_ladder",
                 "id": self.profile_id,
             },
+            "pinned_level_id": self.pinned_level_id,
             "approved_profile_id": self.approved_profile_id,
             "t1": _format_utc(self.t1),
             "t2": _format_utc(self.t2),
@@ -263,6 +295,8 @@ class AdaptiveRuntime:
         eligibility_probe: ReadOnlyEligibilityProbe,
         poller: ObservationPoller,
         applier: ProfileApplier,
+        skip_isolation_checks: bool = False,
+        pinned_level_id: str | None = None,
     ) -> "AdaptiveRuntime":
         session = ControllerSession(
             run_id=run_id,
@@ -272,6 +306,8 @@ class AdaptiveRuntime:
             approved_profile_id=approved_profile_id,
             spec=spec,
             created_at=_aware(clock.now()),
+            skip_isolation_checks=skip_isolation_checks,
+            pinned_level_id=pinned_level_id,
         )
         return cls(
             session,
@@ -314,7 +350,18 @@ class AdaptiveRuntime:
             requested_at=now,
         )
         evidence = await _maybe_await(self.eligibility_probe.inspect(request))
-        reasons = _eligibility_reasons(request, evidence)
+        reasons = _eligibility_reasons(
+            request, evidence, skip_isolation_checks=self.session.skip_isolation_checks
+        )
+        if reasons and _blocked_only_by_probe_errors(request, evidence, reasons):
+            # Every failing check failed by raising, not by observing an unmet
+            # precondition — retry once before blocking. F08-G lost a live
+            # attempt to exactly this in the 2026-08-03 batch: a transient
+            # probe error read as a plain False and the manual rerun passed.
+            evidence = await _maybe_await(self.eligibility_probe.inspect(request))
+            reasons = _eligibility_reasons(
+                request, evidence, skip_isolation_checks=self.session.skip_isolation_checks
+            )
         self.session = self.session.model_copy(
             update={
                 "eligibility": evidence,
@@ -530,10 +577,7 @@ class AdaptiveRuntime:
                 update={"level_changes": [*self.session.level_changes, change]}, deep=True
             )
         except Exception as error:
-            # CalledProcessError stderr must survive into the recorded reason —
-            # type-name-only reasons made F09-P run 2333e298 undiagnosable from artifacts.
-            stderr_tail = " ".join(str(getattr(error, "stderr", "") or "").split())[-160:]
-            detail = f":{stderr_tail}" if stderr_tail else ""
+            detail = stderr_detail(error)
             failed = state.model_copy(
                 update={
                     "phase": ControllerPhase.ABORTED,
@@ -568,7 +612,7 @@ class AdaptiveRuntime:
                 fencing_token=request.fencing_token,
                 idempotency_key=request.idempotency_key,
                 succeeded=False,
-                reason=f"cleanup_exception:{type(error).__name__}",
+                reason=f"cleanup_exception:{type(error).__name__}{stderr_detail(error)}",
             )
         if result.effect_ended_at is not None:
             self._close_latest_effect(_aware(result.effect_ended_at))
@@ -582,6 +626,32 @@ class AdaptiveRuntime:
             effect_ended_at=result.effect_ended_at,
             reason=result.reason,
         )
+        # A run whose injection never applied has nothing to recover from.
+        # level_changes only gains an entry when apply() succeeds, so an empty
+        # list means the environment was never touched — yet such a run still
+        # entered the recovery gate and waited for conditions that describe the
+        # *aftermath of an injection*. Those can never be met, so the run always
+        # aged into DIRTY exactly recovery.timeout later and blocked the queue.
+        # Seen repeatedly in the 2026-08-03 batch wherever the executor refused
+        # the parameters (F03-H, F15-R, F05-P): the refusal was the real finding
+        # and it arrived buried under a 10-minute recovery_timeout.
+        never_injected = not self.session.level_changes
+        if result.succeeded and never_injected:
+            self.session = self.session.model_copy(
+                update={
+                    "controller_state": final_state,
+                    "cleanup": cleanup,
+                    "status": SessionStatus.CLEAN,
+                    "recovery": RecoveryEvidence(
+                        status="succeeded",
+                        started_at=result.effect_ended_at or now,
+                        verified_at=now,
+                        reason="no_injection_applied",
+                    ),
+                },
+                deep=True,
+            )
+            return
         self.session = self.session.model_copy(
             update={
                 "controller_state": final_state,
@@ -671,26 +741,65 @@ class AdaptiveRuntime:
         return _aware(self.clock.now())
 
 
+def _blocked_only_by_probe_errors(
+    request: EligibilityRequest,
+    evidence: EligibilityEvidence,
+    reasons: list[str],
+) -> bool:
+    """True when every blocking reason traces back to a check that raised.
+
+    A check observing an unmet precondition (a genuine False, a structural
+    reason like clean_window_too_short) must block without retry — repeating
+    the question does not change the answer. Only exception-driven failures
+    are worth one more look.
+    """
+    if not all(reason.startswith(("check_failed:", "check_error:")) for reason in reasons):
+        return False
+    failing = [
+        check
+        for check in request.checks
+        if evidence.check_results.get(check) is not True
+    ]
+    return bool(failing) and all(check in evidence.check_errors for check in failing)
+
+
 def _eligibility_reasons(
-    request: EligibilityRequest, evidence: EligibilityEvidence
+    request: EligibilityRequest,
+    evidence: EligibilityEvidence,
+    *,
+    skip_isolation_checks: bool = False,
 ) -> list[str]:
     requested_at = _aware(request.requested_at)
     checked_at = _aware(evidence.checked_at)
     window_start = _aware(evidence.clean_window_start)
     window_end = _aware(evidence.clean_window_end)
+    # The clean-window and scenario_overlap gates are v2-queue isolation
+    # guarantees. The v3 continuous cycle (reset + 2h normal + buffer) already
+    # separates injections on its own time axis, so it opts out of both — the
+    # previous cycle's run legitimately sits inside the 30m overlap window.
     reasons = [
         f"check_failed:{check}"
         for check in request.checks
         if evidence.check_results.get(check) is not True
+        and not (skip_isolation_checks and check == "clean-window")
     ]
+    # A failed check that actually raised carries its exception alongside, so a
+    # blocked session states what broke instead of a bare check name.
+    reasons.extend(
+        f"check_error:{check}:{evidence.check_errors[check]}"
+        for check in request.checks
+        if check in evidence.check_errors
+        and not (skip_isolation_checks and check == "clean-window")
+    )
     window = (window_end - window_start).total_seconds()
-    if window < request.clean_window_sec:
-        reasons.append("clean_window_too_short")
-    if window_end > checked_at:
-        reasons.append("clean_window_after_check")
+    if not skip_isolation_checks:
+        if window < request.clean_window_sec:
+            reasons.append("clean_window_too_short")
+        if window_end > checked_at:
+            reasons.append("clean_window_after_check")
     if checked_at < requested_at:
         reasons.append("eligibility_before_request")
-    if evidence.overlapping_run_ids:
+    if evidence.overlapping_run_ids and not skip_isolation_checks:
         reasons.append("scenario_overlap")
     if not evidence.baseline_active:
         reasons.append("baseline_inactive")

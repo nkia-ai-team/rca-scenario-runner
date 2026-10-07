@@ -24,6 +24,7 @@ from app.capture_orchestration import (
     CaptureScheduler,
     load_scenario_metadata,
 )
+from app.pass_mode import capture_enabled
 from app.production_runtime import (
     TRUSTED_CAPTURE_SCRIPT,
     TRUSTED_CATALOG,
@@ -243,6 +244,9 @@ class ScenarioRunner:
         self,
         scenario_id: str,
         mode: Literal["run", "cleanup"],
+        *,
+        skip_isolation_checks: bool = False,
+        repair_capsule: bool = False,
     ) -> RunInfo:
         scenario = get_scenario(scenario_id)
         external_manifest = None
@@ -256,7 +260,9 @@ class ScenarioRunner:
                     f"external scenario is plan-only or unresolved: {external_manifest.id}"
                 )
             if mode == "cleanup":
-                return await self._start_external_dirty_cleanup(scenario)
+                return await self._start_external_dirty_cleanup(
+                    scenario, repair_capsule=repair_capsule
+                )
 
         if self._lock.locked() or self.is_busy:
             raise RuntimeError("Another scenario is already running")
@@ -388,14 +394,34 @@ class ScenarioRunner:
                 fencing_token=lease.fencing_token,
                 manual_dirty_cleanup=manual_dirty_cleanup,
                 run_dir=run_dir,
+                skip_isolation_checks=skip_isolation_checks,
             )
         )
         return self.get_current()  # type: ignore[return-value]
 
-    async def _start_external_dirty_cleanup(self, scenario) -> RunInfo:
+    async def _start_external_dirty_cleanup(
+        self, scenario, *, repair_capsule: bool = False
+    ) -> RunInfo:
         if self._lock.locked() or self.is_busy:
             raise RuntimeError("Another scenario is already running")
         dirty = self.coordinator.snapshot().dirty_run
+        if dirty is None:
+            # The coordinator forgets a dirty run when a later lease clears it,
+            # while the run's own record stays dirty with its effect interval
+            # open — and an open interval overlaps every future clean window, so
+            # every start is refused with check_failed:clean-window. External
+            # cleanup is the way out, and it was the one thing the forgotten
+            # state made unreachable (F15-T2-run-d5b1ae8a, 2026-08-03).
+            orphan = self.artifact_store.find_orphaned_dirty_run(scenario.id)
+            if orphan is not None:
+                run_id, fencing_token = orphan
+                dirty = self.coordinator.readopt_dirty(
+                    run_id=run_id,
+                    scenario_id=scenario.id,
+                    fencing_token=fencing_token,
+                    reason="readopted for external cleanup: effect interval never closed",
+                    now=self.clock.now(),
+                )
         if dirty is None or dirty.scenario_id != scenario.id:
             raise RuntimeError("external cleanup requires a matching DIRTY run")
         claimant = f"manual-cleanup-{uuid.uuid4().hex[:8]}"
@@ -415,18 +441,32 @@ class ScenarioRunner:
         )
         self._task = asyncio.create_task(
             self._execute_external_dirty_cleanup(
-                dirty.run_id, dirty.fencing_token, claimant
+                dirty.run_id, dirty.fencing_token, claimant,
+                repair_capsule=repair_capsule,
             )
         )
         return self.get_current()  # type: ignore[return-value]
 
     async def _execute_external_dirty_cleanup(
-        self, dirty_run_id: str, fencing_token: int, claimant: str
+        self, dirty_run_id: str, fencing_token: int, claimant: str,
+        *, repair_capsule: bool = False,
     ) -> None:
         assert self._current is not None
         success = False
         try:
             run_dir = self.artifact_store.root / dirty_run_id
+            if repair_capsule:
+                # The capsule's own executor is what failed; re-cut the contract
+                # tree from the live root so cleanup has working code to run.
+                # plan.json is untouched, so the target of the cleanup is the
+                # same one injection created. See repair_capsule_contracts.
+                await asyncio.to_thread(
+                    self.artifact_store.repair_capsule_contracts,
+                    run_dir,
+                    self.dispatcher_path.parent,
+                    reason=f"manual dirty cleanup by {claimant}",
+                    now=self.clock.now(),
+                )
             capsule = self.artifact_store.verify_capsule(run_dir)
             plan = json.loads((run_dir / "plan.json").read_text(encoding="utf-8"))
             binding = capsule["binding"]
@@ -486,6 +526,23 @@ class ScenarioRunner:
                 success = True
         except Exception as error:
             self._append_log(f"[ERROR] External DIRTY cleanup failed: {error}")
+            # The in-memory log tail is the only place this used to land, and it
+            # dies with the process — #21 in the 2026-08-03 batch read as
+            # "HTTP 200, no capsule-repair.json, no error anywhere" while a
+            # refused capsule repair vanished here. Persist the reason next to
+            # the run so a refused escape hatch says why it refused.
+            with suppress(Exception):
+                atomic_json(
+                    self.artifact_store.root / dirty_run_id / "manual-cleanup-error.json",
+                    {
+                        "schema_version": 1,
+                        "source": "manual-dirty-cleanup",
+                        "claimant": claimant,
+                        "repair_capsule": repair_capsule,
+                        "error": f"{type(error).__name__}: {error}",
+                        "at": self.clock.now().isoformat(),
+                    },
+                )
         finally:
             if not success:
                 with suppress(RuntimeError):
@@ -515,6 +572,7 @@ class ScenarioRunner:
         fencing_token: int,
         manual_dirty_cleanup: bool,
         run_dir: Path | None,
+        skip_isolation_checks: bool = False,
     ) -> None:
         assert self._current is not None
         run_id = self._current.run_id
@@ -544,6 +602,7 @@ class ScenarioRunner:
                         fencing_token=fencing_token,
                         run_dir=run_dir,
                         log_file=log_file,
+                        skip_isolation_checks=skip_isolation_checks,
                     )
                 else:
                     exit_code = await self._invoke_once(
@@ -709,10 +768,14 @@ class ScenarioRunner:
         fencing_token: int,
         run_dir: Path,
         log_file=None,
+        skip_isolation_checks: bool = False,
     ) -> tuple[int, object | None]:
         """Drive and persist a controller session; effects stay dependency-bound."""
 
         def run_log(line: str) -> None:
+            # Mirror into the in-memory tail the status API serves. Without it a
+            # controller run polls as zero log lines for its whole duration.
+            self._append_log(line)
             if log_file is not None:
                 log_file.write(line + "\n")
                 log_file.flush()
@@ -739,6 +802,7 @@ class ScenarioRunner:
                     ),
                     dispatcher=self.dispatcher_path,
                     run_dir=run_dir,
+                    skip_isolation_checks=skip_isolation_checks,
                 )
             session = await runtime.begin()
             self.artifact_store.persist_session(
@@ -857,8 +921,21 @@ class ScenarioRunner:
             # beside accepted cases makes them indistinguishable to consumers.
             self.artifact_store.write_result(run_dir, session.trusted_evidence())
             return
+        if not capture_enabled():
+            # Smoke pass: no case is exported, but the run still has to publish
+            # its result — the queue reads result.json as the evidence that the
+            # run finished, and without it every scenario stops the batch with
+            # "controller evidence missing".
+            self.artifact_store.write_result(run_dir, session.trusted_evidence())
+            return
         case_token = re.sub(r"[^a-z0-9]+", "-", session.scenario_id.lower()).strip("-")
-        case_id = f"case-{case_token}-{session.run_id[-8:].lower()}"
+        # v3 marker distinguishes continuous-cycle (schema 2.0) cases from the
+        # legacy v2 library that shares /data/eval-cases (2026-07-25, A-plan
+        # coexistence — consumers must tell case-f01-r-v3-<h> from the old
+        # case-f01-r-<h> at a glance). Only emitted in cycle mode; v2 keeps its
+        # name so already-delivered references stay valid.
+        marker = "v3-" if getattr(session.spec, "cycle_mode", False) or os.environ.get("CYCLE_MODE", "").lower() in {"1", "true", "yes", "on"} else ""
+        case_id = f"case-{case_token}-{marker}{session.run_id[-8:].lower()}"
         evidence = None
         if mode == "evaluation":
             if not self.dispatcher_path.is_file() or not self.catalog_path.is_file():

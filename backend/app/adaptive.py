@@ -127,6 +127,10 @@ class ObservedValue(StrictModel):
     # Failure detail (exit code + stderr tail) for quality="error" signals;
     # absent on healthy observations.
     error: str | None = None
+    # Seconds between genuinely new values at the source (0 = re-queried every
+    # tick). Carried from the approved query so the controller can tell a second
+    # observation apart from a second *reading of the same* observation.
+    update_interval_sec: int = 0
 
     @property
     def usable(self) -> bool:
@@ -146,6 +150,9 @@ class ControllerState(StrictModel):
     level_id: str | None = None
     last_elapsed_sec: int = 0
     streaks: dict[str, int] = Field(default_factory=dict)
+    # elapsed_sec of the tick that last advanced each gate's streak. A tick that
+    # re-reads the same source sample holds the streak instead of advancing it.
+    streak_marks: dict[str, int] = Field(default_factory=dict)
     action: ControllerAction | None = None
     reason: str | None = None
     dirty: bool = False
@@ -195,15 +202,27 @@ def advance(
     raw_ruleout = _matches(spec.must_rule_out, observation.signals)
     raw_success = _matches(spec.success, observation.signals)
     raw_escalate = _matches(spec.escalate, observation.signals)
-    streaks = _updated_streaks(
+    streaks, streak_marks = _updated_streaks(
         state.streaks,
+        state.streak_marks,
+        observation.elapsed_sec,
+        {
+            "abort": _independence_sec(spec.abort, observation.signals),
+            "must_rule_out": _independence_sec(spec.must_rule_out, observation.signals),
+            "success": _independence_sec(spec.success, observation.signals),
+            "escalate": _independence_sec(spec.escalate, observation.signals),
+        },
         abort=raw_abort,
         must_rule_out=raw_ruleout,
         success=raw_success,
         escalate=raw_escalate,
     )
     current = state.model_copy(
-        update={"last_elapsed_sec": observation.elapsed_sec, "streaks": streaks},
+        update={
+            "last_elapsed_sec": observation.elapsed_sec,
+            "streaks": streaks,
+            "streak_marks": streak_marks,
+        },
         deep=True,
     )
 
@@ -217,20 +236,23 @@ def advance(
 
     if observation.elapsed_sec < level.settle_sec:
         return _transition(
-            current, ControllerPhase.SETTLING, ControllerAction.WAIT, "settling"
+            _drop_pending_streaks(current), ControllerPhase.SETTLING, ControllerAction.WAIT, "settling"
         )
     if observation.elapsed_sec < level.min_hold_sec:
         return _transition(
-            current, ControllerPhase.EVALUATING, ControllerAction.WAIT, "min_hold"
+            _drop_pending_streaks(current), ControllerPhase.EVALUATING, ControllerAction.WAIT, "min_hold"
         )
 
     # Alternative-cause veto is judged only once the injection has settled past
     # min_hold. Injections that deliberately restart the target pod (k8s.env,
     # k8s.probe) drive pod_ready=false transiently during the expected restart;
     # evaluating must_rule_out before min_hold aborted those runs on their own
-    # injection mechanism. A genuine alternative cause (pod never recovers) keeps
-    # the streak alive past min_hold and still aborts here; immediate dangers are
-    # already handled by the abort set above.
+    # injection mechanism. The streak is also dropped while settling (above), so
+    # the confirmation below is carried by consecutive_ticks of post-min_hold
+    # evidence alone — F21-P run 5df51067 was vetoed one tick past min_hold on a
+    # streak built almost entirely from its own rollout transient. A genuine
+    # alternative cause still aborts here, at most consecutive_ticks-1 ticks
+    # later; immediate dangers are already handled by the abort set above.
     if _confirmed(spec.must_rule_out, streaks, "must_rule_out"):
         return _transition(
             current,
@@ -244,6 +266,11 @@ def advance(
             current, ControllerPhase.SUCCEEDED, ControllerAction.SUCCEED, "success"
         )
 
+    # Escalation is carried by post-min_hold observations only: an escalate
+    # condition says "the effect has not appeared yet", which is trivially true
+    # while the injection is still working, so a streak charged during
+    # settle+min_hold would abandon every rung the instant min_hold expires.
+    # See _drop_pending_streaks (F05-R run 14fc63f9: gave up 6s before the OOM).
     if (
         not safety_unknown
         and not safety_pending
@@ -284,11 +311,20 @@ def finalize_cleanup(state: ControllerState, *, cleanup_succeeded: bool) -> Cont
     if not state.terminal:
         raise ValueError("cleanup can only finalize a terminal controller state")
     if not cleanup_succeeded:
+        # "cleanup_failed" says the recovery attempt failed; the terminal reason
+        # already there says why the run failed at all. Replacing it threw the
+        # latter away — F01-R run 0104bd01 (2026-07-31) reached its artifacts as
+        # a bare "cleanup_failed", so the apply's stderr, which the apply path
+        # deliberately preserves, was destroyed one layer above. Keep the prefix
+        # so reason matches on "cleanup_failed" still hold.
+        reason = "cleanup_failed"
+        if state.reason:
+            reason = f"{reason} after {state.reason}"
         return state.model_copy(
             update={
                 "phase": ControllerPhase.DIRTY,
                 "action": ControllerAction.MARK_DIRTY,
-                "reason": "cleanup_failed",
+                "reason": reason,
                 "dirty": True,
             },
             deep=True,
@@ -343,11 +379,138 @@ def _condition_result(
     return actual != expected
 
 
-def _updated_streaks(streaks: dict[str, int], **results: bool | None) -> dict[str, int]:
+def _independence_sec(
+    condition_set: ConditionSet | None,
+    signals: dict[str, ObservedValue],
+) -> int:
+    """Seconds a gate must wait before its evidence can renew.
+
+    An ``all`` gate is only as independent as its slowest signal: confirming a
+    condition that reads a 60s metric three times inside one minute reads one
+    sample three times, which is one piece of evidence, not three.
+
+    An ``any`` gate renews as fast as the quickest condition actually carrying
+    it. Taking the maximum here would have delayed F12-H's abort by 45s whenever
+    the entry point went dark, because an unrelated 60s prometheus condition sat
+    in the same set — safety gates must not inherit an idle signal's cadence.
+    """
+    if condition_set is None:
+        return 0
+    intervals = [
+        signals[condition.signal].update_interval_sec
+        for condition in condition_set.conditions
+        if condition.signal in signals
+        and (
+            condition_set.match == "all"
+            or _condition_result(condition, signals) is True
+        )
+    ]
+    if not intervals:
+        return 0
+    return max(intervals) if condition_set.match == "all" else min(intervals)
+
+
+def _drop_pending_streaks(state: ControllerState) -> ControllerState:
+    """Zero the must_rule_out and escalate streaks while the level is pre-min_hold.
+
+    7eb9391 deferred the veto's *judgment* past min_hold but let its *evidence*
+    keep accumulating through the settle window, so the first post-min_hold tick
+    could confirm on a streak the injection's own transient had built. Dropping
+    the streak here makes ``consecutive_ticks`` mean post-min_hold observations,
+    which is what the deferral promised in the first place (0eec7ed).
+
+    2026-08-07: escalate had the identical hole, and F05-R run 14fc63f9 paid for
+    it. Its escalate condition is `restart_count == 0` — "the OOM has not landed
+    yet" — which is *necessarily* true while the injection is still working, so
+    the streak charges to full during settle+min_hold and fires on the first tick
+    min_hold allows. The 640Mi rung was abandoned at elapsed 140s; payment OOMed
+    at ~146s. Six seconds. The rung worked: for the next 70s payment was gone
+    entirely and checkout returned 91 5xx and zero 200s — the exact success
+    condition — but by then the controller had moved on and logged no ticks at
+    all for that window.
+
+    This generalises to every escalate condition of the form "the effect has not
+    appeared yet", which is what an escalate condition *is*. Deferring the
+    judgment past min_hold while letting the evidence accrue before it means
+    min_hold never protects the rung it was added to protect.
+    """
+    streaks = dict(state.streaks)
+    marks = dict(state.streak_marks)
+    for gate in ("must_rule_out", "escalate"):
+        streaks[gate] = 0
+        marks.pop(gate, None)
+    return state.model_copy(update={"streaks": streaks, "streak_marks": marks}, deep=True)
+
+
+# Gates whose streak survives an *unreadable* sample (as opposed to a sample
+# that genuinely missed the threshold).
+#
+# `success` counts damage that has already been observed. A gauge going blind
+# does not un-observe it. And the gauges go blind precisely when the injection
+# bites hardest: an APM percentile has no sample when the service completes no
+# transaction, which is by design (publishing 0 for an empty window broke `gte`
+# gates, so the probe reports "unusable" instead). Treating that identically to
+# "the threshold was not met" made success hardest to confirm exactly where the
+# damage was worst — measured on 2026-08-09: F15-H `commerce_order_p95`
+# unusable 21/53 ticks with all three conditions otherwise satisfied (streak
+# never passed 1), F05-P's four-tick success window broken by one unreadable
+# `checkout_5xx_rate` mid-window.
+#
+# `abort` and `must_rule_out` are deliberately excluded. They assert "this is
+# dangerous" / "another cause is present"; an unreadable sample is not evidence
+# for either, so they keep resetting (fail-closed). The asymmetry is the point.
+_HOLD_ON_UNKNOWN = frozenset({"success"})
+
+# How stale held evidence may get before it is discarded, in multiples of the
+# gate's independence window. Without a bound, success could be confirmed across
+# an arbitrarily long observation gap — the real risk this exception carries.
+# With independence 0 (a signal re-queried every tick) the bound is 0, so an
+# unreadable sample resets immediately, which is the pre-existing behaviour.
+_UNKNOWN_HOLD_FACTOR = 2
+
+
+def _updated_streaks(
+    streaks: dict[str, int],
+    marks: dict[str, int],
+    elapsed_sec: int,
+    independence: dict[str, int],
+    **results: bool | None,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Advance each gate's streak, counting independent samples rather than ticks.
+
+    Four outcomes per gate: a false result resets it, an unreadable result resets
+    it too *unless* the gate holds on unknown (see ``_HOLD_ON_UNKNOWN``), a true
+    result on fresh evidence advances it, and a true result that can only be
+    re-reading the previous sample holds it where it is. Holding rather than
+    advancing is what makes ``consecutive_ticks`` mean consecutive
+    *observations* — before this the tick interval (15s) outpaced every
+    prometheus metric (60s), so a three-tick confirmation could be satisfied
+    inside a single sample.
+    """
     updated = dict(streaks)
+    updated_marks = dict(marks)
     for name, result in results.items():
-        updated[name] = updated.get(name, 0) + 1 if result is True else 0
-    return updated
+        if result is None and name in _HOLD_ON_UNKNOWN:
+            mark = updated_marks.get(name)
+            if mark is None or updated.get(name, 0) == 0:
+                continue  # nothing accrued yet, so nothing to hold
+            if elapsed_sec - mark > _UNKNOWN_HOLD_FACTOR * independence.get(name, 0):
+                updated[name] = 0
+                updated_marks.pop(name, None)
+            continue
+        if result is not True:
+            updated[name] = 0
+            updated_marks.pop(name, None)
+            continue
+        previous = updated.get(name, 0)
+        mark = updated_marks.get(name)
+        if previous == 0 or mark is None:
+            updated[name] = 1
+            updated_marks[name] = elapsed_sec
+        elif elapsed_sec - mark >= independence.get(name, 0):
+            updated[name] = previous + 1
+            updated_marks[name] = elapsed_sec
+    return updated, updated_marks
 
 
 def _confirmed(
@@ -399,6 +562,7 @@ def _escalate_or_fail(
             "level_id": next_level.id,
             "last_elapsed_sec": 0,
             "streaks": {},
+            "streak_marks": {},
             "action": ControllerAction.ESCALATE,
             "reason": reason,
         },

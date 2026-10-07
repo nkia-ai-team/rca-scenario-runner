@@ -68,6 +68,18 @@ services:
       - CAPTURE_STATE_PATH=/app/state/capture-jobs.json
       - LIVE_QUEUE_STATE_PATH=/app/state/live-queue.json
       - LIVE_CONTROLLER_REGISTRY_PATH=/opt/lucida/scenario-contracts/registry/controllers.json
+      # v3 연속 사이클(캡처) 모드. 비면 v2 시나리오 런으로 돈다.
+      # CYCLE_SCENARIOS 는 승인 목록의 부분집합만 허용된다(오타는 거부됨).
+      - CYCLE_MODE=${CYCLE_MODE:-}
+      - CYCLE_SCENARIOS=${CYCLE_SCENARIOS:-}
+      # 모델 스냅샷 평면. 비우면 auto(워크로드 실재 여부로 판별).
+      - MODEL_EXEC_MODE=${MODEL_EXEC_MODE:-}
+      # 패스 종류. smoke면 케이스를 만들고 지키는 일(내보내기·간격·격리검사·야간창·
+      # 골든리셋)이 함께 꺼진다 — 판정에 관여하는 것은 무엇도 바뀌지 않는다.
+      # 근거와 규칙은 backend/app/pass_mode.py. 기본값은 dataset.
+      - SCENARIO_PASS=${SCENARIO_PASS:-dataset}
+      # dataset 패스의 시나리오 간격. 30분 아래로는 내려가지 않는다(캡처 창이 겹친다).
+      - SCENARIO_CLEAN_WINDOW_MIN=${SCENARIO_CLEAN_WINDOW_MIN:-30}
       - TRUSTED_RUNS_ROOT=/var/lib/lucida/scenario-runs
       - CAPTURE_SCRIPT=/opt/lucida/capture-eval-case.sh
       - ASSEMBLE_SCRIPT=/opt/lucida/assemble-eval-case.sh
@@ -83,6 +95,11 @@ services:
       - COMMERCE_DB_PASSWORD=${COMMERCE_DB_PASSWORD:-}
       - PG_PASSWORD=${PG_PASSWORD:-}
       - CH_PASSWORD=${CH_PASSWORD:-}
+      # clickhouse.service_error_rate reads the trace table for the 13 scenarios
+      # whose gates moved off the APM rollup. Same credential as the capture
+      # scripts — mapped, not copied, so there is one secret in .env.
+      - CLICKHOUSE_USER=${CH_USER:-lucida}
+      - CLICKHOUSE_PASSWORD=${CH_PASSWORD:-}
       - MODEL_SNAPSHOT_SSH_TARGET=${MODEL_SNAPSHOT_SSH_TARGET:-}
       # trainer-reset(golden) 활성화 (2026-07-21)
       - GOLDEN_RESET_ENABLED=${GOLDEN_RESET_ENABLED:-}
