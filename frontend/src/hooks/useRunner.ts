@@ -42,6 +42,20 @@ function toDisplay(status: Status): DisplayStatus {
   return status;
 }
 
+// 409 는 "다른 실행 중" 하나가 아니다. 현행 시나리오는 정리할 실행이 없을 때,
+// 사전 점검이 거부할 때도 409 로 답하므로 사유를 그대로 보여 준다.
+function conflictMessage(e: ApiError): string {
+  if (e.status !== 409) return e.detail ?? e.message;
+  const detail = e.detail ?? "";
+  if (!detail || detail.includes("already running")) {
+    return "다른 시나리오가 실행 중입니다";
+  }
+  if (detail.includes("requires a matching DIRTY run")) {
+    return "정리할 실행이 없습니다. 이 시나리오로 남은 미정리 실행이 없습니다";
+  }
+  return detail;
+}
+
 function parseIsoSafe(iso: string | null | undefined): Date | null {
   if (!iso) return null;
   const d = new Date(iso);
@@ -143,11 +157,7 @@ export function useRunner(scenarios: ScenarioView[]): RunnerApi {
         startPolling(scn);
       } catch (e) {
         if (e instanceof ApiError) {
-          setError(
-            e.status === 409
-              ? "다른 시나리오가 실행 중입니다"
-              : (e.detail ?? e.message),
-          );
+          setError(conflictMessage(e));
         } else {
           setError("알 수 없는 오류");
         }
@@ -165,11 +175,7 @@ export function useRunner(scenarios: ScenarioView[]): RunnerApi {
         startPolling(scn);
       } catch (e) {
         if (e instanceof ApiError) {
-          setError(
-            e.status === 409
-              ? "다른 시나리오가 실행 중입니다"
-              : (e.detail ?? e.message),
-          );
+          setError(conflictMessage(e));
         } else {
           setError("알 수 없는 오류");
         }

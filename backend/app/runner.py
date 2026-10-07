@@ -773,6 +773,9 @@ class ScenarioRunner:
         """Drive and persist a controller session; effects stay dependency-bound."""
 
         def run_log(line: str) -> None:
+            # Mirror into the in-memory tail the status API serves. Without it a
+            # controller run polls as zero log lines for its whole duration.
+            self._append_log(line)
             if log_file is not None:
                 log_file.write(line + "\n")
                 log_file.flush()

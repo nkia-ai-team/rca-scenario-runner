@@ -114,7 +114,7 @@ export function HistoryTable({ history, scenarios, open, setOpen }: Props) {
                               {scn?.name ?? h.scenario_id}
                             </span>
                             <span className="mono text-[10.5px] text-[var(--ink-3)]">
-                              S{pres.num}
+                              {pres.code}
                             </span>
                             {h.mode === "cleanup" && (
                               <span className="mono text-[10px] text-[var(--ink-3)] uppercase tracking-wider">

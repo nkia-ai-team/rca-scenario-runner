@@ -153,7 +153,13 @@ async def test_external_fixed_and_adaptive_manifests_reach_controller_runtime(
 
     assert seen[0].id == selected.id
     assert seen[0].injection["catalog_slug"] == selected.slug
-    assert runner.get_current().status == "succeeded"
+    current = runner.get_current()
+    assert current.status == "succeeded"
+    # The status API tail and the on-disk log carry the same controller lines.
+    log_lines = runner.log_path(current.run_id).read_text(encoding="utf-8").splitlines()
+    assert current.log_tail == log_lines
+    assert current.log_tail[0].startswith(f"[BEGIN] run={current.run_id} ")
+    assert current.log_tail[-1].startswith("[END] status=clean")
 
 
 async def test_plan_only_external_manifest_is_refused_before_lease(tmp_path, monkeypatch) -> None:
