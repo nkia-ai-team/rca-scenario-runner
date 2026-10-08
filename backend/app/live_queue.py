@@ -478,7 +478,15 @@ class LiveScenarioQueue:
         self._functional_details = details
         return checks
 
-    async def start(self) -> LiveQueueState:
+    async def start(self, scenario_ids: list[str] | None = None) -> LiveQueueState:
+        """Start the queue. ``scenario_ids`` narrows a cycle run to those approved
+        scenarios for this queue only, like CYCLE_SCENARIOS but without a container
+        restart: the operation harness starts one candidate at a time this way
+        (testbed-services docs/spec-scenario-lifecycle.md)."""
+        if scenario_ids is not None and not self.cycle_mode:
+            raise RuntimeError("scenario_ids is only supported in cycle mode")
+        if scenario_ids is not None and not scenario_ids:
+            raise RuntimeError("scenario_ids must name at least one scenario")
         async with self._lock:
             current = self.snapshot()
             if current.phase in ACTIVE_PHASES:
@@ -490,7 +498,9 @@ class LiveScenarioQueue:
                 raise RuntimeError(f"live queue readiness failed: {', '.join(readiness.missing)}")
             now = self._format(self.clock.now())
             if self.cycle_mode:
-                scenario_ids, snapshot_sha256 = self._cycle_contract()
+                scenario_ids, snapshot_sha256 = self._cycle_contract(
+                    tuple(scenario_ids) if scenario_ids is not None else None
+                )
                 state = LiveQueueState(
                     queue_id=f"cycle-{len(scenario_ids)}-{uuid.uuid4().hex[:8]}",
                     scenario_ids=scenario_ids,
@@ -1354,7 +1364,7 @@ class LiveScenarioQueue:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"{bundle_dir}\n", encoding="utf-8")
 
-    def _cycle_contract(self) -> tuple[list[str], str]:
+    def _cycle_contract(self, selected_ids: tuple[str, ...] | None = None) -> tuple[list[str], str]:
         """Freeze the v3 cycle's scenario list and its digest.
 
         Sourced from the same approved registry the v2 queue freezes, so both
@@ -1364,9 +1374,10 @@ class LiveScenarioQueue:
         there would otherwise produce a capture nobody asked for.
         """
         approved, digest = self._queue_contract()
-        if not self.cycle_scenario_ids:
+        chosen = self.cycle_scenario_ids if selected_ids is None else selected_ids
+        if not chosen:
             return approved, digest
-        selected = list(self.cycle_scenario_ids)
+        selected = list(chosen)
         if len(selected) != len(set(selected)):
             raise RuntimeError("cycle queue scenario ids must be unique")
         unknown = [item for item in selected if item not in set(approved)]

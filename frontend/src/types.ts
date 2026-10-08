@@ -68,6 +68,9 @@ export interface ApiScenario {
   propagation_steps: string[] | null;
   expected_clusters: Record<string, unknown> | null;
   expected_incidents: Record<string, unknown> | null;
+  // testbed-services 수명주기: "official" = 정상 녹화 1개 이상, "candidate" = 녹화 전 후보.
+  // 없으면(레거시) 정식으로 취급한다.
+  stage?: "official" | "candidate" | null;
 }
 
 export interface Domain {

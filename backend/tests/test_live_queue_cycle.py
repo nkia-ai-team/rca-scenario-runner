@@ -146,6 +146,28 @@ def test_cycle_subset_must_come_from_the_approved_list(tmp_path: Path) -> None:
     assert narrowed == [approved[1]]
 
 
+@pytest.mark.asyncio
+async def test_start_narrows_one_cycle_queue_to_the_requested_scenarios(tmp_path: Path) -> None:
+    """The operation harness starts one candidate at a time without restarting the
+    container (CYCLE_SCENARIOS is fixed at boot). The request narrows only that
+    queue and still refuses ids outside the approved list."""
+    approved = make_cycle_queue(tmp_path, cycle_ids=())[0]._queue_contract()[0]
+    (tmp_path / "q").mkdir()
+    configured = (approved[0], approved[1])
+    queue, _, _, _, _ = make_cycle_queue(tmp_path / "q", cycle_ids=configured)
+
+    with pytest.raises(RuntimeError, match="not in the approved list"):
+        await queue.start(scenario_ids=["F01-TYPO"])
+    with pytest.raises(RuntimeError, match="at least one"):
+        await queue.start(scenario_ids=[])
+
+    state = await queue.start(scenario_ids=[approved[1]])
+
+    assert state.scenario_ids == [approved[1]]
+    assert state.queue_id.startswith("cycle-1-")
+    assert queue._cycle_contract()[0] == list(configured)  # the configured default is untouched
+
+
 async def _advance_to_injection(queue, runner, clock, *, scenario_id, start=True):
     """start -> cycle_reset -> cycle_normal -> cycle_buffer -> running."""
     if start:
@@ -582,3 +604,26 @@ async def test_collector_restart_wipes_stale_bundle_dir(tmp_path: Path) -> None:
     assert not (bundle / "gen0.json").exists()
     assert not (bundle / "orphan.json").exists()
     assert (bundle / "gen1.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_start_route_passes_the_optional_subset_body(monkeypatch) -> None:
+    """The web button posts no body; the operation harness posts {"scenario_ids": [...]}."""
+    from httpx import ASGITransport, AsyncClient
+
+    from app import main
+
+    calls = []
+
+    class FakeQueue:
+        async def start(self, scenario_ids=None):
+            calls.append(scenario_ids)
+            raise RuntimeError("stop here")
+
+    monkeypatch.setattr(main, "get_live_queue", lambda: FakeQueue())
+    async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://t") as client:
+        no_body = await client.post("/api/live-queue/start")
+        subset = await client.post("/api/live-queue/start", json={"scenario_ids": ["F30-R"]})
+
+    assert (no_body.status_code, subset.status_code) == (409, 409)
+    assert calls == [None, ["F30-R"]]

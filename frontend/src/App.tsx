@@ -12,7 +12,7 @@ import { useHealth } from "./hooks/useHealth";
 import { useRunner } from "./hooks/useRunner";
 import { useScenarios } from "./hooks/useScenarios";
 import { durationSec } from "./lib/format";
-import type { DisplayStatus } from "./types";
+import type { DisplayStatus, ScenarioView } from "./types";
 
 const DEFAULT_DOMAIN_SLUG = "plopvape-shop";
 
@@ -69,6 +69,9 @@ export default function App() {
   const visibleScenarios = selectedDomain
     ? scenarios.filter((s) => s.domain === selectedDomain)
     : scenarios;
+  // 후보(정상 녹화 전)는 정식 목록과 섞지 않고 아래 "검증 대기" 칸에 따로 보인다.
+  const officialScenarios = visibleScenarios.filter((s) => s.stage !== "candidate");
+  const candidateScenarios = visibleScenarios.filter((s) => s.stage === "candidate");
 
   // Concurrency banner — only show when someone *else* is running.
   // "Someone else" = the active run_id is not what this tab launched.
@@ -157,6 +160,20 @@ export default function App() {
   }, [runner.error]);
 
   const selectedId = runner.exec?.scenario.id;
+  const renderCard = (s: ScenarioView) => (
+    <ScenarioCard
+      key={s.id}
+      scn={s}
+      status={runner.statuses[s.id] ?? "idle"}
+      runDisabled={
+        someoneElseRunning ||
+        (runner.anyRunning && runner.statuses[s.id] !== "running")
+      }
+      isSelected={selectedId === s.id}
+      onRun={runner.run}
+      onCleanup={runner.cleanup}
+    />
+  );
 
   return (
     <div className="min-h-screen relative">
@@ -227,7 +244,9 @@ export default function App() {
                   <p className="text-[11.5px] text-[var(--ink-3)] mt-0.5">
                     {selectedDomain && domains.find((d) => d.slug === selectedDomain)?.label}
                     {" · "}
-                    {visibleScenarios.length}건 · cleanup 멱등 보장
+                    정식 {officialScenarios.length}건
+                    {candidateScenarios.length > 0 && ` · 검증 대기 ${candidateScenarios.length}건`}
+                    {" · "}cleanup 멱등 보장
                   </p>
                 </div>
               </div>
@@ -242,22 +261,22 @@ export default function App() {
                     이 도메인에 등록된 시나리오가 없습니다.
                   </div>
                 )}
-                {visibleScenarios.map((s) => (
-                  <ScenarioCard
-                    key={s.id}
-                    scn={s}
-                    status={runner.statuses[s.id] ?? "idle"}
-                    runDisabled={
-                      someoneElseRunning ||
-                      (runner.anyRunning &&
-                        runner.statuses[s.id] !== "running")
-                    }
-                    isSelected={selectedId === s.id}
-                    onRun={runner.run}
-                    onCleanup={runner.cleanup}
-                  />
-                ))}
+                {officialScenarios.map(renderCard)}
               </div>
+              {candidateScenarios.length > 0 && (
+                <div className="space-y-3 pt-3">
+                  <div className="px-1">
+                    <h3 className="text-[13px] font-semibold text-[var(--ink-2)]">
+                      검증 대기 · {candidateScenarios.length}건
+                    </h3>
+                    <p className="text-[11.5px] text-[var(--ink-3)] mt-0.5">
+                      정상 녹화 전인 후보입니다. 운영 하네스가 녹화 대기 큐 순서대로 실행하고,
+                      녹화에 성공하면 정식 목록으로 옮겨집니다.
+                    </p>
+                  </div>
+                  {candidateScenarios.map(renderCard)}
+                </div>
+              )}
             </section>
 
             <section

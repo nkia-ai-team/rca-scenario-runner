@@ -90,9 +90,11 @@ def _to_scenario(manifest: ScenarioManifest, meta: dict[str, Any]) -> Scenario |
     hops = [hop for hop in _ARROW.split(chain) if hop]
     observed_in = _strings(meta.get("observation_domains"))
     root_cause = meta.get("root_cause")
+    stage = (manifest.model_extra or {}).get("stage")
     return Scenario(
         id=manifest.id,
         short_id=manifest.id,
+        stage=stage if isinstance(stage, str) else None,
         domain=domain,
         domain_label=_DOMAIN_LABELS.get(domain, domain.replace("-", " ").title()),
         name=_text(meta, "title") or manifest.id,

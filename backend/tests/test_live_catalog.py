@@ -11,9 +11,13 @@ from app.runner import get_runner
 from tests.test_external_live_manifests import manifest
 
 
-def write_manifest(root: Path, scenario_id: str, *, live: bool = True) -> None:
+def write_manifest(
+    root: Path, scenario_id: str, *, live: bool = True, stage: str | None = None
+) -> None:
     document = manifest("evaluation", live=live).model_dump()
     document["id"] = scenario_id
+    if stage is not None:
+        document["stage"] = stage
     document["slug"] = scenario_id.lower()
     if not live:
         document["readiness"] = "parked"
@@ -86,6 +90,22 @@ def test_live_manifest_becomes_a_card_with_registry_text(tmp_path, manifest_root
         "정답 대상: commerce-order\n\n"
         "부분 점수 대상: commerce-shipping"
     )
+
+
+def test_manifest_stage_reaches_the_card(tmp_path, manifest_root) -> None:
+    """testbed-services 수명주기: 후보(candidate)는 웹이 "검증 대기"로 따로 보인다.
+    stage 가 없는 manifest(옛 catalog)는 None 이고 웹은 정식으로 취급한다."""
+    write_manifest(manifest_root, "F01-R", stage="official")
+    write_manifest(manifest_root, "F30-R", stage="candidate")
+    write_manifest(manifest_root, "F04-H")
+    registry = write_registry(
+        tmp_path / "scenario-metadata.json",
+        {sid: metadata() for sid in ("F01-R", "F30-R", "F04-H")},
+    )
+
+    stages = {scenario.id: scenario.stage for scenario in list_live_scenarios(registry)}
+
+    assert stages == {"F01-R": "official", "F30-R": "candidate", "F04-H": None}
 
 
 @pytest.mark.parametrize(

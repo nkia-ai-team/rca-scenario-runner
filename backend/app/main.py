@@ -4,7 +4,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Body, FastAPI, HTTPException, Response
+from pydantic import BaseModel
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -99,10 +100,18 @@ async def api_live_queue_readiness() -> OperationalReadiness:
     return await asyncio.to_thread(get_live_queue().readiness)
 
 
+class LiveQueueStartRequest(BaseModel):
+    # Optional cycle-mode subset for this queue only (approved ids). Omitted or
+    # no body keeps the configured CYCLE_SCENARIOS / whole approved list.
+    scenario_ids: list[str] | None = None
+
+
 @app.post("/api/live-queue/start", response_model=LiveQueueState)
-async def api_live_queue_start() -> LiveQueueState:
+async def api_live_queue_start(
+    body: LiveQueueStartRequest | None = Body(default=None),
+) -> LiveQueueState:
     try:
-        return await get_live_queue().start()
+        return await get_live_queue().start(scenario_ids=body.scenario_ids if body else None)
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 

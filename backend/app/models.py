@@ -111,6 +111,10 @@ class Scenario(BaseModel):
     # 반드시 수집 가능한 시그널 (트레이스 span / 메트릭 / 로그) 기반으로만 기술.
     # 보이지 않는 것 (코드 어노테이션, 런타임 설정값) 채점 기준 금지.
     expected_rca_root_cause: Optional[str] = None
+    # testbed-services 수명주기(docs/spec-scenario-lifecycle.md): "official" = 정상 녹화
+    # 1개 이상, "candidate" = 실행은 되지만 녹화 전(웹은 "검증 대기"로 따로 보인다).
+    # 레거시 catalog 와 stage 가 없는 manifest 는 None(정식으로 취급).
+    stage: Optional[str] = None
     # --- 구조화 스키마 (testbed-services spec-scenario-design §4 / load §3) ---
     # 레거시 항목은 root_cause/propagation 이 문자열이라 위의 cause/propagation 으로
     # 그대로 들어오고, 구조화 항목은 로더가 표시용 문자열로 정규화한 뒤 원본을
