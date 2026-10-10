@@ -12,6 +12,7 @@ import pytest
 from app.adaptive_runtime import EligibilityRequest
 from app.live_probes import (
     DEPLOYMENT_REPLICAS_CONTRACT,
+    LiveProbeError,
     LOADGEN_FIELDS,
     BLOCKED_SESSION_SQL,
     EXPECTED_KUBE_CONTEXT,
@@ -1738,3 +1739,107 @@ def test_node_utilization_templates_read_the_system_series() -> None:
     for template_id in ("kcm-node-cpu-utilization-v1", "kcm-node-memory-utilization-v1"):
         promql = PROMETHEUS_TEMPLATES[template_id]
         assert ".system_" in promql, f"{template_id} 가 파드 회계 계열을 읽는다: {promql}"
+
+
+def _mysql_pod_process(fakes: Fakes, *, started_at: str, anon: int):
+    """Fake kubectl for the food MySQL StatefulSet pod (F42-P)."""
+    def process(argv, **kwargs):
+        argv = list(argv)
+        fakes.process_calls.append((argv, kwargs))
+        if "pods" in argv and "app=testbed-mysql" in argv:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "metadata": {"name": "testbed-mysql-0"},
+                                "status": {
+                                    "conditions": [{"type": "Ready", "status": "True"}],
+                                    "containerStatuses": [
+                                        {
+                                            "name": "mysql",
+                                            "restartCount": 44,
+                                            "lastState": {"terminated": {"reason": "OOMKilled"}},
+                                            "state": {"running": {"startedAt": started_at}},
+                                        }
+                                    ],
+                                },
+                            }
+                        ]
+                    }
+                ),
+                "",
+            )
+        if "/sys/fs/cgroup/memory.stat" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, f"anon {anon}\nfile 137023488\nkernel 16384000\n", ""
+            )
+        if "/sys/fs/cgroup/memory.current" in argv:
+            return subprocess.CompletedProcess(argv, 0, "1073078272\n1073741824\n", "")
+        return fakes.process(argv, **kwargs)
+    return process
+
+
+def test_f42p_food_mysql_restart_is_read_as_uptime(tmp_path) -> None:
+    # MySQL already carries restartCount 44 and lastState OOMKilled from earlier
+    # days, so F42-P rules a restart during the run out by a short uptime.
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes, scenario_id="F42-P")
+    probes.process_runner = _mysql_pod_process(
+        fakes, started_at=(NOW - timedelta(hours=35)).isoformat(), anon=919715840
+    )
+    registry = ApprovedQueryRegistry.from_path()
+    target = {"namespace": "rca-testbed-food", "deployment": "testbed-mysql", "container": "mysql"}
+    values = {
+        query_id: probes.observe(registry.bind({"query_id": query_id, "parameters": target}))
+        for query_id in (
+            "kubernetes.container_uptime_seconds",
+            "kubernetes.container_restart_count",
+            "kubernetes.container_last_termination_reason",
+            "kubernetes.container_memory_current_bytes",
+        )
+    }
+    assert all(item["quality"] == "good" for item in values.values())
+    assert values["kubernetes.container_uptime_seconds"]["value"] == 35 * 3600
+    assert values["kubernetes.container_restart_count"]["value"] == 44
+    assert values["kubernetes.container_last_termination_reason"]["value"] == "OOMKilled"
+    assert values["kubernetes.container_memory_current_bytes"]["value"] == 1073078272
+
+    probes.process_runner = _mysql_pod_process(
+        fakes, started_at=(NOW - timedelta(seconds=40)).isoformat(), anon=500000000
+    )
+    restarted = probes.observe(
+        registry.bind({"query_id": "kubernetes.container_uptime_seconds", "parameters": target})
+    )
+    assert restarted["quality"] == "good" and restarted["value"] == 40
+
+    rejected = probes.observe(
+        registry.bind(
+            {
+                "query_id": "kubernetes.container_uptime_seconds",
+                "parameters": {**target, "deployment": "testbed-order"},
+            }
+        )
+    )
+    assert rejected["quality"] == "error" and rejected["value"] is None
+
+
+def test_db_memory_headroom_needs_anon_room_and_uptime(tmp_path) -> None:
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes, scenario_id="F42-P")
+    long_up = (NOW - timedelta(hours=35)).isoformat()
+    probes.process_runner = _mysql_pod_process(fakes, started_at=long_up, anon=919715840)
+    assert probes._db_memory_has_headroom() is True
+    probes.process_runner = _mysql_pod_process(fakes, started_at=long_up, anon=960000000)
+    with pytest.raises(LiveProbeError):
+        probes._db_memory_has_headroom()
+    probes.process_runner = _mysql_pod_process(
+        fakes, started_at=(NOW - timedelta(minutes=10)).isoformat(), anon=500000000
+    )
+    with pytest.raises(LiveProbeError):
+        probes._db_memory_has_headroom()
+    other = _probes(tmp_path, fakes, scenario_id="F07-H")
+    with pytest.raises(LiveProbeError):
+        other._db_memory_has_headroom()

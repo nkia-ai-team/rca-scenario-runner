@@ -155,6 +155,12 @@ APPROVED_CHECK_IDS = frozenset(
         # that the 2026-07-28 nodeSelector pinning had moved the whole commerce
         # cohort off the node F05-P was hogging. See WORKER_COHORT_PLACEMENT.
         "worker-cohort-placement",
+        # F42-P loads the food MySQL with many concurrent aggregation sessions
+        # while that MySQL already sits next to its 1Gi limit and OOM-restarts
+        # every day or two. Start only with anonymous-memory headroom and a
+        # container that has been up long enough for a restart during the run
+        # to show as a short uptime. See DB_MEMORY_HEADROOM.
+        "db-memory-headroom",
     }
 )
 
@@ -471,6 +477,22 @@ WORKER_COHORT_PLACEMENT = {
             "testbed-payment",
         ),
     ),
+}
+# scenario_id -> the database container that must have memory headroom before
+# the scenario may start. memory.current is useless here (page cache keeps it at
+# memory.max), so the check reads the anon line of memory.stat. Server-side for
+# the same reason as WORKER_COHORT_PLACEMENT.
+DB_MEMORY_HEADROOM = {
+    # 2026-10-10 109: anon 919,715,840 (877MiB), kernel ~16MB, limit 1GiB, one
+    # aggregation session ~2.3MiB. Up to ~20 sessions (pool 10 + abandoned ones)
+    # stay below the limit from 900MiB anon.
+    "F42-P": {
+        "namespace": "rca-testbed-food",
+        "selector": "app=testbed-mysql",
+        "container": "mysql",
+        "max_anon_bytes": 900 * 1024 * 1024,
+        "min_uptime_sec": 1800,
+    },
 }
 APPROVED_BUSINESS_KEYS = frozenset({"checkout", "order-1"})
 APPROVED_K8S_TARGETS = {
@@ -858,6 +880,15 @@ F25_H_POSTGRES_TARGET = {
     "deployment": "testbed-postgres",
     "container": "postgres",
 }
+# F42-P must_rule_out: the food MySQL StatefulSet pod restarting (OOMKill) during
+# the run. Its restart count and last termination reason are already non-zero
+# and OOMKilled from earlier days, so the rule reads uptime instead; memory and
+# termination reason are recorded alongside.
+F42_P_FOOD_MYSQL_TARGET = {
+    "namespace": "rca-testbed-food",
+    "deployment": "testbed-mysql",
+    "container": "mysql",
+}
 # F05-P must_rule_out: a rising kafka restart count would mean the broker is
 # crashlooping rather than the node draining — restart-count query only.
 F05_KAFKA_TARGET = {
@@ -990,6 +1021,7 @@ class LiveProbeSet:
             "baseline-business-success": self._baseline_business_succeeds,
             "target-health": self._target_healthy,
             "worker-cohort-placement": self._worker_cohort_is_placed,
+            "db-memory-headroom": self._db_memory_has_headroom,
         }
         results: dict[str, bool] = {}
         errors: dict[str, str] = {}
@@ -1100,6 +1132,51 @@ class LiveProbeSet:
             raise LiveProbeError(
                 f"{node} does not host {sorted(missing)} — the cohort this scenario "
                 "measures is not on the node it starves"
+            )
+        return True
+
+    def _db_memory_has_headroom(self) -> bool:
+        target = DB_MEMORY_HEADROOM.get(self.scenario_id)
+        if target is None:
+            raise LiveProbeError(f"no database memory headroom is registered for {self.scenario_id}")
+        namespace = target["namespace"]
+        container = target["container"]
+        result = self._kubectl(
+            "get", "pods", "--namespace", namespace, "--selector", target["selector"], "-o", "json",
+        )
+        items = json.loads(result.stdout).get("items", [])
+        active = [item for item in items if item.get("metadata", {}).get("deletionTimestamp") is None]
+        if len(active) != 1:
+            raise LiveProbeError("database memory headroom requires exactly one active pod")
+        statuses = [
+            status
+            for status in active[0].get("status", {}).get("containerStatuses", [])
+            if status.get("name") == container
+        ]
+        if len(statuses) != 1:
+            raise LiveProbeError("database container status is unavailable")
+        uptime = _container_uptime_seconds(statuses[0], _aware(self.clock()))
+        if uptime < target["min_uptime_sec"]:
+            raise LiveProbeError(
+                f"database container has been up {uptime}s, below {target['min_uptime_sec']}s"
+            )
+        pod = active[0].get("metadata", {}).get("name")
+        if not isinstance(pod, str) or not pod:
+            raise LiveProbeError("database pod name is invalid")
+        stat = self._kubectl(
+            "exec", pod, "--namespace", namespace, "-c", container, "--",
+            "cat", "/sys/fs/cgroup/memory.stat",
+        )
+        anon = None
+        for line in stat.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "anon" and parts[1].isdigit():
+                anon = int(parts[1])
+        if anon is None:
+            raise LiveProbeError("database cgroup anon memory is unavailable")
+        if anon > target["max_anon_bytes"]:
+            raise LiveProbeError(
+                f"database anon memory {anon} is above {target['max_anon_bytes']}"
             )
         return True
 
@@ -1415,6 +1492,7 @@ class LiveProbeSet:
             "kubernetes.container_liveness_probe_match",
             "kubernetes.container_memory_current_bytes",
             "kubernetes.container_memory_limit_bytes",
+            "kubernetes.container_uptime_seconds",
             # 외부 레지스트리(testbed-services queries.json)의 정본 id — 위
             # container_* 쌍과 동일 의미론의 별칭(F05-R/F05-H 컨트롤러가 참조).
             "kubernetes.deployment_resources_match_baseline",
@@ -1453,6 +1531,15 @@ class LiveProbeSet:
                 "kubernetes.container_oom_killed",
             }:
                 target = F25_H_POSTGRES_TARGET
+            elif parameters == F42_P_FOOD_MYSQL_TARGET and query.query_id in {
+                "kubernetes.container_memory_current_bytes",
+                "kubernetes.container_memory_limit_bytes",
+                "kubernetes.container_restart_count",
+                "kubernetes.container_last_termination_reason",
+                "kubernetes.container_oom_killed",
+                "kubernetes.container_uptime_seconds",
+            }:
+                target = F42_P_FOOD_MYSQL_TARGET
             else:
                 raise LiveProbeError("payment container target is not allowlisted")
             namespace = target["namespace"]
@@ -1522,6 +1609,14 @@ class LiveProbeSet:
                 return reason, _aware(self.clock()), "kubernetes:payment:last-termination-reason"
             if query.query_id == "kubernetes.container_oom_killed":
                 return "OOMKilled" in reasons, _aware(self.clock()), "kubernetes:payment:oom-killed"
+            if query.query_id == "kubernetes.container_uptime_seconds":
+                if len(statuses) != 1:
+                    raise LiveProbeError("uptime probe requires exactly one container status")
+                return (
+                    _container_uptime_seconds(statuses[0], _aware(self.clock())),
+                    _aware(self.clock()),
+                    "kubernetes:container:uptime-seconds",
+                )
             if len(active) != 1:
                 raise LiveProbeError("payment cgroup probe requires exactly one active pod")
             pod = active[0].get("metadata", {}).get("name")
@@ -2304,6 +2399,14 @@ def _atomic_json(path: Path, document: Mapping[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _container_uptime_seconds(status: dict[str, Any], now: datetime) -> int:
+    """Seconds since the running container started; 0 while it is not running."""
+    started = status.get("state", {}).get("running", {}).get("startedAt")
+    if not started:
+        return 0
+    return max(0, int((now - _parse_time(started)).total_seconds()))
 
 
 def _parse_time(value: Any) -> datetime:
