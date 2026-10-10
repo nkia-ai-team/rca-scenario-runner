@@ -833,7 +833,12 @@ class TrustedDispatcherApplier:
                         "--level-index", str(request.level_index),
                         "--level-id", request.level_id,
                         "--parameters-json",
-                        json.dumps(request.parameters, sort_keys=True, separators=(",", ":")),
+                        # profile-control 은 ensure_ascii=False 정본 문자열과 글자 그대로 비교한다.
+                        # 기본값(ascii 이스케이프)이면 한글 파라미터가 \uXXXX 로 바뀌어 거부된다(F40-R, 2026-10-10).
+                        json.dumps(
+                            request.parameters, sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=False,
+                        ),
                     ]
                 )
             argv.extend(["--plan-digest", digest, "--confirm", confirmation])

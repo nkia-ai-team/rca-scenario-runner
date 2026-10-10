@@ -294,6 +294,59 @@ def test_profile_control_uses_scenario_id_confirmation_and_composite_order(tmp_p
     ]
 
 
+def test_non_ascii_parameters_reach_profile_control_in_its_canonical_encoding(tmp_path) -> None:
+    # profile-control 은 --parameters-json 을 ensure_ascii=False 정본과 글자 그대로 비교한다.
+    profile_control = tmp_path / "profile-control.py"
+    profile_control.write_text("trusted boundary", encoding="utf-8")
+    calls: list[list[str]] = []
+    parameters = {"key": "banner", "value": "가을 정기 세일"}
+    plan = {
+        "live_allowed": True,
+        "scenario": {"id": "F40-R", "slug": "f40-r-config-row"},
+        "plan_digest": "a" * 64,
+        "profile_instances": [
+            {
+                "profile_id": "db.config_row",
+                "parameters": parameters,
+                "approved_levels": [{"level_id": "design", "parameters": parameters}],
+            },
+        ],
+    }
+
+    def process(argv, **_kwargs):
+        calls.append(argv)
+        if "--plan" in argv:
+            return _completed({"normalized_plan": plan})
+        return _completed({"applied_at": "2026-07-16T11:05:00Z"})
+
+    applier = TrustedDispatcherApplier(
+        "f40-r-config-row",
+        primary_profile="db.config_row",
+        companion_profiles=[],
+        dispatcher=tmp_path / "run-scenario.sh",
+        profile_control=profile_control,
+        process_runner=process,
+        clock=Clock(),
+    )
+    applier.apply(
+        ApplyRequest(
+            run_id="run-1",
+            scenario_id="F40-R",
+            fencing_token=7,
+            profile_id="db.config_row",
+            level_index=0,
+            level_id="design",
+            parameters=parameters,
+            idempotency_key="apply-key",
+            requested_at=NOW,
+        )
+    )
+    apply_call = next(call for call in calls if "apply" in call)
+    raw = apply_call[apply_call.index("--parameters-json") + 1]
+    assert raw == json.dumps(parameters, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    assert "가을 정기 세일" in raw
+
+
 def test_profile_control_absence_fails_before_live_effect(tmp_path) -> None:
     calls = []
     plan = {
