@@ -178,7 +178,7 @@ print_dry_run() {
   cat <<EOF
 scenario=cross-domain/f15-t2
 side_effects=false
-orchestrator=scenario-runner@192.168.200.109
+orchestrator=scenario-runner@192.168.122.20
 step.1=offset:0s,duration:${LOCK_HOLD_SEC}s,kind:database,transport:kubectl,location:commerce/${COMMERCE_PG_POD}
 step.2=offset:${SECOND_OFFSET_SEC}s,duration:${PG429_HOLD_SEC}s,kind:external_mock,transport:kubectl,location:food/external-pg-mock
 t1=step.1.start

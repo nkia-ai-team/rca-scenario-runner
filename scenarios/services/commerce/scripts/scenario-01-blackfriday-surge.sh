@@ -270,7 +270,7 @@ print_dry_run() {
     cat <<EOF
 scenario=commerce/scenario-01
 side_effects=false
-orchestrator=scenario-runner@192.168.200.109
+orchestrator=scenario-runner@192.168.122.20
 injection_kind=north_south
 injection_location=tb-runner@192.168.122.206
 transport=ssh

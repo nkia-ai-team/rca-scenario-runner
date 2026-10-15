@@ -6,7 +6,7 @@ service:
     사건 경계 split/merge/multi-root를 검증하는 합성 시나리오군.
   owner: project
 target:
-  server: 192.168.200.109
+  server: 192.168.122.20
   ssh_user: root
   arch: arm64
   kubeconfig: /root/tb-kubeconfig

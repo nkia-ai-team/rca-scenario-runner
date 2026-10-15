@@ -9,7 +9,7 @@ service:
   owner: BangSungjoon
   linear_project: RCA 테스트베드
 target:
-  server: 192.168.200.109
+  server: 192.168.122.20
   ssh_user: nkia
   arch: arm64
   namespace: rca-testbed-food

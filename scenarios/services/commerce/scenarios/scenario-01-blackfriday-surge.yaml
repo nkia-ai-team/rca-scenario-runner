@@ -5,7 +5,7 @@ file: scenario-01-blackfriday-surge.sh
 execution:
   orchestrator:
     transport: local
-    location: scenario-runner@192.168.200.109
+    location: scenario-runner@192.168.122.20
     timeout_sec: 900
   injection_points:
     - id: north-south-surge

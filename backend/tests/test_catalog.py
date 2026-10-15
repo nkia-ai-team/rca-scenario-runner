@@ -48,7 +48,7 @@ def test_commerce_structured_scenario_loads_from_per_scenario_file(real_catalog)
     assert len(s.expected_alarms) == 3
     assert s.script_filename == "scenario-01-blackfriday-surge.sh"
     assert s.execution.orchestrator.transport == "local"
-    assert s.execution.orchestrator.location == "scenario-runner@192.168.200.109"
+    assert s.execution.orchestrator.location == "scenario-runner@192.168.122.20"
     point = s.execution.injection_points[0]
     assert point.kind == "north_south"
     assert point.transport == "ssh"
@@ -69,7 +69,7 @@ def test_cross_domain_boundary_contract_is_preserved(real_catalog):
         "allow_time_overlap": True,
     }
     assert s.execution.orchestrator.transport == "local"
-    assert s.execution.orchestrator.location == "scenario-runner@192.168.200.109"
+    assert s.execution.orchestrator.location == "scenario-runner@192.168.122.20"
     assert {point.kind for point in s.execution.injection_points} == {
         "database",
         "external_mock",
