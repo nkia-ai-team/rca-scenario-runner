@@ -124,6 +124,20 @@ async def api_live_queue_resume() -> LiveQueueState:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
+class LiveQueueCancelRequest(BaseModel):
+    reason: str | None = None
+
+
+@app.post("/api/live-queue/cancel", response_model=LiveQueueState)
+async def api_live_queue_cancel(
+    body: LiveQueueCancelRequest | None = Body(default=None),
+) -> LiveQueueState:
+    try:
+        return await get_live_queue().cancel(reason=body.reason if body else None)
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @app.post("/api/live-queue/append-promoted", response_model=LiveQueueState)
 async def api_live_queue_append_promoted() -> LiveQueueState:
     try:

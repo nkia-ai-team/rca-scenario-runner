@@ -609,6 +609,26 @@ class LiveScenarioQueue:
         self.ensure_worker()
         return self.snapshot()
 
+    async def cancel(self, reason: str | None = None) -> LiveQueueState:
+        """Close a paused queue without re-running its current scenario.
+
+        ``resume`` always re-enters the paused scenario, so a queue whose only
+        scenario was put on hold could never move on: ``start`` refuses while
+        paused. Cancel ends it as ``completed`` (keeping the pause reason) so the
+        operator can ``start`` the next candidate. It does not touch run
+        evidence or a DIRTY coordinator; ``start`` still requires readiness.
+        """
+        async with self._lock:
+            state = self.snapshot()
+            if state.phase != "paused":
+                raise RuntimeError("only a paused live queue can be cancelled")
+            previous = state.reason or "no pause reason"
+            state = self._complete(state)
+            note = f"cancelled by operator: {reason}" if reason else "cancelled by operator"
+            state = state.model_copy(update={"reason": f"{note} (paused: {previous})"})
+            self._write(state)
+        return self.snapshot()
+
     async def append_promoted(self) -> LiveQueueState:
         """Append newly approved live scenarios without changing queued work."""
         async with self._lock:

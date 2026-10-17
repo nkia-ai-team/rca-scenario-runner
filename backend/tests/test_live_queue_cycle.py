@@ -578,6 +578,38 @@ async def test_resume_resets_cycle_restart_counts(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_closes_paused_queue_so_next_start_works(tmp_path: Path) -> None:
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    await queue.start()
+    state = await queue.tick()  # -> cycle_normal
+    queue._pause(state, "DIRTY coordinator state blocks the live queue")
+
+    with pytest.raises(RuntimeError, match="paused"):
+        await queue.start()
+
+    cancelled = await queue.cancel(reason="scenario on hold")
+    assert cancelled.phase == "completed"
+    assert cancelled.current_scenario_id is None
+    assert cancelled.current_run_id is None
+    assert "scenario on hold" in cancelled.reason
+    assert "DIRTY coordinator state" in cancelled.reason
+
+    restarted = await queue.start()
+    assert restarted.phase == "cycle_reset"
+    assert restarted.queue_id != cancelled.queue_id
+
+
+@pytest.mark.asyncio
+async def test_cancel_refuses_unpaused_queue(tmp_path: Path) -> None:
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    await queue.start()
+    await queue.tick()  # -> cycle_normal
+    with pytest.raises(RuntimeError, match="only a paused"):
+        await queue.cancel()
+    assert queue.snapshot().phase == "cycle_normal"
+
+
+@pytest.mark.asyncio
 async def test_collector_restart_wipes_stale_bundle_dir(tmp_path: Path) -> None:
     gen = {"n": 0}
 

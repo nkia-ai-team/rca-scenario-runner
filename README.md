@@ -201,6 +201,7 @@ DIRTY external run은 동일 시나리오의 cleanup API로만 재시도할 수 
 | GET | `/api/live-queue` | 영속 큐 진행률, 현재 run, clean-window deadline, 중단 사유 |
 | POST | `/api/live-queue/start` | 고정 순서 11개 큐 신규 시작 |
 | POST | `/api/live-queue/resume` | 원인 조치 후 중단된 동일 시나리오부터 재실행 |
+| POST | `/api/live-queue/cancel` | 중단된 큐를 재실행 없이 끝냄(보류한 시나리오만 남은 큐). 본문 `{"reason": "..."}` 선택. 그 뒤 `start` 로 다음 후보 시작 |
 
 Live 큐 순서는 기존 검증 8개인
 `F01-R → F01-H → F03-G → F06-R → F07-H → F08-H → F09-P → F11-G` 뒤에
@@ -228,6 +229,9 @@ watch -n 5 'curl -fsS http://localhost:8090/api/live-queue | jq .'
 
 # paused 원인과 DIRTY를 해소한 뒤 동일 시나리오부터 재시도
 curl -fsS -X POST http://localhost:8090/api/live-queue/resume | jq .
+
+# 중단된 시나리오를 다시 돌리면 안 될 때(보류): 재실행 없이 큐를 끝내고 다음을 start
+curl -fsS -X POST http://localhost:8090/api/live-queue/cancel -H 'content-type: application/json' -d '{"reason":"scenario on hold"}' | jq .
 
 # 정지
 docker compose down
