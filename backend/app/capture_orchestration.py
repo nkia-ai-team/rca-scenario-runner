@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -56,6 +57,25 @@ class ScenarioMetadata(BaseModel):
         return hashlib.sha256(self.model_dump_json().encode("utf-8")).hexdigest()
 
 
+class BeyondDataNote(StrictModel):
+    detail: str = Field(min_length=1)
+    missing_data: str = Field(min_length=1)
+    confirmed_by: str = Field(min_length=1)
+
+
+class ScenarioNotes(StrictModel):
+    """Reference-only notes carried into meta.json as ``scenario_notes``.
+
+    The registry's optional ``beyond_data``/``beyond_data_ko`` hold the detailed
+    cause that collected data cannot separate, so it stays out of the six scored
+    fields above and out of their digest. Scenarios without notes capture exactly
+    as before.
+    """
+
+    beyond_data: BeyondDataNote
+    beyond_data_ko: BeyondDataNote
+
+
 class ScenarioMetadataRegistry(StrictModel):
     schema_version: Literal["1.0"] = "1.0"
     scenarios: dict[str, ScenarioMetadata]
@@ -67,6 +87,15 @@ def load_scenario_metadata(path: Path, scenario_id: str) -> ScenarioMetadata:
     if metadata is None:
         raise RuntimeError(f"AI-authored scenario metadata is missing: {scenario_id}")
     return metadata
+
+
+def load_scenario_notes(path: Path, scenario_id: str) -> ScenarioNotes | None:
+    registry = json.loads(path.read_text(encoding="utf-8"))
+    entry = registry.get("scenarios", {}).get(scenario_id) or {}
+    notes = {key: entry[key] for key in ("beyond_data", "beyond_data_ko") if key in entry}
+    if not notes:
+        return None
+    return ScenarioNotes.model_validate(notes)
 
 
 def parse_utc(value: str, *, field: str) -> datetime:
@@ -117,6 +146,7 @@ class CaptureRequest(StrictModel):
     case_id: str = Field(pattern=r"^case-[a-z0-9][a-z0-9-]*$")
     scenario_id: str = Field(min_length=1)
     scenario_metadata: ScenarioMetadata | None = None
+    scenario_notes: ScenarioNotes | None = None
     mode: Literal["calibration", "evaluation", "failed"]
     t1: str
     t2: str

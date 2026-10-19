@@ -1158,6 +1158,12 @@ class ProductionCaptureInvoker:
             topology_dir = topology_marker.read_text(encoding="utf-8").strip()
             if topology_dir:
                 args.extend(["--topology-bundle", topology_dir])
+        # Reference-only notes (registry beyond_data): written next to the run and
+        # carried as meta.json scenario_notes, outside scenario_metadata and its hash.
+        if job.scenario_notes is not None:
+            notes_file = self.runs_root / job.run_id / "scenario-notes.json"
+            atomic_json(notes_file, job.scenario_notes.model_dump(mode="json"))
+            args.extend(["--scenario-notes-file", str(notes_file)])
         environment = _trusted_environment()
         environment["MODEL_SOURCE"] = str(checkpoint)
         try:

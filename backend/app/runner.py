@@ -23,6 +23,7 @@ from app.capture_orchestration import (
     CaptureRequest,
     CaptureScheduler,
     load_scenario_metadata,
+    load_scenario_notes,
 )
 from app.pass_mode import capture_enabled
 from app.production_runtime import (
@@ -954,6 +955,9 @@ class ScenarioRunner:
             case_id=case_id,
             scenario_id=session.scenario_id,
             scenario_metadata=load_scenario_metadata(
+                self.scenario_metadata_path, session.scenario_id
+            ),
+            scenario_notes=load_scenario_notes(
                 self.scenario_metadata_path, session.scenario_id
             ),
             mode=mode,

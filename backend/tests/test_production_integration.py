@@ -11,7 +11,12 @@ import pytest
 
 from app.adaptive import ControllerPhase
 from app.adaptive_runtime import ApplyRequest, CleanupRequest, EligibilityRequest
-from app.capture_orchestration import CaptureRequest, CaptureScheduler, ScenarioMetadata
+from app.capture_orchestration import (
+    CaptureRequest,
+    CaptureScheduler,
+    ScenarioMetadata,
+    load_scenario_notes,
+)
 from app import live_probes
 from app.live_probes import (
     BASELINE_PAID_ORDERS_SQL,
@@ -728,6 +733,85 @@ def test_capture_invoker_forwards_preflight_and_normal_segment(tmp_path) -> None
     argv = process_calls[0]
     assert argv[argv.index("--preflight-json") + 1] == str(run_dir / "preflight.json")
     assert argv[argv.index("--normal-segment") + 1] == str(normal_dir)
+
+
+NOTE = {"detail": "d", "missing_data": "m", "confirmed_by": "c"}
+
+
+def test_scenario_notes_load_only_as_a_complete_pair(tmp_path) -> None:
+    registry = tmp_path / "scenario-metadata.json"
+    entry = scenario_metadata().model_dump(mode="json")
+    registry.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "scenarios": {
+                    "F01-R": entry,
+                    "F02-R": {**entry, "beyond_data": NOTE, "beyond_data_ko": NOTE},
+                    "F03-R": {**entry, "beyond_data": NOTE},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_scenario_notes(registry, "F01-R") is None
+    assert load_scenario_notes(registry, "F02-R").model_dump(mode="json") == {
+        "beyond_data": NOTE,
+        "beyond_data_ko": NOTE,
+    }
+    with pytest.raises(ValueError):
+        load_scenario_notes(registry, "F03-R")
+
+
+def test_capture_invoker_forwards_scenario_notes_outside_the_metadata_digest(tmp_path) -> None:
+    model = tmp_path / "model.json"
+    model.write_text('{"version": 1}\n', encoding="utf-8")
+    script = tmp_path / "capture-eval-case.sh"
+    script.write_text("trusted", encoding="utf-8")
+    runs = tmp_path / "runs"
+    process_calls = []
+
+    def process(argv, **kwargs):
+        process_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    invoker = ProductionCaptureInvoker(
+        runs_root=runs,
+        capture_script=script,
+        output_root=tmp_path / "cases",
+        model_source=model,
+        process_runner=process,
+    )
+    scheduler = CaptureScheduler(tmp_path / "capture-state.json", clock=Clock(), invoker=invoker)
+    cases = (("run-notes", {"beyond_data": NOTE, "beyond_data_ko": NOTE}), ("run-plain", None))
+    for run_id, notes in cases:
+        (runs / run_id).mkdir(parents=True)
+        scheduler.schedule(
+            CaptureRequest(
+                run_id=run_id,
+                case_id=f"case-{run_id}",
+                scenario_id="F07-H",
+                scenario_metadata=scenario_metadata(),
+                scenario_notes=notes,
+                mode="calibration",
+                t1="2026-07-16T08:00:00Z",
+                t2="2026-07-16T10:20:00Z",
+            )
+        )
+        scheduler.tick(run_id)
+
+    with_notes, plain = process_calls
+    notes_file = runs / "run-notes" / "scenario-notes.json"
+    assert with_notes[with_notes.index("--scenario-notes-file") + 1] == str(notes_file)
+    assert json.loads(notes_file.read_text(encoding="utf-8")) == {
+        "beyond_data": NOTE,
+        "beyond_data_ko": NOTE,
+    }
+    assert "--scenario-notes-file" not in plain
+    digest = scenario_metadata().sha256()
+    assert with_notes[with_notes.index("--scenario-metadata-sha256") + 1] == digest
+    assert plain[plain.index("--scenario-metadata-sha256") + 1] == digest
 
 
 def test_capture_invoker_can_stream_model_from_fixed_remote_observer(tmp_path) -> None:
