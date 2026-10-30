@@ -1,9 +1,11 @@
 import { Fragment, useState } from "react";
 
+import { needsRunConfirm, runConfirmMessage } from "../lib/recording";
 import { TONE } from "../lib/tones";
 import type { DisplayStatus, ScenarioStory, ScenarioView } from "../types";
 import { Icon } from "./Icon";
 import { Pill } from "./Pill";
+import { RecordingBadge } from "./RecordingBadge";
 import { StatusBadge } from "./StatusBadge";
 
 const DETAIL_LABEL =
@@ -76,11 +78,24 @@ export function ScenarioCard({
   onCleanup,
 }: Props) {
   const [open, setOpen] = useState(false);
+  // 추천하지 않는 시나리오(보류, 녹화 검증 안 됨)는 실행 전에 한 번 더 묻는다. 막지는 않는다.
+  const [confirming, setConfirming] = useState(false);
+  const recording = scn.recording ?? null;
+  const notRecommended = needsRunConfirm(recording);
+  const isHold = recording?.level === "hold";
   const tone = TONE[scn.tone];
   const durationMin = Math.max(1, Math.round(scn.estimated_duration_sec / 60));
   const isThisRunning = status === "running";
   const runButtonDisabled = runDisabled || isThisRunning;
   const longHops = scn.propagationHops.some((p) => p.length > 28);
+  const handleRun = () => {
+    if (runButtonDisabled) return;
+    if (notRecommended) {
+      setConfirming(true);
+      return;
+    }
+    onRun(scn);
+  };
 
   return (
     <div
@@ -88,7 +103,7 @@ export function ScenarioCard({
         isSelected
           ? "ring-2 ring-violet-300 ring-offset-2 ring-offset-[var(--bg)]"
           : "hover:shadow-md"
-      }`}
+      } ${isHold && !isSelected ? "opacity-75 hover:opacity-100" : ""}`}
     >
       <div
         className="absolute top-0 left-0 right-0 h-px"
@@ -129,6 +144,7 @@ export function ScenarioCard({
                       </span>
                     </span>
                   )}
+                  {recording && <RecordingBadge status={recording} />}
                 </div>
                 <p
                   className="text-[13px] text-[var(--ink-2)] mt-1.5 leading-relaxed"
@@ -136,6 +152,16 @@ export function ScenarioCard({
                 >
                   {scn.story_ko?.overview ?? scn.description}
                 </p>
+                {recording && notRecommended && (
+                  <p
+                    data-testid="recording-reason"
+                    className={`mt-1.5 text-[12px] leading-relaxed ${
+                      isHold ? "text-rose-700" : "text-amber-800"
+                    }`}
+                  >
+                    사유: {recording.reason}
+                  </p>
+                )}
               </div>
               <StatusBadge status={status} />
             </div>
@@ -263,6 +289,50 @@ export function ScenarioCard({
                     </div>
                   </>
                 )}
+
+                {recording?.detail && (
+                  <>
+                    <div className="mono text-[10.5px] uppercase tracking-wider text-[var(--ink-3)] pt-0.5">
+                      녹화 상태
+                    </div>
+                    <div className="text-[12px] leading-relaxed text-[var(--ink-2)] whitespace-pre-wrap">
+                      {recording.detail}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {confirming && recording && (
+              <div
+                role="alertdialog"
+                aria-label="실행 확인"
+                className={`mt-4 rounded-md ring-1 px-2.5 py-2 text-[12px] leading-relaxed ${
+                  isHold
+                    ? "bg-rose-50 ring-rose-200 text-rose-900"
+                    : "bg-amber-50 ring-amber-200 text-amber-900"
+                }`}
+              >
+                <p>{runConfirmMessage(recording)}</p>
+                <p className="mt-1 opacity-80">사유: {recording.reason}</p>
+                <div className="mt-2 flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      setConfirming(false);
+                      if (!runButtonDisabled) onRun(scn);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium bg-[var(--ink)] text-white hover:bg-black"
+                  >
+                    <Icon name="play" className="w-3.5 h-3.5" />
+                    그래도 실행
+                  </button>
+                  <button
+                    onClick={() => setConfirming(false)}
+                    className="inline-flex items-center px-3 py-1.5 rounded-lg text-[12px] font-medium text-[var(--ink-2)] ring-1 ring-[var(--hair)] bg-white hover:text-[var(--ink)]"
+                  >
+                    취소
+                  </button>
+                </div>
               </div>
             )}
 
@@ -278,7 +348,7 @@ export function ScenarioCard({
                 }
               >
                 <button
-                  onClick={() => !runButtonDisabled && onRun(scn)}
+                  onClick={handleRun}
                   disabled={runButtonDisabled}
                   className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-[12.5px] font-medium transition ${
                     isThisRunning

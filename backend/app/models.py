@@ -4,6 +4,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 from app.controller import ControllerSpec
+from app.recording_status import RecordingStatus
 
 Status = Literal["idle", "running", "succeeded", "failed", "cleanup_running"]
 
@@ -133,6 +134,9 @@ class Scenario(BaseModel):
     # 1개 이상, "candidate" = 실행은 되지만 녹화 전(웹은 "검증 대기"로 따로 보인다).
     # 레거시 catalog 와 stage 가 없는 manifest 는 None(정식으로 취급).
     stage: Optional[str] = None
+    # stage 와 녹화 대기 큐(recording-queue.json)로 정한 녹화 상태. 카드의 배지와
+    # 실행 전 확인이 이것을 본다(app/recording_status.py). 옛 catalog 는 None.
+    recording: Optional[RecordingStatus] = None
     # --- 구조화 스키마 (testbed-services spec-scenario-design §4 / load §3) ---
     # 레거시 항목은 root_cause/propagation 이 문자열이라 위의 cause/propagation 으로
     # 그대로 들어오고, 구조화 항목은 로더가 표시용 문자열로 정규화한 뒤 원본을

@@ -82,6 +82,18 @@ export interface ApiScenario {
   stage?: "official" | "candidate" | null;
   // 있으면 카드가 description 대신 개요, 주입 장애, 전파 과정, 근본 원인, 설계 근거로 보인다.
   story_ko?: ScenarioStory | null;
+  // stage 와 녹화 대기 큐로 정한 녹화 상태. 추천하지 않는 것(recommended=false)은
+  // 카드에 배지와 사유가 붙고 실행 전에 확인을 한 번 더 받는다. 옛 catalog 는 없다.
+  recording?: RecordingStatus | null;
+}
+
+export type RecordingLevel = "hold" | "unverified" | "recorded";
+
+export interface RecordingStatus {
+  level: RecordingLevel;
+  recommended: boolean;
+  reason: string;          // 한 줄 사유
+  detail: string | null;   // 보류 사유 전문, 큐 메모
 }
 
 export interface Domain {

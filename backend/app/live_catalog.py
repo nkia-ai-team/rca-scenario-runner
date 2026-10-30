@@ -23,6 +23,7 @@ from pydantic import ValidationError
 
 from app.manifests import ScenarioManifest, load_manifests
 from app.models import Domain, Scenario, ScenarioStory
+from app.recording_status import judge_recording, load_recording_queue
 
 _DOMAIN_LABELS = {
     "commerce": "Commerce",
@@ -93,7 +94,9 @@ def _story(meta: dict[str, Any]) -> ScenarioStory | None:
         return None
 
 
-def _to_scenario(manifest: ScenarioManifest, meta: dict[str, Any]) -> Scenario | None:
+def _to_scenario(
+    manifest: ScenarioManifest, meta: dict[str, Any], queue_entry: dict[str, Any] | None = None
+) -> Scenario | None:
     runtime = manifest.runtime_scenario()
     if runtime is None:
         return None
@@ -109,6 +112,7 @@ def _to_scenario(manifest: ScenarioManifest, meta: dict[str, Any]) -> Scenario |
         id=manifest.id,
         short_id=manifest.id,
         stage=stage if isinstance(stage, str) else None,
+        recording=judge_recording(stage if isinstance(stage, str) else None, queue_entry),
         domain=domain,
         domain_label=_DOMAIN_LABELS.get(domain, domain.replace("-", " ").title()),
         name=_text(meta, "title") or manifest.id,
@@ -137,18 +141,25 @@ def _sort_key(scenario: Scenario) -> tuple[int, int, str]:
     return (0, int(match.group(1)), match.group(2))
 
 
-def list_live_scenarios(metadata_path: Path) -> list[Scenario]:
-    """Every live-enabled manifest that has registry metadata, in id order."""
+def list_live_scenarios(
+    metadata_path: Path, recording_queue_path: Path | None = None
+) -> list[Scenario]:
+    """Every live-enabled manifest that has registry metadata, in id order.
+
+    ``recording_queue_path`` defaults to the queue inside the contract root
+    (``RECORDING_QUEUE_PATH`` overrides it); a missing queue only drops the
+    hold badges."""
     metadata = _load_metadata(metadata_path)
     if not metadata:
         return []
+    queue = load_recording_queue(recording_queue_path)
     unique = {manifest.slug: manifest for manifest in load_manifests().values()}
     scenarios = []
     for manifest in unique.values():
         meta = metadata.get(manifest.id)
         if meta is None:
             continue
-        scenario = _to_scenario(manifest, meta)
+        scenario = _to_scenario(manifest, meta, queue.get(manifest.id))
         if scenario is not None:
             scenarios.append(scenario)
     return sorted(scenarios, key=_sort_key)

@@ -12,6 +12,7 @@ import { useHealth } from "./hooks/useHealth";
 import { useRunner } from "./hooks/useRunner";
 import { useScenarios } from "./hooks/useScenarios";
 import { durationSec } from "./lib/format";
+import { holdLast } from "./lib/recording";
 import type { DisplayStatus, ScenarioView } from "./types";
 
 const DEFAULT_DOMAIN_SLUG = "plopvape-shop";
@@ -70,8 +71,10 @@ export default function App() {
     ? scenarios.filter((s) => s.domain === selectedDomain)
     : scenarios;
   // 후보(정상 녹화 전)는 정식 목록과 섞지 않고 아래 "검증 대기" 칸에 따로 보인다.
-  const officialScenarios = visibleScenarios.filter((s) => s.stage !== "candidate");
-  const candidateScenarios = visibleScenarios.filter((s) => s.stage === "candidate");
+  // 녹화 대기 큐에서 보류된 것은 각 칸의 맨 뒤로 보낸다.
+  const officialScenarios = holdLast(visibleScenarios.filter((s) => s.stage !== "candidate"));
+  const candidateScenarios = holdLast(visibleScenarios.filter((s) => s.stage === "candidate"));
+  const holdCount = visibleScenarios.filter((s) => s.recording?.level === "hold").length;
 
   // Concurrency banner — only show when someone *else* is running.
   // "Someone else" = the active run_id is not what this tab launched.
@@ -246,6 +249,7 @@ export default function App() {
                     {" · "}
                     정식 {officialScenarios.length}건
                     {candidateScenarios.length > 0 && ` · 검증 대기 ${candidateScenarios.length}건`}
+                    {holdCount > 0 && `, 보류 ${holdCount}건`}
                     {" · "}cleanup 멱등 보장
                   </p>
                 </div>
@@ -271,7 +275,8 @@ export default function App() {
                     </h3>
                     <p className="text-[11.5px] text-[var(--ink-3)] mt-0.5">
                       정상 녹화 전인 후보입니다. 운영 하네스가 녹화 대기 큐 순서대로 실행하고,
-                      녹화에 성공하면 정식 목록으로 옮겨집니다.
+                      녹화에 성공하면 정식 목록으로 옮겨집니다. 큐에서 보류된 것은 사람 결정
+                      전에는 돌리지 않으며 맨 뒤에 둡니다.
                     </p>
                   </div>
                   {candidateScenarios.map(renderCard)}

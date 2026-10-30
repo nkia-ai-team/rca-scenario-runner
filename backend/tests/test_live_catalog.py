@@ -203,6 +203,55 @@ def test_unreadable_registry_lists_nothing(tmp_path, manifest_root, content) -> 
     assert list_live_scenarios(registry) == []
 
 
+def write_queue(path: Path, entries: list[dict]) -> Path:
+    path.write_text(
+        json.dumps({"schema_version": 1, "entries": entries}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_recording_queue_and_stage_decide_the_card_badge(tmp_path, manifest_root) -> None:
+    """보류는 녹화 대기 큐가, 후보와 정식은 manifest stage 가 정한다. 옛 catalog 는 표시가 없다."""
+    write_manifest(manifest_root, "F01-R", stage="official")
+    write_manifest(manifest_root, "F30-R", stage="candidate")
+    write_manifest(manifest_root, "F31-R", stage="candidate")
+    write_manifest(manifest_root, "F04-H")
+    registry = write_registry(
+        tmp_path / "scenario-metadata.json",
+        {sid: metadata() for sid in ("F01-R", "F30-R", "F31-R", "F04-H")},
+    )
+    queue = write_queue(
+        tmp_path / "recording-queue.json",
+        [
+            {"scenario_id": "F30-R", "status": "waiting", "note": "새 시나리오 첫 검증"},
+            {
+                "scenario_id": "F31-R",
+                "status": "hold",
+                "hold_reason": "주입이 노드 붕괴로 번짐. 사람 결정 뒤 waiting 으로 되돌린다.",
+            },
+        ],
+    )
+
+    cards = {s.id: s.recording for s in list_live_scenarios(registry, queue)}
+
+    assert cards["F04-H"] is None
+    assert (cards["F01-R"].level, cards["F01-R"].recommended) == ("recorded", True)
+    assert (cards["F30-R"].level, cards["F30-R"].recommended) == ("unverified", False)
+    assert cards["F30-R"].detail == "새 시나리오 첫 검증"
+    assert (cards["F31-R"].level, cards["F31-R"].recommended) == ("hold", False)
+    assert cards["F31-R"].reason == "주입이 노드 붕괴로 번짐"
+
+
+def test_missing_recording_queue_keeps_the_list(tmp_path, manifest_root) -> None:
+    write_manifest(manifest_root, "F30-R", stage="candidate")
+    registry = write_registry(tmp_path / "scenario-metadata.json", {"F30-R": metadata()})
+
+    [scenario] = list_live_scenarios(registry, tmp_path / "absent.json")
+
+    assert scenario.recording is not None and scenario.recording.level == "unverified"
+
+
 async def test_api_lists_live_catalog_and_keeps_legacy_ids_resolvable(
     client: AsyncClient, tmp_path, manifest_root
 ) -> None:
@@ -228,3 +277,29 @@ async def test_api_falls_back_to_legacy_catalog_without_live_manifests(
     listed = (await client.get("/api/scenarios")).json()
 
     assert "plopvape-shop:01" in {s["id"] for s in listed}
+
+
+async def test_api_carries_recording_status(
+    client: AsyncClient, tmp_path, manifest_root, monkeypatch
+) -> None:
+    write_manifest(manifest_root, "F30-R", stage="candidate")
+    get_runner().scenario_metadata_path = write_registry(
+        tmp_path / "scenario-metadata.json", {"F30-R": metadata()}
+    )
+    queue = write_queue(
+        tmp_path / "recording-queue.json",
+        [{"scenario_id": "F30-R", "status": "hold", "hold_reason": "강도로 해결 불가. 사람 결정."}],
+    )
+    monkeypatch.setenv("RECORDING_QUEUE_PATH", str(queue))
+
+    [listed] = (await client.get("/api/scenarios")).json()
+    single = (await client.get("/api/scenarios/F30-R")).json()
+
+    expected = {
+        "level": "hold",
+        "recommended": False,
+        "reason": "강도로 해결 불가",
+        "detail": "강도로 해결 불가. 사람 결정.",
+    }
+    assert listed["recording"] == expected
+    assert single["recording"] == expected

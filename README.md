@@ -139,8 +139,8 @@ npm run dev
 # Backend (9 integration tests via httpx ASGI transport)
 cd backend && uv run pytest -v
 
-# Frontend build (TypeScript strict + Vite)
-cd frontend && npm run build
+# Frontend 컴포넌트 시험(vitest + jsdom), build (TypeScript strict + Vite)
+cd frontend && npm test && npm run build
 ```
 
 ## Configuration
@@ -155,6 +155,7 @@ cd frontend && npm run build
 | `SCENARIO_MANIFEST_HOST_PATH` | `../testbed-services/scripts/scenarios/manifests` | 64개 plan-only manifest 경로 |
 | `SCENARIO_CONTRACT_HOST_PATH` | `../testbed-services/scripts/scenarios` | digest 검증 dispatcher와 profile-control API의 read-only 신뢰 root |
 | `CAPTURE_SCRIPT_HOST_PATH` | `../testbed-services/scripts/capture-eval-case.sh` | 데이터 저장소 캡처 스크립트의 고정 mount |
+| `RECORDING_QUEUE_PATH` | `/opt/lucida/scenario-contracts/recording-queue.json` | 카드의 녹화 상태(보류, 녹화 검증 안 됨, 녹화 완료)를 정하는 녹화 대기 큐. 계약 root 안에 있어 보통 바꾸지 않는다 |
 | `STATE_HOST_PATH` | `./state` | global lease·fencing·DIRTY coordinator 영속 경로 |
 | `RUNS_HOST_PATH` | `./runs` | controller plan/state/timeline/cleanup/recovery/result와 model checkpoint 영속 경로 |
 | `PROFILE_STATE_HOST_PATH` | `./profile-state` | 원본값 복구용 profile snapshot 영속 경로 |
