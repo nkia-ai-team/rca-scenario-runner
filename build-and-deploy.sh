@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# rca-scenario-runner: build + deploy (109서버 내부에서 실행)
+# rca-scenario-runner: build + deploy (66 tb-ops 내부에서 실행)
 # =============================================================================
 # 하는 일
 #   1) 사전 조건 확인 (docker, docker compose, kubectl 접근, 마운트 경로)
-#   2) ARM64 네이티브로 Docker 이미지 빌드
+#   2) 호스트 아키텍처로 Docker 이미지 빌드 (66 tb-ops 는 x86_64)
 #   3) 기존 컨테이너 정지/제거 후 재기동
 #   4) 헬스체크 + 시나리오 API 응답 확인
 #
@@ -75,8 +75,8 @@ phase_prereqs() {
     local arch
     arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
     log_ok "아키텍처: $arch"
-    if [[ "$arch" != "arm64" && "$arch" != "aarch64" ]]; then
-        log_warn "109서버는 ARM64 여야 합니다 (현재: $arch). 다른 호스트라면 빌드/실행은 되지만 운영 타겟과 아키텍처가 다릅니다."
+    if [[ "$arch" != "amd64" && "$arch" != "x86_64" ]]; then
+        log_warn "66 tb-ops 는 x86_64 입니다 (현재: $arch). 다른 호스트라면 빌드/실행은 되지만 운영 타겟과 아키텍처가 다릅니다."
     fi
 
     if [[ ! -d "$SCENARIOS_HOST_PATH" ]]; then

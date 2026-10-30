@@ -18,7 +18,8 @@ scenarios/
 
 ## 현재 서비스
 
-- **plopvape-shop** — 109서버 K3s `rca-testbed` 네임스페이스. 쇼핑몰 마이크로서비스 대상 4종 시나리오.
+- 이 디렉터리의 `service-spec.yaml` 은 manifest 가 없을 때만 쓰는 옛 카탈로그다. 66 러너가 화면에 보이는 시나리오는 testbed-services 의 manifest(`SCENARIO_MANIFEST_HOST_PATH`)에서 온다.
+- **plopvape-shop** — 1세대. 109서버 K3s `rca-testbed` 네임스페이스. 쇼핑몰 마이크로서비스 대상 4종 시나리오. 66 으로 옮기지 않았다.
 
 ## 새 서비스 추가 절차
 
@@ -30,7 +31,7 @@ scenarios/
 
 ## 배포
 
-스크립트는 **레포에 포함** — 109서버에서 `git pull` 만 받으면 끝. 별도 scp 불필요.
+스크립트는 **레포에 포함**. 66 tb-ops 의 `/root/rca-scenario-runner/scenarios/services` 는 git 이 아닌 사본이라, 바뀐 커밋을 그 사본에 덮어 쓴다(testbed-services `docs/runbook-testbed-move-109-to-66.md` 4단계).
 
 - `docker-compose.yml` 의 기본 마운트: `./scenarios/services/plopvape-shop/scripts:/app/scripts:ro`
 - 다른 서비스로 바꾸려면 `.env` 에서 오버라이드:

@@ -2,7 +2,7 @@ service:
   name: commerce
   description: 'RCA 테스트베드 commerce 플래그십 (대폭 확장판, 구 plopvape-shop 후속).
 
-    109 KVM 게스트 VM kubeadm 클러스터(rca-testbed-commerce ns): nginx + api-gateway +
+    66 Proxmox 게스트 VM kubeadm 클러스터(rca-testbed-commerce ns): nginx + api-gateway +
     9개 서비스(order/product/inventory/payment/notification/user/cart/pricing/shipping)
     + postgres + redis + kafka. baseline 부하는 tb-runner(192.168.122.206)의
     loadgen systemd 3유닛이 상주 생성.
@@ -15,7 +15,7 @@ service:
 target:
   server: 192.168.122.20
   ssh_user: root
-  arch: arm64
+  arch: amd64
   namespace: rca-testbed-commerce
   kubeconfig: /root/tb-kubeconfig
   api_base: http://192.168.122.77:30080

@@ -22,7 +22,7 @@
 #   ./scenario-01-blackfriday-surge.sh cleanup  # 잔존 surge 종료 + 상태 확인
 #   ./scenario-01-blackfriday-surge.sh dry-run  # 무접속 실행 계획 출력
 #
-# 실행 환경: 109 호스트(root) — /root/.ssh/tb_key 로 tb-runner ssh 가능해야 함.
+# 실행 환경: 66 tb-ops(root) — /root/.ssh/tb_key 로 tb-runner ssh 가능해야 함.
 # =============================================================================
 
 set -uo pipefail

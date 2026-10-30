@@ -33,7 +33,7 @@ WORKDIR /app
 # - docker CLI (static binary): scenario-02 가 호스트의 pg-mock 컨테이너 start/stop/inspect
 # - iproute2: `ss -tlnp` 로 포트 점유 확인 (scenario-02 black-hole 교체 타이밍)
 # - openssh-client: tb-runner VM에서 north-south k6 surge를 기동/정리
-# arch-aware: arm64 on 109, amd64 on x86 hosts
+# arch-aware: amd64 on 66 tb-ops (x86_64), arm64 on ARM hosts
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates bash iproute2 openssh-client jq postgresql-client \
  && arch="$(dpkg --print-architecture)" \

@@ -16,7 +16,7 @@ interface Props {
 
 export function TopBar({
   backendOk,
-  envTag = "testbed-109",
+  envTag = "testbed-66",
   domains,
   selectedDomain,
   onSelectDomain,

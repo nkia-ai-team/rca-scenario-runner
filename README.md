@@ -5,14 +5,14 @@ Linear 이슈: [NKIAAI-498](https://linear.app/nkia/issue/NKIAAI-498).
 
 ## What it does
 
-- 109서버 K3s 의 `rca-testbed` 네임스페이스에 배포된 쇼핑몰 마이크로서비스를 대상으로 사전 정의된 4종 장애 시나리오를 웹 UI 로 실행
+- 66 서버(x86 Proxmox) 안 kubeadm 4노드 클러스터(tb-cp, tb-w1~3)의 테스트베드 도메인(commerce, core-banking, food-delivery)을 대상으로 testbed-services 가 정의한 장애 시나리오를 웹 UI 로 실행
 - 테스터가 SSH 없이 브라우저에서 버튼 클릭만으로 장애 주입 + 실시간 상태/로그 확인
 - 시나리오 스크립트는 레포에 포함 (`scenarios/services/<service-name>/scripts/`). 배포 시 레포 내부 경로가 컨테이너로 마운트됨. 자세한 구조는 [scenarios/README.md](scenarios/README.md) 참조.
 
 ## Architecture
 
 ```
-Browser ──HTTP──▶ 109서버:8090 ──▶ [Docker (host network)]
+Browser ──HTTP──▶ 192.168.200.66:8091 ─(포워딩)─▶ tb-ops(192.168.122.20):8091 ──▶ [Docker (host network)]
                                       └─ uvicorn (FastAPI)
                                          ├─ /api/*     → scenario runner API
                                          ├─ /healthz   → health
@@ -20,16 +20,15 @@ Browser ──HTTP──▶ 109서버:8090 ──▶ [Docker (host network)]
                                        │
                                        │ asyncio subprocess
                                        ▼
-                                     bash scenario-XX.sh
-                                       │ kubectl exec
+                                     testbed-services 계약(run-scenario.sh, profile-control.py)
+                                       │ kubectl, ssh
                                        ▼
-                                     K3s rca-testbed ns
-                                       (postgres, 5 shop services, nginx)
+                                     kubeadm 클러스터(tb-cp, tb-w1~3), 부하 VM tb-runner
 ```
 
 - Frontend: React + Vite + TypeScript + Tailwind
 - Backend: FastAPI + asyncio subprocess
-- Deploy: 단일 Docker 컨테이너 (host network) + docker-compose, 109서버 ARM64 네이티브
+- Deploy: 단일 Docker 컨테이너 (host network) + docker-compose, 66 서버 안 tb-ops VM(x86_64)
 - 동시 실행: 한 번에 하나의 시나리오만 (asyncio.Lock 기반)
 
 ### Declarative execution location
@@ -43,7 +42,7 @@ orchestrator로 정규화한다.
 execution:
   orchestrator:
     transport: local
-    location: scenario-runner@109
+    location: scenario-runner@192.168.122.20
     timeout_sec: 900
   injection_points:
     - id: north-south-surge
@@ -75,14 +74,18 @@ SSH는 비대화식 인증과 사전 등록된 host key를 요구한다. 원격 
 실제 injection point와 cleanup 위치를 반환한다. subprocess·SSH·Docker·kubectl·API
 호출과 로그/state 파일 생성을 하지 않는다.
 
-## Prerequisites (109서버)
+## Prerequisites (66 tb-ops)
 
 - Docker 24+ 및 docker compose v2 플러그인
 - `/root/tb-kubeconfig`로 현재 kubeadm 4-node testbed API 접근 가능
-- 호스트 포트 8090 free (변경 가능, `.env` 참조)
+- 호스트 포트 8091 free (`.env` 의 `PORT`. 66 호스트가 `192.168.200.66:8091` 을 tb-ops 로 넘겨 준다)
 - 시나리오 스크립트는 **레포 내부**(`scenarios/services/<service-name>/scripts/`)에 포함되어 있어 별도 배치 불필요. 기본 서비스: `plopvape-shop`. 다른 서비스로 전환하려면 `.env` 의 `SCRIPTS_HOST_PATH` 오버라이드.
 
-## Deploy (109서버)
+## Deploy (66 tb-ops)
+
+tb-ops 의 `/root/rca-scenario-runner` 와 `/root/testbed-services` 는 git 이 아닌 사본이다.
+시나리오 계약(`scripts/scenarios/`)은 testbed-services 의 `deploy-live-promotions.sh` 가 rsync 로 올린다.
+아래는 git 사본에서 처음 세우는 절차다.
 
 ```bash
 # 최초
@@ -94,8 +97,8 @@ git checkout feature/nkiaai-498   # 통합 후에는 develop/main
 ./build-and-deploy.sh
 
 # 확인
-curl http://localhost:8090/healthz
-curl http://localhost:8090/api/scenarios
+curl http://localhost:8091/healthz
+curl http://localhost:8091/api/scenarios
 # 브라우저: http://<target-host>:${PORT}/
 
 # 업데이트 (새 변경 반영)
@@ -105,7 +108,7 @@ git pull
 
 스크립트가 다음을 순차 수행:
 1. 사전 조건 (docker, compose, 마운트 경로, kubeconfig) 검사
-2. ARM64 네이티브 빌드
+2. 호스트 아키텍처로 빌드(66 tb-ops 는 x86_64)
 3. 기존 컨테이너 정지 후 재기동
 4. `/healthz`, `/api/scenarios` 헬스체크
 5. 접속 URL 출력
@@ -131,7 +134,7 @@ npm run dev
 # 브라우저: http://localhost:5173/
 ```
 
-로컬에선 kubectl / K3s 가 없어 `POST /run` 시 bash 가 실패합니다. **UI 흐름 검증 전용** 이며 실제 장애 주입은 109 배포 후에만 가능합니다.
+로컬에선 kubectl / K3s 가 없어 `POST /run` 시 bash 가 실패합니다. **UI 흐름 검증 전용** 이며 실제 장애 주입은 66 tb-ops 배포 후에만 가능합니다.
 
 ### Tests
 
@@ -149,7 +152,7 @@ cd frontend && npm test && npm run build
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
-| `PORT` | `8090` | 호스트 바인드 포트 |
+| `PORT` | `8090` | 호스트 바인드 포트. 66 tb-ops 는 `8091` (66 호스트 포워딩과 맞춤) |
 | `SCRIPTS_HOST_PATH` | `./scenarios/services/plopvape-shop/scripts` | 컨테이너 `/app/scripts` 로 마운트되는 경로. 레포 내부가 기본값 — 다른 서비스로 바꾸려면 `./scenarios/services/<name>/scripts` 로 변경 |
 | `KUBECONFIG_HOST_PATH` | `/root/tb-kubeconfig` | 컨테이너의 동일 경로로 read-only 마운트되는 정본 kubeconfig 파일 |
 | `SCENARIO_MANIFEST_HOST_PATH` | `../testbed-services/scripts/scenarios/manifests` | 64개 plan-only manifest 경로 |
@@ -222,17 +225,17 @@ docker logs -f scenario-runner
 docker ps --filter name=scenario-runner
 
 # 시작 전 readiness (ready=true만 허용)
-curl -fsS http://localhost:8090/api/live-queue/readiness | jq .
+curl -fsS http://localhost:8091/api/live-queue/readiness | jq .
 
 # 11개 순차 큐 시작 / 모니터링
-curl -fsS -X POST http://localhost:8090/api/live-queue/start | jq .
-watch -n 5 'curl -fsS http://localhost:8090/api/live-queue | jq .'
+curl -fsS -X POST http://localhost:8091/api/live-queue/start | jq .
+watch -n 5 'curl -fsS http://localhost:8091/api/live-queue | jq .'
 
 # paused 원인과 DIRTY를 해소한 뒤 동일 시나리오부터 재시도
-curl -fsS -X POST http://localhost:8090/api/live-queue/resume | jq .
+curl -fsS -X POST http://localhost:8091/api/live-queue/resume | jq .
 
 # 중단된 시나리오를 다시 돌리면 안 될 때(보류): 재실행 없이 큐를 끝내고 다음을 start
-curl -fsS -X POST http://localhost:8090/api/live-queue/cancel -H 'content-type: application/json' -d '{"reason":"scenario on hold"}' | jq .
+curl -fsS -X POST http://localhost:8091/api/live-queue/cancel -H 'content-type: application/json' -d '{"reason":"scenario on hold"}' | jq .
 
 # 정지
 docker compose down
