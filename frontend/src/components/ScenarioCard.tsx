@@ -1,10 +1,88 @@
 import { Fragment, useState } from "react";
 
 import { TONE } from "../lib/tones";
-import type { DisplayStatus, ScenarioView } from "../types";
+import type { DisplayStatus, ScenarioStory, ScenarioView } from "../types";
 import { Icon } from "./Icon";
 import { Pill } from "./Pill";
 import { StatusBadge } from "./StatusBadge";
+
+const STORY_LABEL =
+  "mono text-[10.5px] uppercase tracking-wider text-[var(--ink-3)]";
+const PRETTY = { textWrap: "pretty" } as React.CSSProperties;
+
+// 사람이 읽는 이야기(story_ko). 개요, 주입 장애, 전파 과정, 근본 원인, 설계 근거 순이다.
+function StoryBlock({ story }: { story: ScenarioStory }) {
+  return (
+    <div className="mt-1.5 space-y-2.5">
+      <section>
+        <div className={STORY_LABEL}>개요</div>
+        <p
+          className="mt-0.5 text-[13px] text-[var(--ink)] leading-relaxed"
+          style={PRETTY}
+        >
+          {story.overview}
+        </p>
+      </section>
+      <section>
+        <div className={STORY_LABEL}>주입 장애</div>
+        <p
+          className="mt-0.5 text-[12.5px] text-[var(--ink-2)] leading-relaxed"
+          style={PRETTY}
+        >
+          {story.injected_fault}
+        </p>
+      </section>
+      <section>
+        <div className={STORY_LABEL}>전파 과정</div>
+        <ol className="mt-1 space-y-1">
+          {story.propagation.map((step, i) => (
+            <li key={i} className="flex items-start gap-2">
+              <span className="mono text-[10.5px] text-[var(--ink-3)] pt-[3px] tabular-nums">
+                {i + 1}
+              </span>
+              <span
+                className="text-[12.5px] text-[var(--ink-2)] leading-relaxed"
+                style={PRETTY}
+              >
+                <span className="font-medium text-[var(--ink)]">
+                  {step.stage}
+                </span>
+                : {step.text}
+              </span>
+            </li>
+          ))}
+        </ol>
+      </section>
+      <section>
+        <div className={STORY_LABEL}>근본 원인</div>
+        <p
+          className="mt-0.5 text-[12.5px] text-[var(--ink-2)] leading-relaxed"
+          style={PRETTY}
+        >
+          {story.root_cause}
+        </p>
+      </section>
+      {story.design_notes.length > 0 && (
+        <section>
+          <div className={STORY_LABEL}>설계 근거</div>
+          <ul className="mt-1 space-y-1">
+            {story.design_notes.map((note, i) => (
+              <li key={i} className="flex items-start gap-2">
+                <span className="mt-[8px] w-1 h-1 rounded-full bg-[var(--ink-3)] shrink-0" />
+                <span
+                  className="text-[12px] text-[var(--ink-3)] leading-relaxed"
+                  style={PRETTY}
+                >
+                  {note}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+    </div>
+  );
+}
 
 interface Props {
   scn: ScenarioView;
@@ -78,12 +156,16 @@ export function ScenarioCard({
                     </span>
                   )}
                 </div>
-                <p
-                  className="text-[13px] text-[var(--ink-2)] mt-1.5 leading-relaxed"
-                  style={{ textWrap: "pretty" } as React.CSSProperties}
-                >
-                  {scn.description}
-                </p>
+                {scn.story_ko ? (
+                  <StoryBlock story={scn.story_ko} />
+                ) : (
+                  <p
+                    className="text-[13px] text-[var(--ink-2)] mt-1.5 leading-relaxed"
+                    style={{ textWrap: "pretty" } as React.CSSProperties}
+                  >
+                    {scn.description}
+                  </p>
+                )}
               </div>
               <StatusBadge status={status} />
             </div>

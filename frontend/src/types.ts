@@ -44,6 +44,15 @@ export interface ExecutionPlan {
   injection_points: InjectionPoint[];
 }
 
+// 화면 전용 이야기(registry story_ko). 채점 정답지가 아니다.
+export interface ScenarioStory {
+  overview: string;
+  injected_fault: string;
+  propagation: { stage: string; text: string }[];
+  root_cause: string;
+  design_notes: string[];
+}
+
 export interface ApiScenario {
   id: string;            // composite "<domain>:<short_id>"
   short_id: string;      // within-domain id, e.g. "01"
@@ -71,6 +80,8 @@ export interface ApiScenario {
   // testbed-services 수명주기: "official" = 정상 녹화 1개 이상, "candidate" = 녹화 전 후보.
   // 없으면(레거시) 정식으로 취급한다.
   stage?: "official" | "candidate" | null;
+  // 있으면 카드가 description 대신 개요, 주입 장애, 전파 과정, 근본 원인, 설계 근거로 보인다.
+  story_ko?: ScenarioStory | null;
 }
 
 export interface Domain {

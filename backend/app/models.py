@@ -89,6 +89,24 @@ class ExecutionPlan(BaseModel):
         return self
 
 
+class StoryStage(BaseModel):
+    stage: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+
+
+class ScenarioStory(BaseModel):
+    """화면 전용 이야기(registry ``story_ko``). 채점 칸이 아니고 capture 에도 실리지 않는다.
+
+    카드는 개요, 주입 장애, 전파 과정, 근본 원인, 설계 근거 순으로 보인다.
+    """
+
+    overview: str = Field(min_length=1)
+    injected_fault: str = Field(min_length=1)
+    propagation: list[StoryStage] = Field(min_length=1)
+    root_cause: str = Field(min_length=1)
+    design_notes: list[str] = Field(default_factory=list)
+
+
 class Scenario(BaseModel):
     id: str                       # composite "<domain>:<short_id>" — globally unique
     short_id: str                 # within-domain id, e.g. "01"
@@ -131,6 +149,8 @@ class Scenario(BaseModel):
     # Optional declarative, normalized controller contract. Legacy scenarios
     # remain valid and expose ``None`` here.
     controller: Optional[ControllerSpec] = None
+    # 사람이 읽는 이야기. 있으면 카드가 description 대신 이것을 보인다.
+    story_ko: Optional[ScenarioStory] = None
 
 
 class Domain(BaseModel):

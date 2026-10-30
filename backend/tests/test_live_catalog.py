@@ -108,6 +108,51 @@ def test_manifest_stage_reaches_the_card(tmp_path, manifest_root) -> None:
     assert stages == {"F01-R": "official", "F30-R": "candidate", "F04-H": None}
 
 
+STORY = {
+    "overview": "재고 줄을 오래 잠그면 주문이 차례로 멈춘다.",
+    "injected_fault": "재고 DB에서 상품 1번 줄을 잠근다.",
+    "propagation": [
+        {"stage": "초기", "text": "그 상품이 든 주문만 멈춘다."},
+        {"stage": "전면 장애", "text": "DB 연결 10개가 다 찬다."},
+    ],
+    "root_cause": "재고 DB 잠금이다. 주문 서비스는 피해자다.",
+    "design_notes": ["경로: order → product → inventory"],
+}
+
+
+def test_story_ko_reaches_the_card_and_description_stays(tmp_path, manifest_root) -> None:
+    """화면 전용 story_ko 는 카드로 그대로 가고, 채점 칸 description 은 바뀌지 않는다."""
+    write_manifest(manifest_root, "F01-R")
+    registry = write_registry(
+        tmp_path / "scenario-metadata.json", {"F01-R": metadata(story_ko=STORY)}
+    )
+
+    [scenario] = list_live_scenarios(registry)
+
+    assert scenario.description == "English description."
+    assert scenario.story_ko is not None
+    assert scenario.story_ko.model_dump() == STORY
+
+
+@pytest.mark.parametrize(
+    "story",
+    [None, "문자열", {"overview": "개요만 있다"}, {**STORY, "propagation": []}],
+)
+def test_missing_or_malformed_story_falls_back_to_description(
+    tmp_path, manifest_root, story
+) -> None:
+    write_manifest(manifest_root, "F01-R")
+    overrides = {} if story is None else {"story_ko": story}
+    registry = write_registry(
+        tmp_path / "scenario-metadata.json", {"F01-R": metadata(**overrides)}
+    )
+
+    [scenario] = list_live_scenarios(registry)
+
+    assert scenario.story_ko is None
+    assert scenario.description == "English description."
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [("easy", 2), ("medium", 3), ("중", 3), ("high", 4), ("HIGH", 4), (None, None), ("?", None)],

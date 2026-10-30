@@ -19,8 +19,10 @@ import re
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from app.manifests import ScenarioManifest, load_manifests
-from app.models import Domain, Scenario
+from app.models import Domain, Scenario, ScenarioStory
 
 _DOMAIN_LABELS = {
     "commerce": "Commerce",
@@ -79,6 +81,18 @@ def _grading_text(meta: dict[str, Any]) -> str | None:
     return text or None
 
 
+def _story(meta: dict[str, Any]) -> ScenarioStory | None:
+    """화면 전용 ``story_ko``. 모양이 어긋나면 카드는 description 으로 돌아간다
+    (모양 검사는 testbed-services 정답지 시험이 소유한다)."""
+    raw = meta.get("story_ko")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return ScenarioStory.model_validate(raw)
+    except ValidationError:
+        return None
+
+
 def _to_scenario(manifest: ScenarioManifest, meta: dict[str, Any]) -> Scenario | None:
     runtime = manifest.runtime_scenario()
     if runtime is None:
@@ -112,6 +126,7 @@ def _to_scenario(manifest: ScenarioManifest, meta: dict[str, Any]) -> Scenario |
         propagation_steps=hops or None,
         injection=runtime.injection,
         controller=runtime.controller,
+        story_ko=_story(meta),
     )
 
 
