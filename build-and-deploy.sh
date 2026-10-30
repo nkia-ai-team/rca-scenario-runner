@@ -181,7 +181,9 @@ phase_health() {
     local scenarios_json
     scenarios_json="$(curl -s --max-time 3 "http://localhost:${PORT}/api/scenarios" || true)"
     local count
-    count="$(echo "$scenarios_json" | grep -oE '"id":"[0-9]+"' | wc -l)"
+    # 시나리오 id 는 F01-R 꼴이다. 숫자만 찾으면 0건이 되고, pipefail 아래 grep 의 무일치 종료가
+    # 경고 대신 스크립트 전체를 실패로 끝냈다(2026-10-30 tb-ops 배포).
+    count="$( { echo "$scenarios_json" | grep -oE '"id":"[^"]+"' || true; } | wc -l)"
     if [[ "$count" -ge 4 ]]; then
         log_ok "/api/scenarios 응답 OK (시나리오 $count 개)"
     else
