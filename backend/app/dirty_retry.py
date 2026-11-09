@@ -39,6 +39,23 @@ is fixed at ``hold + slack`` after the previous attempt ended and never grows.
 Only a DIRTY run whose recorded cleanup *failed* is retried. A run that cleaned
 up and then failed recovery (``recovery_timeout``) or lost its heartbeat is DIRTY
 for a reason a second cleanup cannot fix, and clearing it that way would hide it.
+
+A run a runner restart cut (U10, ``app.restart_recovery``) is retried as well,
+under the same deadline. Its cleanup did not fail, it never ran or never
+finished: the run was injecting, or cleaning, when the process went away, so the
+testbed is in the state a failed cleanup leaves and the node's timer is armed as
+usual. Without this a restart while injecting (a deploy, a crash) left the run
+DIRTY until someone cleaned it by hand, where before U10 the new process's
+watchdog cleaned it (review U10 H1, M1).
+
+One exception to the wait, for a cut run only and only before its first
+attempt: if the run's journal holds no apply at all, nothing reached a node. The
+applier journals an apply's intent before profile-control runs, and every node
+change (and every arm) happens inside that call, so an empty journal means no
+node timer exists to race and no node undo to wait for; postpone, the one thing a
+cleanup does to a timer, acts only while one is armed. It is cleaned at once.
+Later attempts are spaced from the previous attempt's end (``hold + slack``) as
+usual, with no arm bound.
 """
 from __future__ import annotations
 
@@ -52,8 +69,9 @@ from pathlib import Path
 from typing import Any
 
 from app.controller import duration_seconds
-from app.coordinator import CleanupClaim, DirtyRun
+from app.coordinator import RESTART_DIRTY_REASONS, CleanupClaim, DirtyRun
 from app.production_runtime import atomic_json
+from app.restart_recovery import recovered_by_restart
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +217,29 @@ def cleanup_failed(run_dir: Path) -> bool:
     return isinstance(cleanup, dict) and cleanup.get("succeeded") is False
 
 
+def cut_by_restart(run_dir: Path, dirty: DirtyRun) -> bool:
+    """A runner restart cut this run's injection or cleanup (U10).
+
+    The DIRTY reason says so when the restart made the run DIRTY. A cleanup cut
+    on a run that was DIRTY already keeps that run's reason; the recovery record
+    next to the run names it then."""
+    return dirty.reason in RESTART_DIRTY_REASONS or recovered_by_restart(
+        run_dir, dirty.run_id, dirty.fencing_token
+    )
+
+
+def no_apply_started(run_dir: Path) -> bool:
+    """The journal is readable and holds no apply call (see the module note)."""
+    journal = _read(run_dir / "mutations.json")
+    operations = journal.get("operations") if journal is not None else None
+    if not isinstance(operations, list):
+        return False
+    return not any(
+        isinstance(operation, dict) and operation.get("action") == "apply"
+        for operation in operations
+    )
+
+
 def _max_injection_sec(run_dir: Path) -> int:
     plan = _read(run_dir / "plan.json") or {}
     runtime = (plan.get("controller") or {}).get("runtime") or {}
@@ -272,13 +313,18 @@ def node_undo_deadline(
     policy: RetryPolicy,
     *,
     process_started_at: datetime | None = None,
+    nothing_armed: bool = False,
 ) -> datetime:
-    armed = last_arm_bound(run_dir, dirty) + timedelta(
-        seconds=_max_injection_sec(run_dir) + policy.node_margin_sec
-    )
     postponed = last_cleanup_end(
         run_dir, dirty, record, process_started_at=process_started_at
     ) + timedelta(seconds=policy.node_hold_sec)
+    if nothing_armed:
+        # No apply reached a node (module note): only the spacing after an
+        # earlier attempt is left.
+        return postponed
+    armed = last_arm_bound(run_dir, dirty) + timedelta(
+        seconds=_max_injection_sec(run_dir) + policy.node_margin_sec
+    )
     return max(armed, postponed)
 
 
@@ -297,13 +343,28 @@ def decide(
     record = read_record(run_dir, dirty)
     if record.get("status") == "gave_up":
         return RetryDecision(due=False, reason="dirty_retry_gave_up")
-    if not cleanup_failed(run_dir):
+    restarted = cut_by_restart(run_dir, dirty)
+    if not cleanup_failed(run_dir) and not restarted:
         return RetryDecision(due=False, reason="dirty_not_from_a_failed_cleanup")
     attempts = len(record["attempts"])
     if attempts >= policy.max_attempts:
         return RetryDecision(due=False, reason="dirty_retry_attempts_exhausted")
+    nothing_armed = restarted and no_apply_started(run_dir)
+    if nothing_armed and attempts == 0:
+        return RetryDecision(
+            due=True,
+            reason="no_apply_reached_a_node",
+            attempt=1,
+            not_before=dirty.marked_at,
+            node_undo_deadline=dirty.marked_at,
+        )
     deadline = node_undo_deadline(
-        run_dir, dirty, record, policy, process_started_at=process_started_at
+        run_dir,
+        dirty,
+        record,
+        policy,
+        process_started_at=process_started_at,
+        nothing_armed=nothing_armed,
     )
     not_before = deadline + timedelta(seconds=policy.slack_sec)
     if now < not_before:

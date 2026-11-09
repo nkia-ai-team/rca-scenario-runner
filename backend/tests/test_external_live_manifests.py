@@ -473,10 +473,16 @@ def dirty_cleanup_run(
     flat_cleanup: dict | None = None,
     max_injection="20m",
     outcomes=None,
+    restart: str | None = None,
 ):
     """A DIRTY capsule run, as a failed node cleanup leaves it, and a runner on a movable clock.
 
-    ``outcomes`` lists what successive retry cleanups report (True, or a failure reason)."""
+    ``outcomes`` lists what successive retry cleanups report (True, or a failure reason).
+    ``restart`` makes the DIRTY come from a runner restart instead (U10): the
+    previous runner process dies at ``marked_at`` and the new one recovers.
+    ``"mid_run"``: it held the run's lease (the run was injecting).
+    ``"cut_cleanup"``: the run was already DIRTY and a cleanup it had claimed
+    was cut after recording success but before clearing DIRTY."""
     selected = manifest("evaluation")
     monkeypatch.setattr("app.runner.get_scenario", lambda _: None)
     monkeypatch.setattr("app.runner.get_manifest", lambda _: selected)
@@ -496,7 +502,10 @@ def dirty_cleanup_run(
 
     monkeypatch.setattr("app.runner.TrustedDispatcherApplier", Applier)
     clock = MovingClock(U9_T0)
-    coordinator = GlobalCoordinator(tmp_path / "coordinator.json")
+    coordinator = GlobalCoordinator(
+        tmp_path / "coordinator.json",
+        owner="previous-runner-process" if restart else None,
+    )
     lease = coordinator.acquire(
         run_id="dirty-run", scenario_id=selected.id, now=U9_T0, lease_sec=30
     )
@@ -530,7 +539,14 @@ def dirty_cleanup_run(
         },
     )
     changes = journal_applies(run_dir, selected.slug, plan, clock, applies)
-    if write_session:
+    if restart == "mid_run" and write_session and not cleanup_succeeded:
+        # What the controller persists every tick while it injects.
+        store.persist_session(
+            run_dir,
+            {"status": "running", "scenario_id": "F07-E", "level_changes": changes,
+             "controller_state": {}, "cleanup": None, "recovery": None},
+        )
+    elif write_session:
         store.persist_session(
             run_dir,
             dirty_session(
@@ -542,12 +558,29 @@ def dirty_cleanup_run(
         )
     if flat_cleanup is not None:
         (run_dir / "cleanup.json").write_text(json.dumps(flat_cleanup), encoding="utf-8")
-    coordinator.mark_dirty(
-        run_id=lease.run_id,
-        fencing_token=lease.fencing_token,
-        reason="adaptive_controller_dirty",
-        now=marked_at,
-    )
+    if restart != "mid_run":
+        coordinator.mark_dirty(
+            run_id=lease.run_id,
+            fencing_token=lease.fencing_token,
+            reason="adaptive_controller_dirty",
+            now=U9_T0 + minutes(2) if restart else marked_at,
+        )
+    if restart == "cut_cleanup":
+        coordinator.claim_cleanup(
+            run_id=lease.run_id, fencing_token=lease.fencing_token,
+            claimant="cleanup-retry-cut", now=marked_at - minutes(4),
+        )
+    if restart:
+        from app import coordinator as coordinator_module
+        from app.restart_recovery import recover_after_restart
+
+        # The previous process dies: its owner marker is released.
+        marker = coordinator._marker(coordinator.owner)
+        import os
+
+        os.close(coordinator_module._held_markers.pop(marker))
+        coordinator = GlobalCoordinator(tmp_path / "coordinator.json")
+        assert recover_after_restart(coordinator, store.root, now=marked_at)
     clock.at = marked_at
     runner = ScenarioRunner(
         tmp_path,
@@ -623,6 +656,43 @@ U9_DEADLINE_CASES = {
 }
 
 
+# U10: a runner restart marks the run it cut DIRTY. No cleanup failed, but the
+# testbed is as dirty as after a failed one, and the same node deadline applies.
+U9_DEADLINE_CASES.update(
+    {
+        # Restart while injecting, the apply returned at T0: arm bound + 30m + 5m.
+        "restart-mid-run": (
+            dict(marked_at=U9_T0 + minutes(5), restart="mid_run"), minutes(35)
+        ),
+        # Restart inside the apply call: only its intent, the recovery bounds the arm.
+        "restart-mid-apply": (
+            dict(marked_at=U9_T0 + minutes(4), applies=((0, U9_T0, U9_T0, "died"),),
+                 restart="mid_run"),
+            minutes(4 + 30 + 5),
+        ),
+        # Review M1: the controller recorded its own cleanup as succeeded and
+        # the process died before releasing the lease.
+        "restart-after-controller-cleanup": (
+            dict(marked_at=U9_T0 + minutes(25), restart="mid_run", cleanup_succeeded=True),
+            minutes(25 + 16 + 5),
+        ),
+        # Review M1: a cleanup recorded success and was cut before clearing DIRTY.
+        "restart-cut-after-cleanup-success": (
+            dict(
+                marked_at=U9_T0 + minutes(45),
+                restart="cut_cleanup",
+                flat_cleanup={
+                    "schema_version": 1, "source": "dirty-cleanup-retry", "succeeded": True,
+                    "effect_ended_at": (U9_T0 + minutes(42)).isoformat(),
+                    "finished_at": (U9_T0 + minutes(42)).isoformat(),
+                },
+            ),
+            minutes(42 + 16 + 5),
+        ),
+    }
+)
+
+
 @pytest.mark.parametrize("case", list(U9_DEADLINE_CASES))
 async def test_dirty_cleanup_retry_waits_for_the_node_undo_deadline_then_clears_dirty(
     tmp_path, monkeypatch, case
@@ -660,6 +730,31 @@ async def test_dirty_cleanup_retry_waits_for_the_node_undo_deadline_then_clears_
     from app.live_probes import _run_intervals
 
     assert all(end <= U9_T0 + first_retry_at for _, end in _run_intervals(run.run_dir))
+
+
+async def test_a_run_restarted_before_any_apply_is_cleaned_at_once(tmp_path, monkeypatch) -> None:
+    """U10: the runner restarted after taking the lease but before any apply
+    call. Every apply journals its intent before profile-control runs, so an
+    empty journal means nothing reached a node and no node timer was armed:
+    there is no node undo to wait for. Later attempts are spaced as usual."""
+    run = dirty_cleanup_run(
+        tmp_path, monkeypatch, marked_at=U9_T0 + minutes(3), applies=(), restart="mid_run",
+        outcomes=["ssh refused", True],
+    )
+    dirty = run.coordinator.snapshot().dirty_run
+    assert dirty is not None and dirty.reason == "runner_restarted_mid_run"
+    assert json.loads((run.run_dir / "mutations.json").read_text())["operations"] == []
+
+    assert await settle(run.runner) == "cleanup_retry_started"
+    assert len(run.calls) == 1 and run.coordinator.snapshot().dirty_run is not None
+
+    # The failed attempt may have reached a node: the next waits hold + slack.
+    after_first = run.clock.at
+    run.clock.at = after_first + minutes(16 + 5) - timedelta(seconds=1)
+    assert await settle(run.runner) == "waiting_for_node_undo_deadline"
+    run.clock.at = after_first + minutes(16 + 5)
+    assert await settle(run.runner) == "cleanup_retry_started"
+    assert run.coordinator.snapshot().dirty_run is None
 
 
 def test_the_applier_journals_when_a_failed_apply_call_ended(tmp_path, monkeypatch) -> None:

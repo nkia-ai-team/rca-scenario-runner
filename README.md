@@ -244,6 +244,34 @@ docker compose down
 docker exec -it scenario-runner bash
 ```
 
+### 재기동 회수
+
+러너는 기동할 때(watchdog, 큐보다 먼저) 죽은 이전 프로세스가 `state/coordinator.json` 에
+남긴 lease 와 cleanup claim 을 회수한다(`backend/app/restart_recovery.py`). 진행 중이던
+실행은 DIRTY(`runner_restarted_mid_run`, cleanup 이 끊겼으면 `runner_restarted_during_cleanup`)가
+되고, 실행 폴더에 `restart-recovery.json` 이 남는다. 이런 DIRTY 는 실패한 cleanup 처럼
+노드 되돌리기 기한 뒤 러너가 스스로 다시 정리한다(`backend/app/dirty_retry.py`). 큐는
+멈춘 채로 두니 resume 은 운영자가 한다. 소유 프로세스 판별에 쓰는 표지가
+`state/coordinator.json.owners/` 에 있다.
+
+### 되돌리기 (재기동 회수 이전 이미지로)
+
+재기동 회수가 들어간 러너는 lease 와 cleanup claim 에 `owner` 키를 적는다. 그 이전 러너는
+모르는 키를 거부해 이 키가 남은 `coordinator.json` 을 읽지 못한다(시작, watchdog, 수동
+cleanup 이 모두 실패). 옛 이미지로 되돌릴 때는 새 러너를 멈춘 뒤 키를 지우고 올린다.
+
+```bash
+docker compose down
+STATE="${STATE_HOST_PATH:-./state}"
+cp -p "$STATE/coordinator.json" "$STATE/coordinator.json.bak-$(date +%Y%m%d%H%M%S)"
+jq 'del(.active_lease.owner?, .cleanup_claim.owner?)' "$STATE/coordinator.json" > "$STATE/coordinator.json.new"
+mv "$STATE/coordinator.json.new" "$STATE/coordinator.json"
+# 옛 이미지로 기동
+```
+
+`coordinator.json.owners/` 와 실행 폴더의 `restart-recovery.json` 은 옛 러너에 영향이 없다.
+옛 러너는 남은 lease 를 종전대로 watchdog 이 만료 뒤 정리한다.
+
 ## License
 
 Internal use only — NKIA.

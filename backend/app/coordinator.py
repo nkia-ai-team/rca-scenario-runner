@@ -80,6 +80,14 @@ class CoordinatorState(StrictModel):
     cleanup_claim: CleanupClaim | None = None
 
 
+# DIRTY reasons a runner restart leaves (recover_dead_owners). No cleanup failed:
+# the run was cut before or during one, and the DIRTY cleanup retry
+# (app.dirty_retry) takes these as it takes a failed cleanup.
+RESTARTED_MID_RUN = "runner_restarted_mid_run"
+RESTARTED_DURING_CLEANUP = "runner_restarted_during_cleanup"
+RESTART_DIRTY_REASONS = frozenset({RESTARTED_MID_RUN, RESTARTED_DURING_CLEANUP})
+
+
 class RestartRecovery(StrictModel):
     """One lease or cleanup claim taken back from a runner process that is gone."""
 
@@ -117,13 +125,29 @@ class GlobalCoordinator:
             if path in _held_markers:
                 return
             self.owners_dir.mkdir(parents=True, exist_ok=True)
-            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o640)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as error:
+            for _ in range(5):
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o640)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as error:
+                    os.close(fd)
+                    raise RuntimeError(
+                        f"owner marker is held by another process: {self.owner}"
+                    ) from error
+                # Between the open and the flock, another process's probe can
+                # lock the still-unlocked file, take this owner for dead and
+                # unlink it. The lock would then sit on a file nobody can find,
+                # and every probe would read this live owner as gone (review
+                # U10 L1). Hold the lock only if it is on the file at the path.
+                try:
+                    same = os.fstat(fd).st_ino == os.stat(path).st_ino
+                except FileNotFoundError:
+                    same = False
+                if same:
+                    _held_markers[path] = fd
+                    return
                 os.close(fd)
-                raise RuntimeError(f"owner marker is held by another process: {self.owner}") from error
-            _held_markers[path] = fd
+            raise RuntimeError(f"owner marker could not be held: {self.owner}")
 
     def owner_alive(self, owner: str) -> bool:
         """Whether the runner process ``owner`` still runs.
@@ -437,7 +461,7 @@ class GlobalCoordinator:
                             fencing_token=claim.fencing_token,
                             previous_owner=claim.owner,
                             claimant=claim.claimant,
-                            reason="runner_restarted_during_cleanup",
+                            reason=RESTARTED_DURING_CLEANUP,
                         )
                     )
             lease = updated.active_lease
@@ -448,9 +472,7 @@ class GlobalCoordinator:
                     and interrupted.fencing_token == lease.fencing_token
                 )
                 reason = (
-                    "runner_restarted_during_cleanup"
-                    if during_cleanup
-                    else "runner_restarted_mid_run"
+                    RESTARTED_DURING_CLEANUP if during_cleanup else RESTARTED_MID_RUN
                 )
                 dirty = DirtyRun(
                     run_id=lease.run_id,
@@ -474,8 +496,15 @@ class GlobalCoordinator:
             elif interrupted is not None and not recovered:
                 # The claim sat on a lease whose own owner still runs (another
                 # runner's watchdog claimed a live runner's lease and died). The
-                # claim already fenced that run's heartbeat, so the live owner
-                # closes its run itself; only the dead claim is ours to drop.
+                # lease is that live process's to close. A claim fences every
+                # heartbeat while it stands, and a renewal that fails once stops
+                # renewing for good (LeaseHeartbeat.renewing), so the run ends
+                # on heartbeat_failed and is marked DIRTY by its owner, or its
+                # lease expires and the owner's own watchdog, no longer
+                # exempting it, claims and cleans it. Only the dead claim is
+                # ours to drop. A heartbeat that never ran while the claim stood
+                # (claim, death and this recovery inside one renewal interval)
+                # is not fenced; that needs two runners on one state.
                 recovered.append(
                     RestartRecovery(
                         action="released_cleanup_claim",
@@ -484,7 +513,7 @@ class GlobalCoordinator:
                         fencing_token=interrupted.fencing_token,
                         previous_owner=interrupted.owner,
                         claimant=interrupted.claimant,
-                        reason="runner_restarted_during_cleanup",
+                        reason=RESTARTED_DURING_CLEANUP,
                     )
                 )
             if updated != state:

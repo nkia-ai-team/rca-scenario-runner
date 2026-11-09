@@ -31,11 +31,32 @@ def _run_dir(runs_root: Path, run_id: str) -> Path | None:
 
 
 def _cleanup_already_succeeded(run_dir: Path) -> bool:
+    """Success in either shape: the flat one the watchdog, a manual cleanup and
+    the DIRTY retry write, or the controller's ``{"cleanup": {...}}``
+    (``persist_session``), as ``app.dirty_retry.cleanup_failed`` reads them."""
     try:
         document = json.loads((run_dir / "cleanup.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return isinstance(document, dict) and document.get("succeeded") is True
+    if not isinstance(document, dict):
+        return False
+    if "succeeded" in document:
+        return document["succeeded"] is True
+    cleanup = document.get("cleanup")
+    return isinstance(cleanup, dict) and cleanup.get("succeeded") is True
+
+
+def recovered_by_restart(run_dir: Path, run_id: str, fencing_token: int) -> bool:
+    """A restart recovery touched this run under this fencing token."""
+    try:
+        record = json.loads((run_dir / RECORD).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(record, dict)
+        and record.get("run_id") == run_id
+        and record.get("fencing_token") == fencing_token
+    )
 
 
 def recover_after_restart(

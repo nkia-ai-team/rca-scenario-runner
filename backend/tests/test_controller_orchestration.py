@@ -708,13 +708,23 @@ def test_restart_recovery_releases_a_claim_left_by_a_forced_kill(tmp_path: Path)
     )
 
 
-def test_restart_recovery_keeps_a_cleanup_success_already_recorded(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "succeeded",
+    [
+        {"schema_version": 1, "source": "manual-dirty-cleanup", "succeeded": True,
+         "effect_ended_at": "2026-11-09T00:00:00+00:00"},
+        # The controller's own shape (persist_session), review U10 L2.
+        {"schema_version": 1, "cleanup": {"succeeded": True, "reason": None}},
+    ],
+    ids=["flat", "controller"],
+)
+def test_restart_recovery_keeps_a_cleanup_success_already_recorded(
+    tmp_path: Path, succeeded: dict
+) -> None:
     state_path = tmp_path / "state" / "coordinator.json"
     run_dir = tmp_path / "runs" / "run-before"
     run_dir.mkdir(parents=True)
     _previous_process(state_path, "dirty", "claim")
-    succeeded = {"schema_version": 1, "source": "manual-dirty-cleanup", "succeeded": True,
-                 "effect_ended_at": "2026-11-09T00:00:00+00:00"}
     (run_dir / "cleanup.json").write_text(json.dumps(succeeded))
 
     _recover(state_path, tmp_path / "runs")
@@ -792,6 +802,50 @@ def test_restart_recovery_sweeps_markers_of_gone_processes(tmp_path: Path) -> No
     assert (owners / f"{gone_owner}.lock").exists()
     assert _recover(state_path, tmp_path / "runs") == []
     assert [marker.stem for marker in owners.glob("*.lock")] == [GlobalCoordinator(state_path).owner]
+
+
+def test_owner_marker_survives_a_probe_between_its_open_and_its_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review U10 L1: another process probes the marker after it is created and
+    before it is locked, takes the owner for dead and unlinks it. The owner must
+    not end up locking a file no one can find."""
+    import fcntl
+    import os
+
+    from app import coordinator as coordinator_module
+
+    state_path = tmp_path / "coordinator.json"
+    holder = GlobalCoordinator(state_path, owner="racing-owner")
+    marker = holder._marker(holder.owner)
+    real_flock = fcntl.flock
+    raced = []
+
+    def flock(fd, operation):
+        if not raced and os.fstat(fd).st_ino == os.stat(marker).st_ino:
+            raced.append(True)
+            # The other process's probe, in full: lock, read as dead, unlink.
+            probe = os.open(marker, os.O_RDWR)
+            real_flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            marker.unlink()
+            os.close(probe)
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(coordinator_module.fcntl, "flock", flock)
+    try:
+        holder.hold_owner_marker()
+    finally:
+        monkeypatch.setattr(coordinator_module.fcntl, "flock", real_flock)
+
+    assert raced and marker.exists()
+    # A probe from elsewhere finds the marker locked: the owner is alive.
+    probe = os.open(marker, os.O_RDWR)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(probe)
+        os.close(coordinator_module._held_markers.pop(marker))
 
 
 def _legacy_state(state_path: Path, *, claim: bool) -> None:
