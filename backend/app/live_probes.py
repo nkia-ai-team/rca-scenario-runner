@@ -1545,6 +1545,11 @@ class LiveProbeSet:
             namespace = target["namespace"]
             deployment = target["deployment"]
             container = target["container"]
+            # Every value below is named after the target it was read from. They
+            # all said "payment" once, because the block began as F05's payment
+            # probe: F77-R's transfer restart count was recorded as
+            # kubernetes:payment:restart-count (ledger §6, 2026-10-24).
+            source = f"kubernetes:{namespace}:{deployment}:{container}"
             if query.query_id in {
                 "kubernetes.container_resources_match",
                 "kubernetes.container_liveness_probe_match",
@@ -1598,7 +1603,7 @@ class LiveProbeSet:
                 values = [status.get("restartCount") for status in statuses]
                 if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
                     raise LiveProbeError("payment restart count is invalid")
-                return sum(values), _aware(self.clock()), "kubernetes:payment:restart-count"
+                return sum(values), _aware(self.clock()), f"{source}:restart-count"
             reasons = [
                 status.get("lastState", {}).get("terminated", {}).get("reason")
                 for status in statuses
@@ -1606,9 +1611,9 @@ class LiveProbeSet:
             reasons = [reason for reason in reasons if isinstance(reason, str) and reason]
             if query.query_id == "kubernetes.container_last_termination_reason":
                 reason = "OOMKilled" if "OOMKilled" in reasons else (reasons[-1] if reasons else "None")
-                return reason, _aware(self.clock()), "kubernetes:payment:last-termination-reason"
+                return reason, _aware(self.clock()), f"{source}:last-termination-reason"
             if query.query_id == "kubernetes.container_oom_killed":
-                return "OOMKilled" in reasons, _aware(self.clock()), "kubernetes:payment:oom-killed"
+                return "OOMKilled" in reasons, _aware(self.clock()), f"{source}:oom-killed"
             if query.query_id == "kubernetes.container_uptime_seconds":
                 if len(statuses) != 1:
                     raise LiveProbeError("uptime probe requires exactly one container status")
@@ -1635,7 +1640,7 @@ class LiveProbeSet:
                 if query.query_id == "kubernetes.container_memory_current_bytes"
                 else limit
             )
-            return value, _aware(self.clock()), f"kubernetes:payment:{query.query_id}"
+            return value, _aware(self.clock()), f"{source}:{query.query_id}"
         if query.query_id == "kubernetes.node_ready":
             if set(query.parameters) != {"node"}:
                 raise LiveProbeError("node readiness query requires the fixed node parameter")
@@ -1776,14 +1781,57 @@ class LiveProbeSet:
             return failed, _aware(self.clock()), (
                 f"kubernetes:{namespace}:{resource}:{container}:image-pull-failure"
             )
-        ready = bool(items) and all(
-            any(
-                condition.get("type") == "Ready" and condition.get("status") == "True"
-                for condition in item.get("status", {}).get("conditions", [])
-            )
-            for item in items
+        ready = bool(items) and all(_pod_is_ready(item) for item in items)
+        if ready:
+            return ready, _aware(self.clock()), f"kubernetes:{namespace}:{resource}:ready"
+        # Some pod is not Ready. During a rolling update that is the surge pod
+        # still starting (or the old one terminating) while the workload keeps
+        # serving: F76-P read restaurant_pod_ready false for 7 ticks of a
+        # healthy rollout, the old pod answering 200 throughout (ledger §6,
+        # 2026-10-24). The question the signal answers is "is the target
+        # down", so ask the owning workload whether its desired replicas are
+        # available. A target with no single owning workload keeps the pod
+        # answer.
+        available = self._workload_available(str(namespace), selector)
+        if available is None:
+            return False, _aware(self.clock()), f"kubernetes:{namespace}:{resource}:ready"
+        return available, _aware(self.clock()), (
+            f"kubernetes:{namespace}:{resource}:workload-available"
         )
-        return ready, _aware(self.clock()), f"kubernetes:{namespace}:{resource}:ready"
+
+    def _workload_available(self, namespace: str, selector: str) -> bool | None:
+        """Whether the one Deployment/StatefulSet selecting ``selector`` has all
+        its desired replicas available; None when no single workload owns it.
+
+        Kubernetes' own measure: availableReplicas counts Ready pods (past
+        minReadySeconds) and never a terminating one, old and new ReplicaSets
+        together. So it stays at the desired count through a surge rollout and
+        falls when serving capacity really falls (readiness fault, crash loop,
+        maxSurge 0 rollout to a broken image, scale to zero)."""
+        key, _, value = selector.partition("=")
+        result = self._kubectl(
+            "get", "deployments,statefulsets", "--namespace", namespace, "-o", "json",
+        )
+        owners = [
+            item
+            for item in json.loads(result.stdout).get("items", [])
+            if item.get("spec", {}).get("selector", {}).get("matchLabels") == {key: value}
+        ]
+        if len(owners) != 1:
+            return None
+        spec = owners[0].get("spec", {})
+        status = owners[0].get("status", {})
+        desired = spec.get("replicas", 1)
+        available = status.get("availableReplicas")
+        if available is None and owners[0].get("kind") == "StatefulSet":
+            available = status.get("readyReplicas")
+        if isinstance(desired, bool) or not isinstance(desired, int) or desired < 0:
+            raise LiveProbeError("workload desired replicas is invalid")
+        if available is None:
+            available = 0
+        if isinstance(available, bool) or not isinstance(available, int) or available < 0:
+            raise LiveProbeError("workload available replicas is invalid")
+        return desired > 0 and available >= desired
 
     def _database_observation(self, query: ApprovedQuery) -> tuple[Any, datetime, str]:
         if query.query_id == "database.oracle_tagged_session_count":
@@ -2372,6 +2420,13 @@ def _run_intervals(run_dir: Path) -> list[tuple[datetime, datetime]]:
             )
         )
     return intervals
+
+
+def _pod_is_ready(item: Mapping[str, Any]) -> bool:
+    return any(
+        condition.get("type") == "Ready" and condition.get("status") == "True"
+        for condition in item.get("status", {}).get("conditions", [])
+    )
 
 
 def _intersects(left_start: datetime, left_end: datetime, right_start: datetime, right_end: datetime) -> bool:

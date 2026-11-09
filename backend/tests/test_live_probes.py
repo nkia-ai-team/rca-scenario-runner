@@ -1843,3 +1843,162 @@ def test_db_memory_headroom_needs_anon_room_and_uptime(tmp_path) -> None:
     other = _probes(tmp_path, fakes, scenario_id="F07-H")
     with pytest.raises(LiveProbeError):
         other._db_memory_has_headroom()
+
+
+class RolloutFakes(Fakes):
+    """Pods and owning workloads of one target, as kubectl returns them."""
+
+    def __init__(self, pods: list[dict], workloads: list[dict]) -> None:
+        super().__init__()
+        self.pods = pods
+        self.workloads = workloads
+
+    def process(self, argv, **kwargs):
+        argv = list(argv)
+        if "pods" in argv:
+            self.process_calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"items": self.pods}), "")
+        if "deployments,statefulsets" in argv:
+            self.process_calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"kind": "List", "items": self.workloads}), ""
+            )
+        return super().process(argv, **kwargs)
+
+
+def _pod(name: str, *, ready: bool, terminating: bool = False) -> dict:
+    metadata: dict = {"name": name}
+    if terminating:
+        metadata["deletionTimestamp"] = NOW.isoformat()
+    return {
+        "metadata": metadata,
+        "status": {"conditions": [{"type": "Ready", "status": "True" if ready else "False"}]},
+    }
+
+
+def _deployment(app: str, *, replicas: int, available: int | None) -> dict:
+    status = {} if available is None else {"availableReplicas": available}
+    return {
+        "kind": "Deployment",
+        "metadata": {"name": app},
+        "spec": {"replicas": replicas, "selector": {"matchLabels": {"app": app}}},
+        "status": status,
+    }
+
+
+def _restaurant_ready(tmp_path, fakes) -> dict:
+    query = ApprovedQueryRegistry.from_path().bind(
+        {
+            "query_id": "kubernetes.pod_ready",
+            "parameters": {"namespace": "rca-testbed-food", "resource": "testbed-restaurant"},
+        }
+    )
+    return _probes(tmp_path, fakes).observe(query)
+
+
+def test_pod_ready_reads_a_surge_rollout_as_up_while_the_workload_is_available(tmp_path) -> None:
+    # F76-P (ledger §6, 2026-10-24): during the restaurant release the surge pod
+    # was still starting while the old pod answered 200. The signal said
+    # NotReady for 7 ticks. The workload had its one desired replica available.
+    fakes = RolloutFakes(
+        pods=[_pod("testbed-restaurant-old", ready=True), _pod("testbed-restaurant-new", ready=False)],
+        workloads=[
+            _deployment("testbed-mysql", replicas=1, available=1),
+            _deployment("testbed-restaurant", replicas=1, available=1),
+        ],
+    )
+
+    observed = _restaurant_ready(tmp_path, fakes)
+
+    assert observed["quality"] == "good"
+    assert observed["value"] is True
+    assert observed["source"] == "kubernetes:rca-testbed-food:testbed-restaurant:workload-available"
+
+
+@pytest.mark.parametrize(
+    ("pods", "workload"),
+    [
+        # Readiness fault on the only pod (F17-R, F16-H): nothing available.
+        ([_pod("p", ready=False)], _deployment("testbed-restaurant", replicas=1, available=0)),
+        # maxSurge 0 rollout to an image that never becomes Ready (F77-R): the
+        # old pod is terminating, the new one is not Ready.
+        (
+            [_pod("old", ready=False, terminating=True), _pod("new", ready=False)],
+            _deployment("testbed-restaurant", replicas=1, available=None),
+        ),
+        # Two desired, one available: capacity really fell.
+        (
+            [_pod("a", ready=True), _pod("b", ready=False)],
+            _deployment("testbed-restaurant", replicas=2, available=1),
+        ),
+        # Scaled to zero is down, not vacuously available.
+        ([_pod("a", ready=False, terminating=True)], _deployment("testbed-restaurant", replicas=0, available=0)),
+    ],
+)
+def test_pod_ready_stays_false_when_desired_replicas_are_not_available(
+    tmp_path, pods, workload
+) -> None:
+    fakes = RolloutFakes(pods=pods, workloads=[workload])
+
+    observed = _restaurant_ready(tmp_path, fakes)
+
+    assert observed["quality"] == "good"
+    assert observed["value"] is False
+
+
+def test_pod_ready_keeps_the_pod_answer_without_a_single_owning_workload(tmp_path) -> None:
+    fakes = RolloutFakes(
+        pods=[_pod("a", ready=True), _pod("b", ready=False)],
+        workloads=[],
+    )
+
+    observed = _restaurant_ready(tmp_path, fakes)
+
+    assert observed["value"] is False
+    assert observed["source"] == "kubernetes:rca-testbed-food:testbed-restaurant:ready"
+
+
+def test_pod_ready_all_ready_needs_no_workload_lookup(tmp_path) -> None:
+    fakes = RolloutFakes(pods=[_pod("a", ready=True)], workloads=[])
+
+    observed = _restaurant_ready(tmp_path, fakes)
+
+    assert observed["value"] is True
+    assert not any("deployments,statefulsets" in argv for argv, _ in fakes.process_calls)
+
+
+def test_container_restart_count_is_named_after_its_own_target(tmp_path) -> None:
+    # F77-R's transfer_restart_count was recorded as kubernetes:payment:restart-count
+    # (ledger §6, 2026-10-24): every value of this block said "payment".
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    transfer = {
+        "namespace": "rca-testbed-banking",
+        "deployment": "testbed-transfer",
+        "container": "transfer-service",
+    }
+    original = fakes.process
+
+    def process(argv, **kwargs):
+        result = original(argv, **kwargs)
+        if "pods" in list(argv):
+            document = json.loads(result.stdout)
+            for item in document["items"]:
+                for status in item["status"]["containerStatuses"]:
+                    status["name"] = "transfer-service"
+            return subprocess.CompletedProcess(result.args, 0, json.dumps(document), "")
+        return result
+
+    fakes.process = process  # type: ignore[method-assign]
+    probes = _probes(tmp_path, fakes)
+
+    observed = probes.observe(
+        registry.bind({"query_id": "kubernetes.container_restart_count", "parameters": transfer})
+    )
+
+    assert observed["quality"] == "good" and observed["value"] == 2
+    assert observed["source"] == (
+        "kubernetes:rca-testbed-banking:testbed-transfer:transfer-service:restart-count"
+    )
+    assert "payment" not in observed["source"]
