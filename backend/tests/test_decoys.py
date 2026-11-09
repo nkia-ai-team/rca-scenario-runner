@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -382,3 +383,160 @@ def test_the_testbed_registry_policy_plans_for_every_scenario() -> None:
             ):
                 assert record.kind == "restart"
                 assert f"{record.namespace}/{record.deployment}" not in excluded, scenario_id
+
+
+# --- U7 수정 2회차: review2 B3, B4, M3 -------------------------------------
+REGISTRY = Path(__file__).resolve().parents[2].parent / "testbed-services/scripts/scenarios/registry"
+
+
+def _real():
+    if not (REGISTRY / "decoy-deployments.json").is_file():
+        pytest.skip("testbed-services registry is not checked out next to the runner")
+    active, _ = load_decoy_policy(REGISTRY / "decoy-deployments.json")
+    scenarios = json.loads((REGISTRY / "scenario-metadata.json").read_text(encoding="utf-8"))["scenarios"]
+    return active, scenarios
+
+
+def _candidate_keys(active, scenario_id, scenario, scope):
+    scoped = active.model_copy(update={"path_scope": scope})
+    return {t.key for group in decoy_candidates(scoped, scenario_id, scenario).values() for t in group}
+
+
+def test_a_victim_in_another_namespace_named_by_a_bare_word_is_on_the_path() -> None:
+    """review2 B3: a bank-caused outage whose answer key names commerce victims
+    only by bare words (order-service, gateway, a path listing) must not get a
+    commerce decoy."""
+    scenario = {
+        "domain": "core-banking",
+        "scoring": {"accept": ["core-banking-ledger"]},
+        "description": "order-service answers checkout with 502 through the gateway.",
+        "story_ko": {"design_notes": ["경로: 체크아웃 gateway → order → inventory → payment"]},
+    }
+    for scope in ("mentioned", "scored"):
+        keys = _candidate_keys(policy(), "X", scenario, scope)
+        if scope == "mentioned":
+            assert "rca-testbed-commerce/testbed-order" not in keys
+            assert "rca-testbed-commerce/testbed-inventory" not in keys
+        assert "rca-testbed-banking/testbed-ledger" not in keys
+
+
+def test_scored_items_exclude_every_target_they_name_and_no_change_lists_are_read() -> None:
+    """review2 B4: Korean restart words, lists and particles. And under the
+    scored scope a target named in must_support or must_rule_out is out
+    whatever the sentence says (excluding too much is the safe side)."""
+    sentences = [
+        "rca-testbed-commerce 에 Deployment 롤아웃, 새 ReplicaSet, 파드 재시작이 없다(KCM).",
+        "order, inventory 는 롤아웃과 오류가 없고 Ready 다.",
+        "order 배포나 재시작이 아님",
+        "order 는 롤아웃이나 재시작이 없고 Ready 다",
+        "같은 네임스페이스의 order, inventory 는 재시작 없이 Ready 다",
+        "order 재기동 없음",
+    ]
+    for sentence in sentences:
+        assert "rca-testbed-commerce/testbed-order" in stated_unchanged(
+            policy(), {"domain": "commerce", "description": sentence}
+        ), sentence
+    scenario = {
+        "domain": "commerce",
+        "scoring": {"accept": ["commerce-user"]},
+        "must_rule_out": ["게이트웨이 설정 오배포가 아님: 게이트웨이 롤아웃이 없고 user 가 Ready"],
+        "must_support": ["order 지연이 먼저 보인다"],
+    }
+    keys = _candidate_keys(policy(), "X", scenario, "scored")
+    assert "rca-testbed-commerce/testbed-order" not in keys
+
+
+def test_a_scenario_without_a_domain_gets_no_decoy() -> None:
+    """review2 M3: without a domain the bare words and the namespace fallback
+    cannot be read, so no schedule is drawn rather than a wrong one."""
+    for seed in range(50):
+        assert schedule(seed, scenario={"description": "Apply an invalid image to the payment deployment"}) == []
+
+
+def test_partition_requires_the_preflight_time() -> None:
+    with pytest.raises(TypeError):
+        partition_decoy_alarms([], [], grace_sec=900)  # type: ignore[call-arg]
+
+
+REVIEW2_CASES = [
+    # (scenario, scope, target that must not be a candidate)
+    ("F68-R", "mentioned", "rca-testbed-commerce/testbed-order"),
+    ("F40-H", "mentioned", "rca-testbed-commerce/testbed-gateway"),
+    ("F01-P", "mentioned", "rca-testbed-commerce/testbed-gateway"),
+    ("F01-P", "mentioned", "rca-testbed-commerce/testbed-inventory"),
+    ("F48-P", "scored", "rca-testbed-food/testbed-restaurant"),
+    ("F38-R", "scored", "rca-testbed-food/testbed-restaurant"),
+    ("F50-R", "scored", "rca-testbed-banking/testbed-ledger"),
+    ("F58-R", "scored", "rca-testbed-food/testbed-restaurant"),
+    ("F57-P", "scored", "rca-testbed-commerce/testbed-gateway"),
+    ("F66-R", "scored", "rca-testbed-commerce/testbed-gateway"),
+]
+
+
+@pytest.mark.parametrize("scenario_id,scope,key", REVIEW2_CASES)
+def test_review2_reproductions_on_the_real_answer_keys(scenario_id, scope, key) -> None:
+    active, scenarios = _real()
+    assert key not in _candidate_keys(active, scenario_id, scenarios[scenario_id], scope)
+
+
+# Independent, deliberately blunt oracle for the exhaustive check below: it does
+# not reuse the module's matching, so a gap in one is not hidden by the other.
+_CHANGE = re.compile(
+    r"롤아웃|재배포|배포|변경|릴리스|재시작|재기동|ReplicaSet|rollout|redeploy|deploy|restart|release|change",
+    re.IGNORECASE,
+)
+_NEG = re.compile(r"없|아니|아님|\bno\b|\bnot\b|without|nothing|untouched|unchanged", re.IGNORECASE)
+
+
+def _oracle_names(target):
+    short = target.deployment.removeprefix("testbed-")
+    return [target.service_name, target.target_id, *target.aliases, target.deployment, target.container, short]
+
+
+def _oracle_hits(active, text):
+    hits = set()
+    for target in active.targets:
+        if target.namespace in text or any(
+            re.search(rf"(?<![A-Za-z0-9-]){re.escape(name)}(?![A-Za-z0-9-])", text)
+            for name in _oracle_names(target)
+        ):
+            hits.add(target.key)
+    return hits
+
+
+def _oracle_forbidden(active, scenario, scope):
+    def texts(node, top=None):
+        if isinstance(node, str):
+            yield top, node
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                if key != "related_scenarios":
+                    yield from texts(value, top or key)
+        elif isinstance(node, list):
+            for value in node:
+                yield from texts(value, top)
+
+    forbidden = set()
+    namespace = active.domain_namespaces.get(scenario.get("domain"))
+    for top, text in texts(scenario):
+        if scope == "mentioned" or top in {"root_cause", "scoring", "must_support", "must_rule_out"}:
+            forbidden |= _oracle_hits(active, text)
+        for sentence in re.split(r"(?<=[.!?。])\s+|\n+|;\s", text):
+            if _CHANGE.search(sentence) and _NEG.search(sentence):
+                hits = _oracle_hits(active, sentence)
+                forbidden |= hits
+    return forbidden, namespace
+
+
+@pytest.mark.parametrize("scope", ["mentioned", "scored"])
+def test_no_real_scenario_offers_a_path_or_unchanged_target(scope) -> None:
+    """Every real answer key (135), both scopes: no candidate is on the fault
+    path or stated unchanged, as judged by the blunt oracle above."""
+    active, scenarios = _real()
+    leaks = []
+    for scenario_id, scenario in scenarios.items():
+        forbidden, _ = _oracle_forbidden(active, scenario, scope)
+        leaked = _candidate_keys(active, scenario_id, scenario, scope) & forbidden
+        if leaked:
+            leaks.append((scenario_id, sorted(leaked)))
+    assert leaks == [], leaks[:10]

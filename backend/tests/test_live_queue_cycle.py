@@ -93,6 +93,8 @@ def make_cycle_queue(tmp_path: Path, *, cycle_ids=CYCLE_IDS, health_probe=None, 
         "injection_summary": "Scenario injection summary.",
         "user_impact": "Scenario user impact.",
         "distinguishing_evidence": "Scenario distinguishing evidence.",
+        # U7: decoys are drawn only for a scenario with a domain (review2 M3).
+        "domain": "commerce",
     }
     runner.scenario_metadata_path.write_text(
         json.dumps(
@@ -818,7 +820,7 @@ def _seed_with(predicate) -> int:
     policy, _ = load_decoy_policy_from_document()
     for seed in range(5000):
         records = build_schedule(
-            policy, seed=seed, scenario_id="F01-R", scenario={},
+            policy, seed=seed, scenario_id="F01-R", scenario={"domain": "commerce"},
             cycle_start=NOW, buffer_start=NOW + timedelta(hours=2),
         )
         if predicate(records):

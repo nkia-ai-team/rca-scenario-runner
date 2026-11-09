@@ -224,16 +224,24 @@ def _scenario_names(scenario: Mapping[str, Any]) -> set[str]:
     return names
 
 
-# A sentence that says something did not change (rollout, deployment, change,
-# configuration). Korean and English, as the answer keys are written in both.
-NO_CHANGE = re.compile(
-    r"(롤아웃|재배포|배포|변경|릴리스)(이|은|는|가|도|과|와)?\s*(없|아니)"
-    r"|\bno (other |new )?(rollouts?|deploy\w*|changes?|configuration changes?|config changes?|restarts?)\b"
-    r"|\bwithout (a |any )?(rollouts?|deploy\w*|changes?)\b"
-    r"|\bnot a (rollout|deploy\w*|change|release)\b"
-    r"|\bnothing (else )?changes\b",
+# A sentence says something did not change when it carries a change word and a
+# negation (review2 B4: Korean restart words, lists such as "롤아웃, 새
+# ReplicaSet, 파드 재시작이 없다", particles such as "배포나 재시작이 아님").
+# Deliberately blunt: it also catches "재시작 없이 Ready" and symptom talk, and
+# excluding a target too many is the safe side.
+CHANGE_WORDS = re.compile(
+    r"롤아웃|재배포|배포|변경|릴리스|재시작|재기동|ReplicaSet|rollout|redeploy|deploy|restart|release|change",
     re.IGNORECASE,
 )
+NEGATION = re.compile(
+    r"없|아니|아님|\bno\b|\bnot\b|without|nothing|untouched|unchanged", re.IGNORECASE
+)
+
+
+def says_no_change(sentence: str) -> bool:
+    return CHANGE_WORDS.search(sentence) is not None and NEGATION.search(sentence) is not None
+
+
 # Fields describing *other* scenarios, not this one's facts.
 _SKIP_FIELDS = frozenset({"related_scenarios"})
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?。])\s+|\n+|[\u2460-\u2473]|;\s")
@@ -260,28 +268,35 @@ def _answer_key_texts(scenario: Mapping[str, Any], path: str = ""):
             yield from _answer_key_texts(value, f"{path}[{index}]")
 
 
+# Korean words the answer keys use for an app instead of its latin name. Only
+# unambiguous ones: generic words such as 주문 or 결제 would match everything.
+_KOREAN_NAMES: dict[str, tuple[str, ...]] = {"gateway": ("게이트웨이",)}
+# Answer-key fields that are scored. Under path_scope="scored" every target they
+# name is out, whatever the sentence says (review2 B4).
+SCORED_FIELDS = frozenset({"root_cause", "scoring", "must_support", "must_rule_out"})
+
+
 def _word(text: str, word: str) -> bool:
     return re.search(rf"(?<![A-Za-z0-9-]){re.escape(word)}(?![A-Za-z0-9-])", text) is not None
 
 
-def mentioned_targets(
-    policy: DecoyPolicy, text: str, scenario_namespace: str | None
-) -> set[str]:
+def mentioned_targets(policy: DecoyPolicy, text: str) -> set[str]:
     """Policy target keys a piece of answer-key text names.
 
-    Qualified names (service name, alias, target id) count anywhere; the bare
-    Deployment, container or short service word counts only inside the
-    scenario's own namespace, where it is unambiguous. A namespace named as a
-    whole covers all its targets."""
+    Every way an answer key names an app counts, in every namespace (review2
+    B3): service name, alias, target id, Deployment, container, the short word
+    (``order``), its Korean name, or the whole namespace. A short word shared by
+    two domains (``order``, ``payment``) excludes both; too many is safe."""
     hits: set[str] = set()
     for target in policy.targets:
         if target.namespace in text or any(name in text for name in target.names()):
             hits.add(target.key)
             continue
-        if target.namespace != scenario_namespace:
-            continue
         short = target.deployment.removeprefix("testbed-")
-        if any(_word(text, word) for word in (target.deployment, target.container, short)):
+        words = (target.deployment, target.container, short)
+        if any(_word(text, word) for word in words) or any(
+            korean in text for korean in _KOREAN_NAMES.get(short, ())
+        ):
             hits.add(target.key)
     return hits
 
@@ -303,9 +318,9 @@ def stated_unchanged(
     for field, text in _answer_key_texts(scenario):
         for sentence in _SENTENCE_SPLIT.split(text):
             sentence = sentence.strip()
-            if not sentence or not NO_CHANGE.search(sentence):
+            if not sentence or not says_no_change(sentence):
                 continue
-            keys = mentioned_targets(policy, sentence, namespace)
+            keys = mentioned_targets(policy, sentence)
             if not keys and namespace and not _NON_TARGET_WORDS.search(sentence):
                 keys = {t.key for t in policy.targets if t.namespace == namespace}
             for key in keys:
@@ -319,9 +334,9 @@ def excluded_targets(
     """Target key -> why it may not carry a decoy in this scenario.
 
     In order: scored names (always the fault path), targets the answer key says
-    did not change, then (``path_scope="mentioned"``) any other target the
-    answer key names, then the policy's own per-scenario list."""
-    namespace = scenario_namespace(policy, scenario)
+    did not change, any target the scored items (root cause, scoring,
+    must_support, must_rule_out) name, then (``path_scope="mentioned"``) any
+    other target the answer key names, then the policy's own per-scenario list."""
     names = _scenario_names(scenario)
     reasons: dict[str, str] = {}
     for target in policy.targets:
@@ -329,9 +344,15 @@ def excluded_targets(
             reasons[target.key] = "scored"
     for key in stated_unchanged(policy, scenario):
         reasons.setdefault(key, "stated_unchanged")
+    scored_text = "\n".join(
+        value for field, value in _answer_key_texts(scenario)
+        if field.split(".", 1)[0].split("[", 1)[0] in SCORED_FIELDS
+    )
+    for key in mentioned_targets(policy, scored_text):
+        reasons.setdefault(key, "scored_item")
     if policy.path_scope == "mentioned":
         text = "\n".join(value for _, value in _answer_key_texts(scenario))
-        for key in mentioned_targets(policy, text, namespace):
+        for key in mentioned_targets(policy, text):
             reasons.setdefault(key, "mentioned")
     for key in policy.scenario_exclusions.get(scenario_id, []):
         reasons.setdefault(key, "policy")
@@ -353,8 +374,12 @@ def decoy_candidates(
     the fault path; ``same_domain`` is an unmentioned app in the scenario's own
     namespace, ``off_domain`` one in another namespace."""
     namespace = scenario_namespace(policy, scenario)
-    excluded = excluded_targets(policy, scenario_id, scenario)
     groups: dict[DecoyRelation, list[DecoyTarget]] = {key: [] for key in RELATION_ORDER}
+    if namespace is None:
+        # review2 M3: without a domain the answer key cannot be read against
+        # the targets reliably; no decoy rather than a wrong one.
+        return groups
+    excluded = excluded_targets(policy, scenario_id, scenario)
     for target in policy.targets:
         if target.key in excluded or not _usable_kinds(policy, target):
             continue
@@ -569,13 +594,13 @@ def partition_decoy_alarms(
     decoys: Iterable[DecoyRecord],
     *,
     grace_sec: int,
-    now: datetime | None = None,
+    now: datetime,
     buffer_start: datetime | None = None,
 ) -> tuple[list[Mapping[str, Any]], list[dict[str, Any]]]:
     """Split firing alerts into (still blocking, explained by a decoy).
 
-    ``now`` is the preflight time (the wall clock when omitted; the queue always
-    passes it). An alert is explained only when all hold, otherwise it blocks:
+    ``now`` is the preflight time and is required: a silent wall-clock default
+    made a forgotten argument look like a fix (review2). An alert is explained only when all hold, otherwise it blocks:
     - the decoy rolled pods (restart kinds) and finished healthy (``applied``).
       A metadata-only decoy cannot cause an alarm, and a failed, undone or
       unfinished one explains nothing;
@@ -588,7 +613,7 @@ def partition_decoy_alarms(
       restart settles in minutes; an alarm on its target still firing after
       that is residue, whatever started it.
     """
-    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now = now.astimezone(timezone.utc)
     applied = [
         record for record in decoys
         if record.kind in ROLLOUT_KINDS and record.status == "applied"
