@@ -565,6 +565,8 @@ if "dirty" in steps:
     coordinator.mark_dirty(run_id="run-before", fencing_token=lease.fencing_token, reason="cleanup_failed", now=now)
 if "claim" in steps:
     coordinator.claim_cleanup(run_id="run-before", fencing_token=lease.fencing_token, claimant="manual-cleanup-cut", now=now)
+if "retry_claim" in steps:
+    coordinator.claim_cleanup(run_id="run-before", fencing_token=lease.fencing_token, claimant="cleanup-retry-cut", now=now)
 if "watchdog_claim" in steps:
     coordinator.claim_cleanup(run_id="run-before", fencing_token=lease.fencing_token, claimant="watchdog-cut", now=now)
 print(coordinator.owner, flush=True)
@@ -660,6 +662,47 @@ def test_restart_recovery_releases_a_cut_cleanup_claim_and_keeps_dirty(tmp_path:
     assert cleanup["succeeded"] is False and cleanup["source"] == "restart-recovery"
     assert "manual-cleanup-cut" in cleanup["reason"] and cleanup["finished_at"]
     # The next cleanup can claim it again.
+    GlobalCoordinator(state_path).claim_cleanup(
+        run_id="run-before", fencing_token=1, claimant="manual-cleanup-next", now=now
+    )
+
+
+def test_restart_recovery_releases_a_claim_left_by_a_forced_kill(tmp_path: Path) -> None:
+    """U9 review M2: SIGKILL (OOM, host reboot) during a DIRTY cleanup retry
+    leaves its claim with nobody to release it; every later retry, the
+    watchdog and a manual cleanup then stop on it. The claim's owner process is
+    gone, so startup takes it back and the run stays DIRTY for the next try."""
+    import signal
+
+    state_path = tmp_path / "state" / "coordinator.json"
+    runs_root = tmp_path / "runs"
+    (runs_root / "run-before").mkdir(parents=True)
+    process, owner = _previous_process(state_path, "dirty", "retry_claim", linger=True)
+    process.send_signal(signal.SIGKILL)
+    assert process.wait(timeout=30) == -signal.SIGKILL
+    before = GlobalCoordinator(state_path).snapshot()
+    assert before.cleanup_claim is not None
+    assert before.cleanup_claim.claimant == "cleanup-retry-cut"
+    assert before.cleanup_claim.owner == owner
+    now = datetime.now(timezone.utc)
+    assert decide_watchdog(before, now=now, heartbeat_timeout_sec=30).action == "cleanup_claimed"
+    with pytest.raises(RuntimeError, match="already claimed by cleanup-retry-cut"):
+        GlobalCoordinator(state_path).claim_cleanup(
+            run_id="run-before", fencing_token=1, claimant="manual-cleanup-next", now=now
+        )
+
+    recovered = _recover(state_path, runs_root)
+
+    assert [(item.action, item.claimant, item.previous_owner) for item in recovered] == [
+        ("released_cleanup_claim", "cleanup-retry-cut", owner)
+    ]
+    state = GlobalCoordinator(state_path).snapshot()
+    assert state.cleanup_claim is None and state.dirty_run == before.dirty_run
+    assert decide_watchdog(state, now=now, heartbeat_timeout_sec=30).action == "block_dirty"
+    cleanup = json.loads((runs_root / "run-before" / "cleanup.json").read_text())
+    # The cut attempt counts as a failed cleanup that ended no later than the
+    # recovery, so a timed retry measures from here, not from its start.
+    assert cleanup["succeeded"] is False and cleanup["finished_at"]
     GlobalCoordinator(state_path).claim_cleanup(
         run_id="run-before", fencing_token=1, claimant="manual-cleanup-next", now=now
     )
