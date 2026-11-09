@@ -79,7 +79,7 @@ class Runner:
         pass
 
 
-def make_cycle_queue(tmp_path: Path, *, cycle_ids=CYCLE_IDS, health_probe=None):
+def make_cycle_queue(tmp_path: Path, *, cycle_ids=CYCLE_IDS, health_probe=None, **extra):
     clock = Clock()
     coordinator = Coordinator()
     scheduler = Scheduler()
@@ -112,6 +112,7 @@ def make_cycle_queue(tmp_path: Path, *, cycle_ids=CYCLE_IDS, health_probe=None):
         cycle_mode=True,
         cycle_scenario_ids=tuple(cycle_ids),
         cycle_health_probe=health_probe,
+        **extra,
     )
     queue.ensure_worker = lambda: None  # type: ignore[method-assign]
     queue._controller_evidence_error = lambda _: None  # type: ignore[method-assign]
@@ -733,3 +734,325 @@ async def test_start_route_passes_the_optional_subset_body(monkeypatch) -> None:
 
     assert (no_body.status_code, subset.status_code) == (409, 409)
     assert calls == [None, ["F30-R"]]
+
+
+# ---------------------------------------------------------------------------
+# U7: decoy and routine deployments inside the cycle
+# ---------------------------------------------------------------------------
+from app.decoys import build_schedule, cycle_seed, load_decoy_policy  # noqa: E402
+from tests.test_decoys import policy_document  # noqa: E402
+
+CLEAN_SIGNALS = {
+    "baseline_loadgen_alive": 1.0,
+    "achieved_rps": 4.0,
+    "diurnal_rps_floor": 1.0,
+    "user_5xx_rate": 0.0,
+    "entry_p95_sec": 0.05,
+    "prev_pool_pending": 0.0,
+}
+
+
+class DecoyAwareProbe:
+    """Preflight probe double: the alerts and open incidents it sees, and the
+    same alarm-filter hook the production probe exposes."""
+
+    def __init__(self, alerts=(), open_incidents=0) -> None:
+        self.alerts = list(alerts)
+        self.open_incidents = open_incidents
+        self.alarm_filter = None
+        self.last_excused_alarms: list[dict] = []
+        self.filters_seen: list[bool] = []
+
+    def set_alarm_filter(self, alarm_filter) -> None:
+        self.alarm_filter = alarm_filter
+
+    def collect(self, *, now):
+        self.filters_seen.append(self.alarm_filter is not None)
+        remaining, self.last_excused_alarms = (
+            self.alarm_filter(self.alerts) if self.alarm_filter else (self.alerts, [])
+        )
+        return {
+            **CLEAN_SIGNALS,
+            "active_alarms": float(len(remaining)),
+            "open_incidents": float(self.open_incidents),
+        }
+
+
+class FakeDecoyExecutor:
+    def __init__(self, *, polls_until_done=1, never_done=()) -> None:
+        self.applied: list[str] = []
+        self.undone: list[str] = []
+        self.polls: dict[str, int] = {}
+        self.polls_until_done = polls_until_done
+        self.never_done = set(never_done)
+
+    def apply(self, record) -> None:
+        self.applied.append(record.id)
+
+    def rollout_done(self, record) -> bool:
+        self.polls[record.id] = self.polls.get(record.id, 0) + 1
+        return record.id not in self.never_done and self.polls[record.id] >= self.polls_until_done
+
+    def undo(self, record) -> None:
+        self.undone.append(record.id)
+
+
+def _decoy_queue(tmp_path: Path, monkeypatch=None, *, seed=None, probe=None, executor=None):
+    policy_path = tmp_path / "decoy-deployments.json"
+    policy_path.write_text(json.dumps(policy_document()), encoding="utf-8")
+    if seed is not None:
+        monkeypatch.setattr("app.live_queue.cycle_seed", lambda *args: seed)
+    executor = executor or FakeDecoyExecutor()
+    queue, runner, coordinator, scheduler, clock = make_cycle_queue(
+        tmp_path,
+        decoy_policy_path=policy_path,
+        decoy_executor=executor,
+        preflight_probe=probe,
+    )
+    return queue, runner, scheduler, clock, executor, policy_path
+
+
+def _seed_with(predicate) -> int:
+    policy, _ = load_decoy_policy_from_document()
+    for seed in range(5000):
+        records = build_schedule(
+            policy, seed=seed, scenario_id="F01-R", scenario={},
+            cycle_start=NOW, buffer_start=NOW + timedelta(hours=2),
+        )
+        if predicate(records):
+            return seed
+    raise AssertionError("no seed satisfies the predicate")
+
+
+def load_decoy_policy_from_document():
+    from app.decoys import DecoyPolicy
+
+    return DecoyPolicy.model_validate(policy_document()), None
+
+
+def _parse(text: str) -> datetime:
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+async def _walk_normal(queue, clock, *, step=timedelta(seconds=30)):
+    """Tick through the 2h normal phase the way the worker loop would."""
+    state = queue.snapshot()
+    end = _parse(state.expected_transition_at)
+    while clock.value < end:
+        clock.value = min(clock.value + step, end)
+        state = await queue.tick()
+        if state.phase != "cycle_normal":
+            break
+    return state
+
+
+@pytest.mark.asyncio
+async def test_cycle_plans_decoys_from_the_recorded_seed(tmp_path: Path) -> None:
+    """Completion condition 1: the schedule is the seeded one, reproducible from
+    values the recording keeps (queue id, scenario, cycle start)."""
+    queue, _, _, _, _, policy_path = _decoy_queue(tmp_path)
+    await queue.start()
+    state = await queue.tick()  # -> cycle_normal
+
+    seed = cycle_seed("testbed-v4-decoy", state.queue_id, "F01-R", state.cycle_started_at)
+    policy, digest = load_decoy_policy(policy_path)
+    registry = json.loads(queue.runner.scenario_metadata_path.read_text())["scenarios"]["F01-R"]
+    expected = build_schedule(
+        policy, seed=seed, scenario_id="F01-R", scenario=registry,
+        cycle_start=NOW, buffer_start=NOW + timedelta(hours=2),
+    )
+    assert state.cycle_decoy_seed == seed
+    assert state.cycle_decoy_policy_sha256 == digest
+    assert state.cycle_decoys == expected
+
+
+@pytest.mark.asyncio
+async def test_cycle_runs_decoys_on_time_and_records_them_for_the_capture(
+    tmp_path: Path, monkeypatch
+) -> None:
+    seed = _seed_with(
+        lambda records: len(records) >= 2
+        and any(r.kind in {"restart", "config_rollout"} for r in records)
+        and {r.window for r in records} == {"normal", "near_fault"}
+    )
+    probe = DecoyAwareProbe()
+    queue, runner, _, clock, executor, _ = _decoy_queue(
+        tmp_path, monkeypatch, seed=seed, probe=probe
+    )
+    await queue.start()
+    state = await queue.tick()  # -> cycle_normal
+    planned = list(state.cycle_decoys)
+
+    state = await _walk_normal(queue, clock)
+    assert state.phase == "cycle_buffer"
+    assert executor.applied == [record.id for record in planned]
+    for before, after in zip(planned, state.cycle_decoys):
+        assert after.status == "applied"
+        started = _parse(after.started_at)
+        assert _parse(before.planned_at) <= started <= _parse(before.planned_at) + timedelta(seconds=30)
+        assert _parse(after.finished_at) < _parse(state.cycle_buffer_started_at)
+
+    clock.value = state_expected(state)
+    state = await queue.tick()  # buffer end -> running
+    assert state.phase == "running"
+    document = json.loads(
+        (runner.artifact_store.root / state.current_run_id / "decoys.json").read_text()
+    )
+    assert document["seed"] == seed
+    assert document["scenario_id"] == "F01-R"
+    assert document["cycle_start"] == "2026-07-16T08:00:00Z"
+    assert [item["id"] for item in document["decoys"]] == [r.id for r in planned]
+    assert all(item["status"] == "applied" for item in document["decoys"])
+    preflight = json.loads(
+        (runner.artifact_store.root / state.current_run_id / "preflight.json").read_text()
+    )
+    assert preflight["verdict"] == "clean"
+    assert preflight["excused_alarms"] == []
+    assert probe.filters_seen == [True]
+
+
+@pytest.mark.asyncio
+async def test_missed_decoys_are_skipped_and_a_stuck_rollout_is_undone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    seed = _seed_with(
+        lambda records: len(records) >= 2
+        and records[0].kind in {"restart", "config_rollout"}
+    )
+    queue, _, _, clock, executor, _ = _decoy_queue(
+        tmp_path, monkeypatch, seed=seed,
+        executor=FakeDecoyExecutor(never_done={"d1"}),
+    )
+    await queue.start()
+    state = await queue.tick()
+    first = state.cycle_decoys[0]
+
+    clock.value = _parse(first.planned_at)
+    state = await queue.tick()
+    assert state.cycle_decoys[0].status == "rolling"
+    clock.value += timedelta(seconds=420)  # rollout timeout
+    state = await queue.tick()
+    assert state.cycle_decoys[0].status == "rolled_back"
+    assert executor.undone == ["d1"]
+
+    # The runner was away until the normal phase ended: nothing runs late into
+    # the buffer, and the misses are recorded rather than dropped.
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "cycle_buffer"
+    assert all(record.status == "skipped" for record in state.cycle_decoys[1:])
+    assert executor.applied == ["d1"]
+
+
+@pytest.mark.asyncio
+async def test_decoys_off_keeps_the_former_records(tmp_path: Path) -> None:
+    """Without a policy the runner writes no decoys.json and the preflight
+    record keeps exactly its former keys (meta.json additions only)."""
+    probe = DecoyAwareProbe()
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path, preflight_probe=probe)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+
+    run_dir = runner.artifact_store.root / state.current_run_id
+    assert state.cycle_decoys == [] and state.cycle_decoy_seed is None
+    assert not (run_dir / "decoys.json").exists()
+    preflight = json.loads((run_dir / "preflight.json").read_text())
+    assert set(preflight) == {"window", "verdict", "checked_at", "waited_sec", "checks", "ai_judgement"}
+    assert probe.filters_seen == [False]
+
+
+def _decoy_alarm(record, *, service=None):
+    return {
+        "state": "firing",
+        "labels": {"alertname": "latency", "service_name": service or record.service_name},
+        "activeAt": record.started_at,
+    }
+
+
+async def _to_buffer_end_with_applied_decoy(tmp_path, monkeypatch, probe):
+    seed = _seed_with(
+        lambda records: any(
+            r.kind in {"restart", "config_rollout"} and r.window == "near_fault" for r in records
+        )
+    )
+    queue, runner, scheduler, clock, executor, _ = _decoy_queue(
+        tmp_path, monkeypatch, seed=seed, probe=probe
+    )
+    await queue.start()
+    await queue.tick()
+    state = await _walk_normal(queue, clock)
+    assert state.phase == "cycle_buffer"
+    decoy = next(
+        r for r in state.cycle_decoys if r.kind in {"restart", "config_rollout"} and r.window == "near_fault"
+    )
+    clock.value = state_expected(state)
+    return queue, runner, state, decoy, clock
+
+
+@pytest.mark.asyncio
+async def test_preflight_excuses_the_alarm_a_decoy_rollout_explains(tmp_path: Path, monkeypatch) -> None:
+    probe = DecoyAwareProbe()
+    queue, runner, _, decoy, _ = await _to_buffer_end_with_applied_decoy(tmp_path, monkeypatch, probe)
+    probe.alerts = [_decoy_alarm(decoy)]
+
+    state = await queue.tick()
+
+    assert state.phase == "running"
+    preflight = json.loads(
+        (runner.artifact_store.root / state.current_run_id / "preflight.json").read_text()
+    )
+    assert preflight["verdict"] == "clean"
+    assert {c["name"]: c["value"] for c in preflight["checks"]}["active_alarms"] == 0.0
+    assert [item["decoy_id"] for item in preflight["excused_alarms"]] == [decoy.id]
+
+
+@pytest.mark.asyncio
+async def test_preflight_still_refuses_an_alarm_no_decoy_explains(tmp_path: Path, monkeypatch) -> None:
+    probe = DecoyAwareProbe()
+    queue, runner, _, decoy, _ = await _to_buffer_end_with_applied_decoy(tmp_path, monkeypatch, probe)
+    probe.alerts = [_decoy_alarm(decoy), _decoy_alarm(decoy, service="commerce-somewhere-else")]
+
+    state = await queue.tick()
+
+    assert state.phase == "cycle_reset"
+    assert "preflight not clean" in state.reason
+    assert runner.started == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_closes_lingering_incidents_when_only_decoy_alarms_fire(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Before U7 a decoy's alarm counted as a second hard failure, so the sweep
+    refused and the cycle restarted: the decoy was read as residue."""
+    probe = DecoyAwareProbe(open_incidents=1)
+    closed = []
+
+    def close_open_incidents():
+        closed.append(True)
+        probe.open_incidents = 0
+        return [{"id": "inc-1", "status": "open", "title": "t"}]
+
+    monkeypatch.setattr("app.incident_close.close_open_incidents", close_open_incidents)
+    queue, runner, _, decoy, _ = await _to_buffer_end_with_applied_decoy(tmp_path, monkeypatch, probe)
+    probe.alerts = [_decoy_alarm(decoy)]
+
+    state = await queue.tick()
+
+    assert closed == [True]
+    assert state.phase == "running"
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_close_incidents_beside_a_real_alarm(tmp_path: Path, monkeypatch) -> None:
+    probe = DecoyAwareProbe(open_incidents=1)
+    closed = []
+    monkeypatch.setattr(
+        "app.incident_close.close_open_incidents", lambda: closed.append(True) or []
+    )
+    queue, runner, _, decoy, _ = await _to_buffer_end_with_applied_decoy(tmp_path, monkeypatch, probe)
+    probe.alerts = [_decoy_alarm(decoy, service="commerce-somewhere-else")]
+
+    state = await queue.tick()
+
+    assert closed == []
+    assert state.phase == "cycle_reset"

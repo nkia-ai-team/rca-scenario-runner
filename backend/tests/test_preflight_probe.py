@@ -106,3 +106,35 @@ def test_dead_loadgen_or_open_incident_fails_the_gate(monkeypatch):
         now=datetime.now(timezone.utc),
     )
     assert verdict.verdict == "dirty"
+
+
+def test_queue_filter_removes_decoy_alarms_and_keeps_the_rest(monkeypatch):
+    """U7: the queue lends the probe a filter for one collect(); what it
+    excuses leaves active_alarms and is kept for the verdict record. Without a
+    filter every firing alarm counts, as before."""
+    monkeypatch.setattr("app.preflight_probe.open_incident_count", lambda **kwargs: 0)
+    decoy_alert = {"state": "firing", "labels": {"service_name": "commerce-order"}}
+    real_alert = {"state": "firing", "labels": {"service_name": "commerce-payment"}}
+    urlopen = _fake_urlopen(
+        {
+            "percentile95": {"data": {"result": [{"value": [0, "0.09"]}]}},
+            "otel_traces_local": {"data": [{"value": 0.0}]},
+            "pending_requests": {"data": {"result": []}},
+            "/api/v1/alerts": {"data": {"alerts": [decoy_alert, real_alert, {"state": "inactive"}]}},
+        }
+    )
+    probe = ProductionPreflightProbe(
+        vm_url="http://vm", urlopen=urlopen,
+        process_runner=_fake_process_runner("active\n4.00 iters/s\n"),
+    )
+
+    assert probe.collect(now=datetime.now(timezone.utc))["active_alarms"] == 2.0
+    assert probe.last_excused_alarms == []
+
+    def only_decoys(alerts):
+        keep = [a for a in alerts if a["labels"] != decoy_alert["labels"]]
+        return keep, [{"decoy_id": "d1"}]
+
+    probe.set_alarm_filter(only_decoys)
+    assert probe.collect(now=datetime.now(timezone.utc))["active_alarms"] == 1.0
+    assert probe.last_excused_alarms == [{"decoy_id": "d1"}]

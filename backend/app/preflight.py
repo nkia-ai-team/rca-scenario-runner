@@ -121,14 +121,20 @@ class PreflightVerdict(StrictModel):
     waited_sec: int = Field(ge=0)
     checks: list[PreflightCheck]
     ai_judgement: AiJudgement | None = None
+    # Firing alarms a decoy deployment of this cycle explains (U7). None when
+    # the cycle had no decoy feature; the key then stays out of meta.json.
+    excused_alarms: list[dict[str, object]] | None = None
 
     @property
     def is_clean(self) -> bool:
         return self.verdict in CLEAN_VERDICTS
 
     def to_meta(self) -> dict[str, object]:
-        """Exactly the ``--preflight-json`` document capture-eval-case.sh reads."""
-        return {
+        """Exactly the ``--preflight-json`` document capture-eval-case.sh reads.
+
+        ``excused_alarms`` is added only when decoys were in play, so a record
+        from a runner without decoys keeps its exact former shape."""
+        document: dict[str, object] = {
             "window": [self.window[0], self.window[1]],
             "verdict": self.verdict,
             "checked_at": self.checked_at,
@@ -140,6 +146,9 @@ class PreflightVerdict(StrictModel):
                 else {"clean": self.ai_judgement.clean, "rationale": self.ai_judgement.rationale}
             ),
         }
+        if self.excused_alarms is not None:
+            document["excused_alarms"] = [dict(item) for item in self.excused_alarms]
+        return document
 
 
 def evaluate_preflight(
@@ -149,6 +158,7 @@ def evaluate_preflight(
     now: datetime,
     waited_sec: int = 0,
     ai_judge: AiJudge | None = None,
+    excused_alarms: list[dict[str, object]] | None = None,
 ) -> PreflightVerdict:
     """Run the deterministic gate and map it to a verdict.
 
@@ -186,6 +196,7 @@ def evaluate_preflight(
         waited_sec=waited_sec,
         checks=evaluated,
         ai_judgement=ai_judgement,
+        excused_alarms=excused_alarms,
     )
 
 
@@ -254,7 +265,9 @@ def build_preflight_checks(observations: Mapping[str, float]) -> list[PreflightC
             op="lte",
             tolerance=R6_ENTRY_P95_TOLERANCE,
         ),
-        # no active alarms / unresolved incidents.
+        # no active alarms / unresolved incidents. ``active_alarms`` counts the
+        # alarms no decoy deployment explains (see app.decoys); with no decoys in
+        # the cycle that is every firing alarm, exactly as before.
         PreflightCheckInput(
             name="active_alarms",
             value=float(observations["active_alarms"]),

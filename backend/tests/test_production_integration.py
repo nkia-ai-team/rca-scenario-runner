@@ -703,6 +703,8 @@ def test_capture_invoker_forwards_preflight_and_normal_segment(tmp_path) -> None
     normal_dir = tmp_path / "normal-segments" / "commerce" / "2026-07-16"
     normal_dir.mkdir(parents=True)
     (run_dir / "normal-segment.path").write_text(str(normal_dir) + "\n", encoding="utf-8")
+    # U7: the cycle's decoy deployments, written by the queue at injection start.
+    (run_dir / "decoys.json").write_text('{"schema_version": 1, "decoys": []}\n', encoding="utf-8")
     process_calls = []
 
     def process(argv, **kwargs):
@@ -733,6 +735,7 @@ def test_capture_invoker_forwards_preflight_and_normal_segment(tmp_path) -> None
     argv = process_calls[0]
     assert argv[argv.index("--preflight-json") + 1] == str(run_dir / "preflight.json")
     assert argv[argv.index("--normal-segment") + 1] == str(normal_dir)
+    assert argv[argv.index("--decoys-json") + 1] == str(run_dir / "decoys.json")
 
 
 NOTE = {"detail": "d", "missing_data": "m", "confirmed_by": "c"}
@@ -809,6 +812,8 @@ def test_capture_invoker_forwards_scenario_notes_outside_the_metadata_digest(tmp
         "beyond_data_ko": NOTE,
     }
     assert "--scenario-notes-file" not in plain
+    # No decoys.json next to the run (decoys off): the flag is not passed.
+    assert "--decoys-json" not in plain
     digest = scenario_metadata().sha256()
     assert with_notes[with_notes.index("--scenario-metadata-sha256") + 1] == digest
     assert plain[plain.index("--scenario-metadata-sha256") + 1] == digest

@@ -72,6 +72,10 @@ services:
       # CYCLE_SCENARIOS 는 승인 목록의 부분집합만 허용된다(오타는 거부됨).
       - CYCLE_MODE=${CYCLE_MODE:-}
       - CYCLE_SCENARIOS=${CYCLE_SCENARIOS:-}
+      # v4 미끼, 평시 배포(주기 모드 전용, 기본 꺼짐). 정책은 testbed-services
+      # registry/decoy-deployments.json, 근거는 backend/app/decoys.py.
+      - DECOY_DEPLOYS=${DECOY_DEPLOYS:-}
+      - DECOY_SEED_BASE=${DECOY_SEED_BASE:-testbed-v4-decoy}
       # 모델 스냅샷 평면. 비우면 auto(워크로드 실재 여부로 판별).
       - MODEL_EXEC_MODE=${MODEL_EXEC_MODE:-}
       # 패스 종류. smoke면 케이스를 만들고 지키는 일(내보내기·간격·격리검사·야간창·

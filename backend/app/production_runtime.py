@@ -1150,6 +1150,11 @@ class ProductionCaptureInvoker:
         phases_file = self.runs_root / job.run_id / "phases.json"
         if phases_file.is_file():
             args.extend(["--phases-json", str(phases_file)])
+        # Decoy deployments of the cycle (U7): seed, plan and outcome, carried into
+        # meta.json as decoy_deployments. Absent when the runner had decoys off.
+        decoys_file = self.runs_root / job.run_id / "decoys.json"
+        if decoys_file.is_file():
+            args.extend(["--decoys-json", str(decoys_file)])
         # Cycle topology bundle (2026-07-24 EventCluster contract): the queue drops
         # a marker with the per-cycle bundle dir of periodic topology snapshots;
         # forward it so the case includes the raw topology graph + service tree.

@@ -25,6 +25,16 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.adaptive import ControllerPhase
 from app.adaptive_runtime import ControllerSession, SessionStatus
 from app.capture_orchestration import CaptureJob, load_scenario_metadata, parse_utc
+from app.decoys import (
+    ROLLOUT_KINDS,
+    DecoyRecord,
+    KubectlDecoyExecutor,
+    build_schedule,
+    cycle_seed,
+    decoy_document,
+    load_decoy_policy,
+    partition_decoy_alarms,
+)
 from app.pass_mode import (
     capture_enabled,
     golden_reset_enabled,
@@ -226,6 +236,11 @@ class LiveQueueState(StrictModel):
     cycle_restart_counts: dict[str, int] = Field(default_factory=dict)
     cycle_golden_id: str | None = None
     cycle_golden_sha256: str | None = None
+    # Decoy deployments planned for the current cycle (U7). Empty when the
+    # feature is off or the cycle drew zero decoys; seed is None only when off.
+    cycle_decoy_seed: int | None = None
+    cycle_decoy_policy_sha256: str | None = None
+    cycle_decoys: list[DecoyRecord] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def fixed_sequence(self) -> "LiveQueueState":
@@ -318,6 +333,9 @@ class LiveScenarioQueue:
         cycle_scenario_ids: tuple[str, ...] = (),
         cycle_health_probe: "Callable[[], str | None] | None" = None,
         topology_collector_factory: "Callable[[Path], object] | None" = None,
+        decoy_policy_path: Path | None = None,
+        decoy_executor: object | None = None,
+        decoy_seed_base: str = "testbed-v4-decoy",
     ) -> None:
         self.runner = runner
         # v3 continuous-cycle mode (off by default; v2 behaviour preserved).
@@ -330,6 +348,11 @@ class LiveScenarioQueue:
         # disables periodic topology capture (default; unit tests without it).
         self.topology_collector_factory = topology_collector_factory
         self._topology_collector: object | None = None
+        # Decoy deployments (U7): cycle mode only, and only when a policy file is
+        # wired. The executor is built from the policy unless a test injects one.
+        self.decoy_policy_path = decoy_policy_path if cycle_mode else None
+        self._decoy_executor = decoy_executor
+        self.decoy_seed_base = decoy_seed_base
         self.state_path = state_path
         self.clock = clock or SystemClock()
         self.poll_interval_sec = poll_interval_sec
@@ -923,7 +946,7 @@ class LiveScenarioQueue:
         if state.phase == "cycle_reset":
             return self._tick_cycle_reset(state)
         if state.phase == "cycle_normal":
-            return self._tick_cycle_normal(state)
+            return await self._tick_cycle_normal(state)
         if state.phase == "cycle_buffer":
             return await self._tick_cycle_buffer(state)
         if state.phase == "running":
@@ -953,6 +976,12 @@ class LiveScenarioQueue:
             return self._pause(state, f"golden reset failed for {scenario_id}: {error}")
         self._thaw_trainer()
         now = self.clock.now()
+        try:
+            decoy_seed, decoy_policy_sha256, decoys = self._plan_cycle_decoys(
+                state, scenario_id, now
+            )
+        except Exception as error:
+            return self._pause(state, f"decoy plan failed for {scenario_id}: {error}")
         state = state.model_copy(
             update={
                 "phase": "cycle_normal",
@@ -964,6 +993,9 @@ class LiveScenarioQueue:
                 "expected_transition_at": self._format(now + CYCLE_NORMAL_DURATION),
                 "cycle_golden_id": (golden or {}).get("id"),
                 "cycle_golden_sha256": (golden or {}).get("sha256"),
+                "cycle_decoy_seed": decoy_seed,
+                "cycle_decoy_policy_sha256": decoy_policy_sha256,
+                "cycle_decoys": decoys,
                 "reason": None,
                 "updated_at": self._format(now),
             }
@@ -973,15 +1005,18 @@ class LiveScenarioQueue:
         self._start_cycle_topology(state)
         return state
 
-    def _tick_cycle_normal(self, state: LiveQueueState) -> LiveQueueState:
-        """Hold the 2h clean lead-in. Baseline load is supplied out-of-band by
-        the tb-runner systemd loadgen, so the queue only waits and health-checks;
-        any health failure restarts the whole cycle (resume table: normal)."""
+    async def _tick_cycle_normal(self, state: LiveQueueState) -> LiveQueueState:
+        """Hold the 2h lead-in. Baseline load is supplied out-of-band by the
+        tb-runner systemd loadgen; the queue health-checks and runs the cycle's
+        planned decoy deployments (U7). Any health failure restarts the whole
+        cycle (resume table: normal)."""
         health_error = self._cycle_health_error()
         if health_error is not None:
             return self._restart_cycle(state, f"normal-phase health failed: {health_error}")
+        state = await self._advance_decoys(state)
         if not self._transition_due(state):
             return state
+        state = await self._settle_decoys_at_buffer(state)
         return self._enter_cycle_buffer(state)
 
     def _enter_cycle_buffer(self, state: LiveQueueState) -> LiveQueueState:
@@ -1019,9 +1054,11 @@ class LiveScenarioQueue:
         if self.preflight_probe is not None:
             now = self.clock.now().astimezone(timezone.utc)
             try:
-                verdict = self._evaluate_preflight(now, waited_sec=0)
+                verdict = self._evaluate_preflight(now, waited_sec=0, decoys=state.cycle_decoys)
                 if not verdict.is_clean and self._sweep_lingering_incidents(verdict):
-                    verdict = self._evaluate_preflight(now, waited_sec=0)
+                    verdict = self._evaluate_preflight(
+                        now, waited_sec=0, decoys=state.cycle_decoys
+                    )
             except Exception as error:
                 return self._pause(state, f"preflight probe failed for {scenario_id}: {error}")
             if not verdict.is_clean:
@@ -1039,6 +1076,9 @@ class LiveScenarioQueue:
             return self._restart_cycle(state, f"injection start failed for {scenario_id}: {error}")
         if verdict is not None:
             self._write_preflight(run.run_id, verdict)
+        # Decoys are final once the buffer opened; bind them to the run so the
+        # capture forwards --decoys-json into meta.json.
+        self._write_cycle_decoys(run.run_id, state)
         # Bind the topology bundle to this run so capture forwards --topology-bundle.
         self._write_topology_bundle_marker(run.run_id)
         now = self.clock.now()
@@ -1176,6 +1216,9 @@ class LiveScenarioQueue:
                 "cycle_buffer_started_at": None,
                 "cycle_golden_id": None,
                 "cycle_golden_sha256": None,
+                "cycle_decoy_seed": None,
+                "cycle_decoy_policy_sha256": None,
+                "cycle_decoys": [],
                 "phase_started_at": self._format(now),
                 "expected_transition_at": self._format(now),
                 "reason": None,
@@ -1239,6 +1282,9 @@ class LiveScenarioQueue:
                 "cycle_buffer_started_at": None,
                 "cycle_golden_id": None,
                 "cycle_golden_sha256": None,
+                "cycle_decoy_seed": None,
+                "cycle_decoy_policy_sha256": None,
+                "cycle_decoys": [],
                 "cycle_restart_counts": {**state.cycle_restart_counts, scenario_id: count},
                 "phase_started_at": self._format(now),
                 "expected_transition_at": self._format(now),
@@ -1392,6 +1438,215 @@ class LiveScenarioQueue:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"{bundle_dir}\n", encoding="utf-8")
 
+    # ------------------------------------------------------------------
+    # Decoy deployments inside the cycle (U7, cycle mode only)
+    # ------------------------------------------------------------------
+    def _decoy_policy(self, *, reload: bool = False):
+        """(policy, sha256) of the decoy registry, or None when decoys are off."""
+        if self.decoy_policy_path is None:
+            return None
+        cached = getattr(self, "_decoy_policy_cache", None)
+        if cached is None or reload:
+            cached = load_decoy_policy(self.decoy_policy_path)
+            self._decoy_policy_cache = cached
+        return cached
+
+    def _decoy_executor_for(self, policy) -> object:
+        if self._decoy_executor is None:
+            self._decoy_executor = KubectlDecoyExecutor(policy)
+        return self._decoy_executor
+
+    def _plan_cycle_decoys(
+        self, state: LiveQueueState, scenario_id: str, cycle_start: datetime
+    ) -> tuple[int | None, str | None, list[DecoyRecord]]:
+        """Seeded schedule for this cycle. The seed comes from values the
+        recording keeps (queue, scenario, cycle start), so the same inputs give
+        the same decoys; it is also written next to the run."""
+        loaded = self._decoy_policy(reload=True)
+        if loaded is None:
+            return None, None, []
+        policy, policy_sha256 = loaded
+        cycle_start_text = self._format(cycle_start)
+        seed = cycle_seed(self.decoy_seed_base, state.queue_id, scenario_id, cycle_start_text)
+        registry = json.loads(self.runner.scenario_metadata_path.read_text(encoding="utf-8"))
+        scenario = (registry.get("scenarios") or {}).get(scenario_id) or {}
+        records = build_schedule(
+            policy,
+            seed=seed,
+            scenario_id=scenario_id,
+            scenario=scenario,
+            cycle_start=parse_utc(cycle_start_text, field="cycle_start"),
+            buffer_start=parse_utc(cycle_start_text, field="cycle_start") + CYCLE_NORMAL_DURATION,
+        )
+        return seed, policy_sha256, records
+
+    async def _advance_decoys(self, state: LiveQueueState) -> LiveQueueState:
+        """One step of the decoy schedule per tick, never blocking on a rollout.
+
+        A rolling decoy is polled (one ``get``) until healthy or past the rollout
+        timeout, then undone. Only one decoy is in flight at a time. A decoy whose
+        time passed while the runner was away runs late only within the policy's
+        late limit and never after the near-fault window closes; otherwise it is
+        recorded as skipped, not silently dropped."""
+        loaded = self._decoy_policy()
+        if loaded is None or not state.cycle_decoys:
+            return state
+        policy, _ = loaded
+        executor = self._decoy_executor_for(policy)
+        now = self.clock.now().astimezone(timezone.utc)
+        records = list(state.cycle_decoys)
+        changed = False
+        for index, record in enumerate(records):
+            if record.status != "rolling":
+                continue
+            records[index] = await self._poll_decoy(executor, record, now, policy.rollout_timeout_sec)
+            changed = changed or records[index] != record
+            if records[index].status == "rolling":
+                return self._store_decoys(state, records) if changed else state
+        cycle_start = parse_utc(state.cycle_started_at, field="cycle_started_at")
+        last_start = (
+            cycle_start
+            + CYCLE_NORMAL_DURATION
+            - timedelta(seconds=policy.windows["near_fault"].end_before_buffer_sec)
+        )
+        for index, record in enumerate(records):
+            if record.status != "planned":
+                continue
+            planned_at = parse_utc(record.planned_at, field="decoy planned_at")
+            if now < planned_at:
+                break
+            if now > planned_at + timedelta(seconds=policy.late_limit_sec) or now > last_start:
+                records[index] = record.model_copy(
+                    update={"status": "skipped", "detail": "runner missed the planned time"}
+                )
+                changed = True
+                continue
+            records[index] = await self._start_decoy(executor, record, now)
+            changed = True
+            break
+        return self._store_decoys(state, records) if changed else state
+
+    async def _start_decoy(self, executor, record: DecoyRecord, now: datetime) -> DecoyRecord:
+        started = record.model_copy(update={"started_at": self._format(now)})
+        try:
+            await asyncio.to_thread(executor.apply, started)
+        except Exception as error:
+            return started.model_copy(
+                update={
+                    "status": "failed",
+                    "finished_at": self._format(self.clock.now()),
+                    "detail": f"{type(error).__name__}: {error}",
+                }
+            )
+        if started.kind in ROLLOUT_KINDS:
+            return started.model_copy(update={"status": "rolling"})
+        return started.model_copy(
+            update={"status": "applied", "finished_at": self._format(self.clock.now())}
+        )
+
+    async def _poll_decoy(
+        self, executor, record: DecoyRecord, now: datetime, timeout_sec: int, *, final: bool = False
+    ) -> DecoyRecord:
+        try:
+            done = await asyncio.to_thread(executor.rollout_done, record)
+        except Exception as error:
+            done = False
+            detail = f"{type(error).__name__}: {error}"
+        else:
+            detail = None
+        if done:
+            return record.model_copy(
+                update={"status": "applied", "finished_at": self._format(now)}
+            )
+        started = parse_utc(record.started_at or self._format(now), field="decoy started_at")
+        if not final and now < started + timedelta(seconds=timeout_sec):
+            return record
+        reason = "rollout not healthy before the buffer" if final else "rollout timed out"
+        try:
+            await asyncio.to_thread(executor.undo, record)
+        except Exception as error:
+            return record.model_copy(
+                update={
+                    "status": "failed",
+                    "finished_at": self._format(now),
+                    "detail": f"{reason}; undo failed: {type(error).__name__}: {error}",
+                }
+            )
+        return record.model_copy(
+            update={
+                "status": "rolled_back",
+                "finished_at": self._format(now),
+                "detail": reason if detail is None else f"{reason}; {detail}",
+            }
+        )
+
+    async def _settle_decoys_at_buffer(self, state: LiveQueueState) -> LiveQueueState:
+        """Nothing of the schedule may reach into the buffer: a rollout still in
+        flight gets one last check and is undone if unhealthy, and decoys that
+        never ran are recorded as skipped."""
+        loaded = self._decoy_policy()
+        if loaded is None or not state.cycle_decoys:
+            return state
+        policy, _ = loaded
+        executor = self._decoy_executor_for(policy)
+        now = self.clock.now().astimezone(timezone.utc)
+        records = []
+        for record in state.cycle_decoys:
+            if record.status == "rolling":
+                record = await self._poll_decoy(
+                    executor, record, now, policy.rollout_timeout_sec, final=True
+                )
+            elif record.status == "planned":
+                record = record.model_copy(
+                    update={"status": "skipped", "detail": "buffer reached before the planned time ran"}
+                )
+            records.append(record)
+        return self._store_decoys(state, records)
+
+    def _store_decoys(self, state: LiveQueueState, records: list[DecoyRecord]) -> LiveQueueState:
+        state = state.model_copy(
+            update={"cycle_decoys": records, "updated_at": self._format(self.clock.now())}
+        )
+        self._write(state)
+        return state
+
+    def _decoy_alarm_filter(self, decoys: list[DecoyRecord]):
+        loaded = self._decoy_policy()
+        grace = loaded[0].alarm_excuse_grace_sec if loaded is not None else 0
+
+        def apply(alerts):
+            return partition_decoy_alarms(alerts, decoys, grace_sec=grace)
+
+        return apply
+
+    def _write_cycle_decoys(self, run_id: str, state: LiveQueueState) -> None:
+        """<run-id>/decoys.json, forwarded by capture as --decoys-json into
+        meta.json. Written only when the feature is on, including when the
+        cycle drew zero decoys (that is a recording without decoys, not a
+        recording from a runner that could not make them)."""
+        if state.cycle_decoy_seed is None:
+            return
+        document = decoy_document(
+            scenario_id=state.current_scenario_id or "",
+            seed=state.cycle_decoy_seed,
+            policy_sha256=state.cycle_decoy_policy_sha256,
+            cycle_start=state.cycle_started_at,
+            records=state.cycle_decoys,
+        )
+        path = self.runner.artifact_store.root / run_id / "decoys.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(document, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(raw, path)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(raw)
+
     def _cycle_contract(self, selected_ids: tuple[str, ...] | None = None) -> tuple[list[str], str]:
         """Freeze the v3 cycle's scenario list and its digest.
 
@@ -1521,9 +1776,30 @@ class LiveScenarioQueue:
         self._write(waiting)
         return waiting
 
-    def _evaluate_preflight(self, now: datetime, waited_sec: int) -> PreflightVerdict:
+    def _evaluate_preflight(
+        self,
+        now: datetime,
+        waited_sec: int,
+        *,
+        decoys: list[DecoyRecord] | None = None,
+    ) -> PreflightVerdict:
+        """R6 gate. With decoys in the cycle, a firing alarm that one of them
+        explains (its target, inside its time span, decoy finished healthy) is
+        not residue: it leaves ``active_alarms`` and is listed in the verdict's
+        ``excused_alarms`` instead. Every other alarm still fails the gate."""
         assert self.preflight_probe is not None
-        observations = self.preflight_probe.collect(now=now)
+        set_filter = getattr(self.preflight_probe, "set_alarm_filter", None)
+        decoy_filter = self._decoy_alarm_filter(decoys) if decoys else None
+        if callable(set_filter):
+            set_filter(decoy_filter)
+        try:
+            observations = self.preflight_probe.collect(now=now)
+        finally:
+            if callable(set_filter):
+                set_filter(None)
+        excused = None
+        if decoy_filter is not None and callable(set_filter):
+            excused = list(getattr(self.preflight_probe, "last_excused_alarms", None) or [])
         checks = build_preflight_checks(observations)
         window = (self._format(now - PREFLIGHT_WINDOW_LEAD), self._format(now))
         return evaluate_preflight(
@@ -1532,6 +1808,7 @@ class LiveScenarioQueue:
             now=now,
             waited_sec=waited_sec,
             ai_judge=self.preflight_ai_judge,
+            excused_alarms=excused,
         )
 
     def _sweep_lingering_incidents(self, verdict: PreflightVerdict) -> bool:
@@ -1936,6 +2213,17 @@ def get_live_queue() -> LiveScenarioQueue:
                     query_url=query_url,
                 )
 
+        # Decoy deployments (U7) are opt-in: DECOY_DEPLOYS=1 on a cycle-mode
+        # runner. The policy is the testbed-services registry file shipped with
+        # the scenario contracts.
+        decoy_policy_path = None
+        if cycle_mode and os.environ.get("DECOY_DEPLOYS", "").lower() in {"1", "true", "yes", "on"}:
+            decoy_policy_path = Path(
+                os.environ.get(
+                    "DECOY_POLICY_PATH",
+                    "/opt/lucida/scenario-contracts/registry/decoy-deployments.json",
+                )
+            )
         # CYCLE_SCENARIOS narrows a cycle run to a subset for targeted
         # single/subset recaptures (e.g. F01-G recalibration) without a code
         # change. Comma-separated ids; unset covers the whole approved registry.
@@ -1957,5 +2245,7 @@ def get_live_queue() -> LiveScenarioQueue:
             cycle_mode=cycle_mode,
             cycle_scenario_ids=cycle_scenario_ids,
             topology_collector_factory=topology_collector_factory,
+            decoy_policy_path=decoy_policy_path,
+            decoy_seed_base=os.environ.get("DECOY_SEED_BASE", "testbed-v4-decoy"),
         )
     return _queue

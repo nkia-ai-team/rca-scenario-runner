@@ -107,3 +107,15 @@ def test_naive_clock_and_empty_checks_are_rejected() -> None:
         evaluate_preflight(window=WINDOW, checks=_r6_checks(), now=datetime(2026, 7, 16, 1, 0, 0))
     with pytest.raises(ValueError, match="at least one check"):
         evaluate_preflight(window=WINDOW, checks=[], now=NOW)
+
+
+def test_excused_alarms_join_the_record_only_when_decoys_were_in_play() -> None:
+    """U7: meta.json gains a key, existing keys keep their shape and values."""
+    plain = evaluate_preflight(window=WINDOW, checks=_r6_checks(), now=NOW).to_meta()
+    excused = [{"decoy_id": "d1", "labels": {"service_name": "s"}, "active_at": "t"}]
+    with_decoys = evaluate_preflight(
+        window=WINDOW, checks=_r6_checks(), now=NOW, excused_alarms=excused
+    ).to_meta()
+
+    assert set(plain) == {"window", "verdict", "checked_at", "waited_sec", "checks", "ai_judgement"}
+    assert with_decoys == {**plain, "excused_alarms": excused}

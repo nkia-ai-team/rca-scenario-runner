@@ -10,7 +10,8 @@ Signal sources were fixed empirically (2026-07-21, 119 live):
   read apm.agent.otel.java.error_rate, but that rollup discards all but one
   insert block per service-minute, so the gateway ratio came from ~5 of the ~105
   requests actually served — one sampled failure read as 20% against a 1% floor.
-- active alarms: vmalert firing list via the VM select endpoint /api/v1/alerts.
+- active alarms: vmalert firing list via the VM select endpoint /api/v1/alerts,
+  minus alarms a decoy deployment of the cycle explains (queue-set filter, U7).
 - open incidents: observer 18087 via the manager session (incident_close).
 - pool residue: max db.client.connections.pending_requests over commerce apps.
 
@@ -56,6 +57,13 @@ class ProductionPreflightProbe:
         self.vm_url = (vm_url or os.environ.get("PREFLIGHT_VM_URL") or DEFAULT_VM_URL).rstrip("/")
         self.process_runner = process_runner
         self.urlopen = urlopen or urllib.request.urlopen
+        # Set by the queue for one collect() when the cycle ran decoy deployments
+        # (U7): splits firing alerts into (still blocking, explained by a decoy).
+        self.alarm_filter = None
+        self.last_excused_alarms: list[dict] = []
+
+    def set_alarm_filter(self, alarm_filter) -> None:
+        self.alarm_filter = alarm_filter
 
     def collect(self, *, now: datetime) -> Mapping[str, float]:
         del now
@@ -126,4 +134,10 @@ class ProductionPreflightProbe:
         with self.urlopen(f"{self.vm_url}/api/v1/alerts", timeout=_TIMEOUT_SEC) as response:
             document = json.loads(response.read())
         alerts = document.get("data", {}).get("alerts", [])
-        return sum(1 for item in alerts if str(item.get("state", "firing")) != "inactive")
+        firing = [item for item in alerts if str(item.get("state", "firing")) != "inactive"]
+        self.last_excused_alarms = []
+        if self.alarm_filter is None:
+            return len(firing)
+        remaining, excused = self.alarm_filter(firing)
+        self.last_excused_alarms = list(excused)
+        return len(remaining)
