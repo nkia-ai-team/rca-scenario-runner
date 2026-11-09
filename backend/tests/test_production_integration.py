@@ -1448,3 +1448,13 @@ async def test_a_slow_apply_does_not_starve_the_heartbeat(tmp_path) -> None:
     assert beats_when_apply_returned >= 10, (
         f"heartbeat was starved during apply (beats={beats_when_apply_returned})"
     )
+
+
+def test_image_carries_the_oracle_client_the_lock_executor_calls() -> None:
+    # testbed-services v4 C6: the Oracle row lock is held by a network session from this
+    # container (oracle_lock_session.py through /usr/local/bin/python3). Without the driver
+    # in the system python the executor's preflight refuses with "runner image lacks
+    # python-oracledb", so the image must install it there, pinned.
+    dockerfile = (Path(__file__).resolve().parents[2] / "Dockerfile").read_text(encoding="utf-8")
+    assert 'RUN uv pip install --system --no-cache "oracledb==2.5.1"' in dockerfile
+    assert dockerfile.index("oracledb==2.5.1") > dockerfile.index("FROM python:3.12-slim AS backend")

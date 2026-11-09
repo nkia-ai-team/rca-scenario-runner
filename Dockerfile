@@ -52,6 +52,14 @@ RUN apt-get update \
 # understands our uv.lock schema.
 COPY --from=ghcr.io/astral-sh/uv:0.8.0 /uv /usr/local/bin/uv
 
+# python-oracledb (thin mode, pure network client, no Oracle Instant Client): the Oracle
+# row-lock injection in testbed-services (scripts/scenarios/profiles/oracle_lock_session.py,
+# v4 C6) connects from this container to the banking Oracle listener instead of exec'ing
+# sqlplus inside the DB pod. Executors call the system python (/usr/local/bin/python3),
+# not the app venv, so it goes into the system site-packages. 2.5.1 is the first version
+# checked to accept program/machine/osuser on connect.
+RUN uv pip install --system --no-cache "oracledb==2.5.1"
+
 # Backend dependencies (cache friendly: lock+pyproject first)
 COPY backend/pyproject.toml backend/uv.lock ./backend/
 RUN cd backend && uv sync --frozen --no-dev
