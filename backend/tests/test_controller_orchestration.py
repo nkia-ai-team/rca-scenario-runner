@@ -435,6 +435,41 @@ async def test_watchdog_does_not_reclaim_a_lease_whose_run_is_live_here(
     assert coordinator.snapshot().active_lease is None
 
 
+async def test_watchdog_may_reclaim_once_the_run_stopped_renewing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review R4: the run stops its heartbeat before its closing steps. If one
+    of those hangs, the lease expires; the watchdog must still be allowed to
+    recover it, as before the in-process exemption."""
+    from contextlib import suppress
+
+    script = tmp_path / "scenario.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    scenario = _runner_scenario(script)
+    monkeypatch.setattr("app.runner.get_scenario", lambda _: scenario)
+    coordinator = GlobalCoordinator(tmp_path / "state.json")
+
+    async def hanging_validator(_scenario):
+        await asyncio.sleep(1.6)
+        return True
+
+    runner = ScenarioRunner(
+        tmp_path, tmp_path / "logs", coordinator=coordinator,
+        lease_sec=1, heartbeat_interval_sec=0.05, recovery_validator=hanging_validator,
+    )
+    started = await runner.start(scenario.id, "cleanup")
+    await asyncio.sleep(1.3)  # script done, heartbeat stopped, validator hanging
+
+    assert runner._task is not None and not runner._task.done()
+    assert runner._owns_live_lease(started.run_id, started.fencing_token) is False
+    stale = decide_watchdog(
+        coordinator.snapshot(), now=datetime.now(timezone.utc), heartbeat_timeout_sec=1
+    )
+    assert stale.action == "claim_cleanup"
+    with suppress(Exception):
+        await runner._task
+
+
 async def test_watchdog_still_reclaims_a_lease_no_live_run_here_owns(
     tmp_path: Path,
 ) -> None:

@@ -204,3 +204,42 @@ async def test_watchdog_leaves_a_lease_alone_while_its_owner_runs_here(tmp_path)
     assert decision.reason == "lease_owner_running_in_process"
     assert coordinator.snapshot().cleanup_claim is None
     assert coordinator.snapshot().active_lease is not None
+
+
+async def test_a_cancelled_watchdog_tick_still_closes_what_it_claimed(tmp_path) -> None:
+    """Review R1: with claim, cleanup and release split over separate awaits, a
+    cancel (container stop) in between left a cleanup claim nobody finishes.
+    CleanupClaim never expires, so every later acquisition was blocked."""
+    import asyncio
+    import time
+    from contextlib import suppress
+
+    coordinator, _ = setup_expired(tmp_path)
+
+    class SlowApplier:
+        def cleanup(self, request):
+            time.sleep(0.3)
+            return SimpleNamespace(succeeded=True, reason=None)
+
+    service = WatchdogService(
+        coordinator,
+        tmp_path / "runs",
+        clock=Clock(),
+        applier_factory=lambda *args, **kwargs: SlowApplier(),
+    )
+    task = asyncio.create_task(service.tick())
+    await asyncio.sleep(0.1)  # claimed, cleanup in flight
+    assert coordinator.snapshot().cleanup_claim is not None
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+    for _ in range(100):
+        state = coordinator.snapshot()
+        if state.cleanup_claim is None:
+            break
+        await asyncio.sleep(0.02)
+    state = coordinator.snapshot()
+    assert state.cleanup_claim is None
+    assert state.active_lease is None and state.dirty_run is None
+    assert json.loads((tmp_path / "runs" / "run-expired" / "cleanup.json").read_text())["succeeded"]

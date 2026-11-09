@@ -96,6 +96,11 @@ class LeaseHeartbeat:
     def signal_stop(self) -> None:
         self._stop.set()
 
+    @property
+    def renewing(self) -> bool:
+        """Still renewing: not told to stop and no renewal has failed."""
+        return not self._stop.is_set() and self.error is None
+
     async def stop(self) -> None:
         """Stop renewing and wait for an in-flight renewal to settle."""
         self._stop.set()
@@ -214,10 +219,12 @@ class ScenarioRunner:
             and current.status in {"running", "cleanup_running"}
             and current.run_id == run_id
             and current.fencing_token == fencing_token
-            # A renewal that failed outright leaves the lease to expire for
-            # real; the watchdog keeps its job there.
+            # Only while the lease is actually being renewed. A renewal that
+            # failed, or one already stopped for the run's closing steps,
+            # leaves the lease to expire for real, and a closing step that
+            # hangs is then the watchdog's to recover, as before (review R4).
             and heartbeat is not None
-            and heartbeat.error is None
+            and heartbeat.renewing
         )
 
     def get_current(self) -> Optional[RunInfo]:
@@ -496,7 +503,14 @@ class ScenarioRunner:
             # every start is refused with check_failed:clean-window. External
             # cleanup is the way out, and it was the one thing the forgotten
             # state made unreachable (F15-T2-run-d5b1ae8a, 2026-08-03).
-            orphan = self.artifact_store.find_orphaned_dirty_run(scenario.id)
+            # Scans every run directory: off the loop, with the start guard up.
+            self._starting = True
+            try:
+                orphan = await asyncio.to_thread(
+                    self.artifact_store.find_orphaned_dirty_run, scenario.id
+                )
+            finally:
+                self._starting = False
             if orphan is not None:
                 run_id, fencing_token = orphan
                 dirty = self.coordinator.readopt_dirty(
@@ -551,7 +565,7 @@ class ScenarioRunner:
                     reason=f"manual dirty cleanup by {claimant}",
                     now=self.clock.now(),
                 )
-            capsule = self.artifact_store.verify_capsule(run_dir)
+            capsule = await asyncio.to_thread(self.artifact_store.verify_capsule, run_dir)
             plan = json.loads((run_dir / "plan.json").read_text(encoding="utf-8"))
             binding = capsule["binding"]
             contracts = run_dir / "capsule" / "contracts"

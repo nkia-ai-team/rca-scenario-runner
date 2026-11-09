@@ -59,10 +59,19 @@ class WatchdogService:
             )
         # Everything below waits on the coordinator file lock, hashes the
         # capsule and shells out to profile cleanup: never on the event loop.
+        # It runs as one synchronous unit on a worker thread. Split into
+        # several awaits, a cancellation (container stop) between the claim and
+        # its release left a cleanup claim no one would ever finish, which
+        # blocks every later acquisition (review R1). A thread is not cancelled
+        # with the task, so the unit always closes what it claimed; shield
+        # keeps the result reachable for a caller that is not cancelled.
+        return await asyncio.shield(asyncio.to_thread(self._claim_and_recover, decision))
+
+    def _claim_and_recover(self, decision: WatchdogDecision) -> WatchdogDecision:
+        assert decision.run_id is not None and decision.fencing_token is not None
         claimant = f"watchdog-{uuid.uuid4().hex[:12]}"
         try:
-            claim = await asyncio.to_thread(
-                self.coordinator.claim_expired_cleanup,
+            claim = self.coordinator.claim_expired_cleanup(
                 now=self.clock.now(),
                 heartbeat_timeout_sec=self.heartbeat_timeout_sec,
                 claimant=claimant,
@@ -76,10 +85,10 @@ class WatchdogService:
                 heartbeat_timeout_sec=self.heartbeat_timeout_sec,
             )
         try:
-            applier, request = await asyncio.to_thread(self._cleanup_call, decision)
-            result = await asyncio.to_thread(applier.cleanup, request)
+            applier, request = self._cleanup_call(decision)
+            result = applier.cleanup(request)
             if inspect.isawaitable(result):
-                result = await result
+                result = asyncio.run(_awaited(result))
             if result.succeeded:
                 effect_ended_at = getattr(result, "effect_ended_at", None) or self.clock.now()
                 atomic_json(
@@ -95,17 +104,14 @@ class WatchdogService:
                     self.runs_root / decision.run_id / "recovery.json",
                     {"schema_version": 1, "source": "watchdog", "status": "succeeded"},
                 )
-                await asyncio.to_thread(
-                    self.coordinator.release,
-                    run_id=decision.run_id,
-                    fencing_token=decision.fencing_token,
+                self.coordinator.release(
+                    run_id=decision.run_id, fencing_token=decision.fencing_token
                 )
                 return WatchdogDecision(action="idle", reason="watchdog_cleanup_recovered")
             reason = result.reason or "watchdog_cleanup_or_recovery_failed"
         except Exception as error:
             reason = f"watchdog_cleanup_failed:{type(error).__name__}"
-        await asyncio.to_thread(
-            self.coordinator.mark_dirty,
+        self.coordinator.mark_dirty(
             run_id=decision.run_id,
             fencing_token=decision.fencing_token,
             reason=reason,
@@ -119,8 +125,7 @@ class WatchdogService:
             self.runs_root / decision.run_id / "recovery.json",
             {"schema_version": 1, "source": "watchdog", "status": "failed", "reason": reason},
         )
-        await asyncio.to_thread(
-            self.coordinator.finish_cleanup_claim,
+        self.coordinator.finish_cleanup_claim(
             run_id=decision.run_id,
             fencing_token=decision.fencing_token,
             claimant=claimant,
@@ -157,3 +162,7 @@ class WatchdogService:
             requested_at=self.clock.now(),
         )
         return applier, request
+
+
+async def _awaited(value):
+    return await value
