@@ -1456,5 +1456,10 @@ def test_image_carries_the_oracle_client_the_lock_executor_calls() -> None:
     # in the system python the executor's preflight refuses with "runner image lacks
     # python-oracledb", so the image must install it there, pinned.
     dockerfile = (Path(__file__).resolve().parents[2] / "Dockerfile").read_text(encoding="utf-8")
-    assert 'RUN uv pip install --system --no-cache "oracledb==2.5.1"' in dockerfile
+    assert "RUN uv pip install --system --no-cache" in dockerfile
+    install = dockerfile[dockerfile.index("RUN uv pip install --system --no-cache"):]
+    install = install[: install.index("\n\n")]
+    # the driver and every package it pulls in are pinned exactly
+    for pin in ("oracledb==2.5.1", "cryptography==50.0.2", "cffi==2.1.1", "pycparser==3.12", "typing_extensions==4.16.0"):
+        assert f'"{pin}"' in install
     assert dockerfile.index("oracledb==2.5.1") > dockerfile.index("FROM python:3.12-slim AS backend")

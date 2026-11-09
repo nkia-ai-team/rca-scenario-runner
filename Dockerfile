@@ -57,8 +57,10 @@ COPY --from=ghcr.io/astral-sh/uv:0.8.0 /uv /usr/local/bin/uv
 # v4 C6) connects from this container to the banking Oracle listener instead of exec'ing
 # sqlplus inside the DB pod. Executors call the system python (/usr/local/bin/python3),
 # not the app venv, so it goes into the system site-packages. 2.5.1 is the first version
-# checked to accept program/machine/osuser on connect.
-RUN uv pip install --system --no-cache "oracledb==2.5.1"
+# checked to accept program/machine/osuser on connect. Its dependencies are pinned too
+# (the set pip resolves for cp312 on 2026-11-10) so a rebuild cannot change them.
+RUN uv pip install --system --no-cache \
+      "oracledb==2.5.1" "cryptography==50.0.2" "cffi==2.1.1" "pycparser==3.12" "typing_extensions==4.16.0"
 
 # Backend dependencies (cache friendly: lock+pyproject first)
 COPY backend/pyproject.toml backend/uv.lock ./backend/
