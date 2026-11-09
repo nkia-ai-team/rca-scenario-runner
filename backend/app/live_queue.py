@@ -1051,13 +1051,25 @@ class LiveScenarioQueue:
             return state
         scenario_id = state.scenario_ids[state.next_index]
         verdict = None
+        unsettled = await self._unsettled_decoy(state)
+        if unsettled is not None:
+            return self._restart_cycle(state, unsettled)
+        # None = decoys off; a list (possibly empty) = decoys on for this cycle.
+        decoys = state.cycle_decoys if state.cycle_decoy_seed is not None else None
         if self.preflight_probe is not None:
             now = self.clock.now().astimezone(timezone.utc)
+            buffer_start = (
+                parse_utc(state.cycle_buffer_started_at, field="cycle_buffer_started_at")
+                if state.cycle_buffer_started_at
+                else None
+            )
             try:
-                verdict = self._evaluate_preflight(now, waited_sec=0, decoys=state.cycle_decoys)
+                verdict = self._evaluate_preflight(
+                    now, waited_sec=0, decoys=decoys, buffer_start=buffer_start
+                )
                 if not verdict.is_clean and self._sweep_lingering_incidents(verdict):
                     verdict = self._evaluate_preflight(
-                        now, waited_sec=0, decoys=state.cycle_decoys
+                        now, waited_sec=0, decoys=decoys, buffer_start=buffer_start
                     )
             except Exception as error:
                 return self._pause(state, f"preflight probe failed for {scenario_id}: {error}")
@@ -1610,14 +1622,39 @@ class LiveScenarioQueue:
         self._write(state)
         return state
 
-    def _decoy_alarm_filter(self, decoys: list[DecoyRecord]):
+    def _decoy_alarm_filter(
+        self, decoys: list[DecoyRecord], now: datetime, buffer_start: datetime | None
+    ):
         loaded = self._decoy_policy()
         grace = loaded[0].alarm_excuse_grace_sec if loaded is not None else 0
 
         def apply(alerts):
-            return partition_decoy_alarms(alerts, decoys, grace_sec=grace)
+            return partition_decoy_alarms(
+                alerts, decoys, grace_sec=grace, now=now, buffer_start=buffer_start
+            )
 
         return apply
+
+    async def _unsettled_decoy(self, state: LiveQueueState) -> str | None:
+        """A decoy undone at the buffer starts a rollback rollout that nothing
+        waited for. If it is still rolling when the buffer ends, the clean
+        window the gate vouches for is not clean: restart the cycle."""
+        loaded = self._decoy_policy()
+        if loaded is None:
+            return None
+        executor = self._decoy_executor_for(loaded[0])
+        for record in state.cycle_decoys:
+            if record.status not in {"rolled_back", "failed"} or record.deployment is None:
+                continue
+            if record.kind not in ROLLOUT_KINDS:
+                continue
+            try:
+                done = await asyncio.to_thread(executor.rollout_done, record)
+            except Exception as error:
+                return f"decoy {record.id} rollout state unreadable at buffer end: {error}"
+            if not done:
+                return f"decoy {record.id} rollback still rolling at buffer end"
+        return None
 
     def _write_cycle_decoys(self, run_id: str, state: LiveQueueState) -> None:
         """<run-id>/decoys.json, forwarded by capture as --decoys-json into
@@ -1782,6 +1819,7 @@ class LiveScenarioQueue:
         waited_sec: int,
         *,
         decoys: list[DecoyRecord] | None = None,
+        buffer_start: datetime | None = None,
     ) -> PreflightVerdict:
         """R6 gate. With decoys in the cycle, a firing alarm that one of them
         explains (its target, inside its time span, decoy finished healthy) is
@@ -1789,7 +1827,9 @@ class LiveScenarioQueue:
         ``excused_alarms`` instead. Every other alarm still fails the gate."""
         assert self.preflight_probe is not None
         set_filter = getattr(self.preflight_probe, "set_alarm_filter", None)
-        decoy_filter = self._decoy_alarm_filter(decoys) if decoys else None
+        decoy_filter = (
+            None if decoys is None else self._decoy_alarm_filter(decoys, now, buffer_start)
+        )
         if callable(set_filter):
             set_filter(decoy_filter)
         try:

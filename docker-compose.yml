@@ -76,6 +76,7 @@ services:
       # registry/decoy-deployments.json, 근거는 backend/app/decoys.py.
       - DECOY_DEPLOYS=${DECOY_DEPLOYS:-}
       - DECOY_SEED_BASE=${DECOY_SEED_BASE:-testbed-v4-decoy}
+      - DECOY_POLICY_PATH=${DECOY_POLICY_PATH:-/opt/lucida/scenario-contracts/registry/decoy-deployments.json}
       # 모델 스냅샷 평면. 비우면 auto(워크로드 실재 여부로 판별).
       - MODEL_EXEC_MODE=${MODEL_EXEC_MODE:-}
       # 패스 종류. smoke면 케이스를 만들고 지키는 일(내보내기·간격·격리검사·야간창·

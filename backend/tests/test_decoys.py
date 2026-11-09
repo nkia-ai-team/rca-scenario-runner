@@ -14,10 +14,12 @@ from app.decoys import (
     DecoyRecord,
     KubectlDecoyExecutor,
     build_schedule,
-    classify_targets,
     cycle_seed,
+    decoy_candidates,
+    excluded_targets,
     load_decoy_policy,
     partition_decoy_alarms,
+    stated_unchanged,
 )
 
 CYCLE_START = datetime(2026, 11, 10, 1, 0, tzinfo=timezone.utc)
@@ -58,7 +60,9 @@ def policy_document(**overrides) -> dict:
         "rollout_timeout_sec": 420,
         "alarm_excuse_grace_sec": 900,
         "kind_weights": {"restart": 45, "config_rollout": 15, "configmap": 25, "annotation": 15},
-        "relation_weights": {"on_path": 35, "same_domain": 30, "off_domain": 35},
+        # All kinds on here so every kind's path is exercised; the shipped
+        # policy enables only restart (test against the real registry below).
+        "relation_weights": {"on_path": 0, "same_domain": 50, "off_domain": 50},
         "configmap": {"name": "service-config", "key": "CONFIG_REVISION"},
         "annotation_key": "kubernetes.io/change-cause",
         "scenario_exclusions": {},
@@ -127,9 +131,10 @@ def test_cycle_seed_is_reproducible_from_recorded_values() -> None:
     assert 0 <= seed < 2**63
 
 
-def test_schedule_draws_vary_count_time_target_kind_and_relation() -> None:
+def test_schedule_draws_vary_count_time_target_and_kind() -> None:
     """The shortcut is learned from anything fixed, so every axis must vary
-    across cycles: count (zero included), time, target, kind, on/off path."""
+    across cycles: count (zero included), time, target, kind, and both
+    off-path relations. On-path never appears (user decision 2026-11-09)."""
     counts, kinds, relations, windows, targets = Counter(), Counter(), Counter(), Counter(), Counter()
     for seed in range(400):
         records = schedule(seed)
@@ -142,9 +147,9 @@ def test_schedule_draws_vary_count_time_target_kind_and_relation() -> None:
 
     assert counts[0] > 0 and max(counts) >= 3
     assert set(kinds) == {"restart", "config_rollout", "configmap", "annotation"}
-    assert set(relations) == {"on_path", "same_domain", "off_domain"}
+    assert set(relations) == {"same_domain", "off_domain"}
     assert set(windows) == {"normal", "near_fault"}
-    assert len(targets) >= 4
+    assert len(targets) >= 3
 
 
 def test_schedule_respects_windows_gap_and_never_reaches_the_buffer() -> None:
@@ -171,15 +176,58 @@ def test_schedule_only_uses_rollout_free_kinds_on_maxsurge_zero_targets() -> Non
                 assert record.kind in {"configmap", "annotation"}
 
 
-def test_on_path_comes_from_the_answer_key_names_and_aliases() -> None:
-    groups, namespaces = classify_targets(policy(), SCENARIO)
-    assert [t.deployment for t in groups["on_path"]] == ["testbed-inventory"]
-    assert {t.deployment for t in groups["same_domain"]} == {"testbed-order", "testbed-user"}
-    assert namespaces == {"rca-testbed-commerce"}
+def test_fault_path_and_unchanged_targets_never_carry_a_decoy() -> None:
+    """Scored names and any target the answer key mentions are the fault path;
+    a target the answer key says did not change is out too."""
+    scenario = {
+        **SCENARIO,
+        "must_rule_out": ["order 쪽 변경이 아님: order 에는 롤아웃이 없다"],
+        "related_scenarios": {"contrast_with": ["F99 (ledger 롤아웃 없음)"]},
+    }
+    reasons = excluded_targets(policy(), "F01-R", scenario)
+    assert reasons == {
+        "rca-testbed-commerce/testbed-inventory": "scored",
+        "rca-testbed-commerce/testbed-order": "stated_unchanged",
+    }
+    victim = {**SCENARIO, "user_impact": "checkouts fail; commerce-user logins slow down"}
+    assert excluded_targets(policy(), "F01-R", victim)["rca-testbed-commerce/testbed-user"] == "mentioned"
+    assert "rca-testbed-commerce/testbed-user" not in excluded_targets(
+        policy(path_scope="scored"), "F01-R", victim
+    )
+    groups = decoy_candidates(policy(), "F01-R", scenario)
+    assert groups["on_path"] == []
+    assert {t.deployment for t in groups["same_domain"]} == {"testbed-user"}
+    assert {t.deployment for t in groups["off_domain"]} == {"testbed-transfer", "testbed-ledger"}
+    for seed in range(300):
+        for record in schedule(seed, scenario=scenario):
+            assert record.deployment not in {"testbed-inventory", "testbed-order"}
+            assert record.relation != "on_path"
 
-    banking = {"domain": "core-banking", "scoring": {"accept": ["banking-transfer"]}}
-    groups, _ = classify_targets(policy(), banking)
-    assert [t.deployment for t in groups["on_path"]] == ["testbed-transfer"]
+
+def test_no_change_sentences_are_read_mechanically() -> None:
+    active = policy()
+    named = {"domain": "core-banking", "must_support": ["transfer, ledger 에 롤아웃이 없다."]}
+    assert set(stated_unchanged(active, named)) == {
+        "rca-testbed-banking/testbed-transfer", "rca-testbed-banking/testbed-ledger",
+    }
+    whole_namespace = {"domain": "commerce", "description": "no rollout or restart happens in rca-testbed-banking."}
+    assert set(stated_unchanged(active, whole_namespace)) == {
+        "rca-testbed-banking/testbed-transfer", "rca-testbed-banking/testbed-ledger",
+    }
+    generic = {"domain": "commerce", "description": "Nothing else changes: no rollout, no restart."}
+    assert set(stated_unchanged(active, generic)) == {
+        "rca-testbed-commerce/testbed-inventory", "rca-testbed-commerce/testbed-order",
+        "rca-testbed-commerce/testbed-user",
+    }
+    store_only = {"domain": "commerce", "must_rule_out": ["PostgreSQL 은 스키마 변경이 없다"]}
+    assert stated_unchanged(active, store_only) == {}
+    other_scenario = {"domain": "commerce", "related_scenarios": {"contrast_with": ["order 롤아웃 없음"]}}
+    assert stated_unchanged(active, other_scenario) == {}
+
+
+def test_policy_refuses_on_path_decoys() -> None:
+    with pytest.raises(ValueError, match="fault path"):
+        policy(relation_weights={"on_path": 10, "same_domain": 50, "off_domain": 50})
 
 
 def test_schedule_is_empty_for_a_shortened_smoke_cycle_and_honours_exclusions() -> None:
@@ -256,39 +304,61 @@ APPLIED = _record(
     planned_at="2026-11-10T02:30:00Z", status="applied",
     started_at="2026-11-10T02:30:00Z", finished_at="2026-11-10T02:32:00Z",
 )
+PREFLIGHT = datetime(2026, 11, 10, 2, 40, tzinfo=timezone.utc)
+BUFFER = datetime(2026, 11, 10, 2, 38, tzinfo=timezone.utc)
 
 
-def test_alarm_from_a_finished_decoy_is_excused() -> None:
+def _partition(alerts, decoys=(APPLIED,), *, now=PREFLIGHT, buffer_start=BUFFER):
+    return partition_decoy_alarms(alerts, list(decoys), grace_sec=900, now=now, buffer_start=buffer_start)
+
+
+def test_alarm_from_a_finished_decoy_rollout_is_excused() -> None:
     alerts = [
         _alert({"alertname": "latency", "service_name": "commerce-order"}),
         _alert({"alertname": "pod", "namespace": "rca-testbed-commerce", "pod": "testbed-order-5d9-xk2"},
                active_at="2026-11-10T02:31:10.123456789Z"),
         _alert({"alertname": "x", "target_id": "uuid-order"}),
+        _alert({"alertname": "w", "namespace": "rca-testbed-commerce", "deployment": "testbed-order"}),
     ]
 
-    remaining, excused = partition_decoy_alarms(alerts, [APPLIED], grace_sec=900)
+    remaining, excused = _partition(alerts)
 
     assert remaining == []
-    assert [item["decoy_id"] for item in excused] == ["d1", "d1", "d1"]
+    assert [item["decoy_id"] for item in excused] == ["d1", "d1", "d1", "d1"]
 
 
 def test_real_residue_still_blocks() -> None:
-    """Pair of the test above: what the decoy does not explain keeps blocking."""
-    other_service = _alert({"service_name": "commerce-payment"})
-    before_decoy = _alert({"service_name": "commerce-order"}, active_at="2026-11-10T02:20:00Z")
-    long_after = _alert({"service_name": "commerce-order"}, active_at="2026-11-10T03:00:00Z")
-    same_name_other_ns = _alert({"namespace": "rca-testbed-food", "pod": "testbed-order-1"})
-    no_time = {"state": "firing", "labels": {"service_name": "commerce-order"}}
-    alerts = [other_service, before_decoy, long_after, same_name_other_ns, no_time]
+    """Pair of the test above, including the review's cases (U7-review B1, B2, M1, M2)."""
+    cases = {
+        "other service": _alert({"service_name": "commerce-payment"}),
+        "began before the decoy, even by a second": _alert(
+            {"service_name": "commerce-order"}, active_at="2026-11-10T02:29:59Z"),
+        "began long after the decoy": _alert(
+            {"service_name": "commerce-order"}, active_at="2026-11-10T02:50:00Z"),
+        "began inside the buffer": _alert(
+            {"service_name": "commerce-order"}, active_at="2026-11-10T02:38:30Z"),
+        "names the target only in a peer label": _alert(
+            {"service_name": "commerce-gateway", "peer_service": "commerce-order"}),
+        "same Deployment name in another namespace": _alert(
+            {"namespace": "rca-testbed-food", "pod": "testbed-order-1"}),
+        "no start time": {"state": "firing", "labels": {"service_name": "commerce-order"}},
+    }
+    for name, alert in cases.items():
+        remaining, excused = _partition([alert])
+        assert remaining == [alert] and excused == [], name
 
-    remaining, excused = partition_decoy_alarms(alerts, [APPLIED], grace_sec=900)
-    assert remaining == alerts and excused == []
+    # Still firing long after a harmless restart should have settled (B2).
+    late = datetime(2026, 11, 10, 2, 48, tzinfo=timezone.utc)
+    assert _partition([_alert({"service_name": "commerce-order"})], now=late)[1] == []
+
+    # A metadata-only decoy cannot cause an alarm (B1).
+    for kind in ("annotation", "configmap"):
+        quiet = APPLIED.model_copy(update={"kind": kind})
+        assert _partition([_alert({"service_name": "commerce-order"})], [quiet])[1] == [], kind
 
     for status in ("rolled_back", "failed", "rolling", "planned", "skipped"):
         unfinished = APPLIED.model_copy(update={"status": status})
-        remaining, excused = partition_decoy_alarms(
-            [_alert({"service_name": "commerce-order"})], [unfinished], grace_sec=900
-        )
+        remaining, excused = _partition([_alert({"service_name": "commerce-order"})], [unfinished])
         assert len(remaining) == 1 and excused == [], status
 
 
@@ -301,9 +371,14 @@ def test_the_testbed_registry_policy_plans_for_every_scenario() -> None:
     scenarios = json.loads((root / "scenario-metadata.json").read_text(encoding="utf-8"))["scenarios"]
 
     assert len(digest) == 64
+    # P4 not confirmed yet: the shipped policy rolls pods only by restart.
+    assert {kind for kind, weight in active.kind_weights.items() if weight > 0} == {"restart"}
     for scenario_id, scenario in scenarios.items():
+        excluded = excluded_targets(active, scenario_id, scenario)
         for seed in range(3):
-            build_schedule(
+            for record in build_schedule(
                 active, seed=seed, scenario_id=scenario_id, scenario=scenario,
                 cycle_start=CYCLE_START, buffer_start=BUFFER_START,
-            )
+            ):
+                assert record.kind == "restart"
+                assert f"{record.namespace}/{record.deployment}" not in excluded, scenario_id

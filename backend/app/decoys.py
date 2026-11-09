@@ -5,8 +5,15 @@ cause (59% of 82 cases were change-caused, only two carried an innocent
 deployment), so "blame the latest rollout" answered most cases. The cure is not
 fewer change scenarios but innocent changes that look the same: during the 2h
 normal lead-in of every cycle the runner applies a few harmless deployments at
-seeded random times, on random targets (on the fault path and off it), of
-random kinds, and of a random count (zero included).
+seeded random times, on random targets, of a random count (zero included).
+
+Two user decisions (2026-11-09) narrow that: a decoy only goes to a target
+*off* the fault path, and never to a target the answer key says did not change
+(otherwise the decoy makes that answer-key sentence false). Both are computed
+from the answer key when the schedule is drawn (``excluded_targets``), not kept
+as a hand list. Until the product records Deployment changes (plan item P4),
+the policy enables only the restart kind; the others stay in the code and are
+switched on by weight.
 
 Shape of the work, split so every rule is testable without a cluster:
 
@@ -31,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -121,6 +129,11 @@ class DecoyPolicy(_Strict):
     configmap: DecoyConfigMap
     annotation_key: str = Field(min_length=1)
     scenario_exclusions: dict[str, list[str]] = Field(default_factory=dict)
+    # How far the fault path reaches: "mentioned" = every target the answer key
+    # names anywhere in its facts (victims on the propagation path included);
+    # "scored" = only root cause, trigger and scored names. Targets the answer
+    # key says did not change are excluded under both.
+    path_scope: Literal["mentioned", "scored"] = "mentioned"
     domain_namespaces: dict[str, str]
     targets: list[DecoyTarget] = Field(min_length=1)
 
@@ -135,6 +148,9 @@ class DecoyPolicy(_Strict):
             raise ValueError("decoy policy needs both the normal and the near_fault window")
         if sum(self.kind_weights.values()) <= 0 or sum(self.relation_weights.values()) <= 0:
             raise ValueError("kind and relation weights must not be all zero")
+        if self.relation_weights.get("on_path", 0) > 0:
+            # User decision 2026-11-09: decoys stay off the fault path.
+            raise ValueError("decoys must not target the fault path (on_path weight must be 0)")
         if self.rollout_timeout_sec >= self.windows["near_fault"].end_before_buffer_sec:
             # A rollout started at the last allowed moment must be over before
             # the buffer opens, or it bleeds into the preflight window.
@@ -208,24 +224,143 @@ def _scenario_names(scenario: Mapping[str, Any]) -> set[str]:
     return names
 
 
-def classify_targets(
+# A sentence that says something did not change (rollout, deployment, change,
+# configuration). Korean and English, as the answer keys are written in both.
+NO_CHANGE = re.compile(
+    r"(롤아웃|재배포|배포|변경|릴리스)(이|은|는|가|도|과|와)?\s*(없|아니)"
+    r"|\bno (other |new )?(rollouts?|deploy\w*|changes?|configuration changes?|config changes?|restarts?)\b"
+    r"|\bwithout (a |any )?(rollouts?|deploy\w*|changes?)\b"
+    r"|\bnot a (rollout|deploy\w*|change|release)\b"
+    r"|\bnothing (else )?changes\b",
+    re.IGNORECASE,
+)
+# Fields describing *other* scenarios, not this one's facts.
+_SKIP_FIELDS = frozenset({"related_scenarios"})
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?。])\s+|\n+|[\u2460-\u2473]|;\s")
+# Components that are not decoy targets. A no-change sentence that names only
+# these says nothing about the app Deployments; one that names nothing at all
+# ("nothing else changes") is read as covering the whole scenario namespace.
+_NON_TARGET_WORDS = re.compile(
+    r"mysql|oracle|postgres|redis|kafka|nginx|mock|노드|node|네트워크|network|스키마|schema|"
+    r"인덱스|index|\bdb\b|데이터베이스|database|이미지|outbox|브로커|broker",
+    re.IGNORECASE,
+)
+
+
+def _answer_key_texts(scenario: Mapping[str, Any], path: str = ""):
+    if isinstance(scenario, str):
+        yield path, scenario
+    elif isinstance(scenario, Mapping):
+        for key, value in scenario.items():
+            if key in _SKIP_FIELDS:
+                continue
+            yield from _answer_key_texts(value, f"{path}.{key}" if path else str(key))
+    elif isinstance(scenario, list):
+        for index, value in enumerate(scenario):
+            yield from _answer_key_texts(value, f"{path}[{index}]")
+
+
+def _word(text: str, word: str) -> bool:
+    return re.search(rf"(?<![A-Za-z0-9-]){re.escape(word)}(?![A-Za-z0-9-])", text) is not None
+
+
+def mentioned_targets(
+    policy: DecoyPolicy, text: str, scenario_namespace: str | None
+) -> set[str]:
+    """Policy target keys a piece of answer-key text names.
+
+    Qualified names (service name, alias, target id) count anywhere; the bare
+    Deployment, container or short service word counts only inside the
+    scenario's own namespace, where it is unambiguous. A namespace named as a
+    whole covers all its targets."""
+    hits: set[str] = set()
+    for target in policy.targets:
+        if target.namespace in text or any(name in text for name in target.names()):
+            hits.add(target.key)
+            continue
+        if target.namespace != scenario_namespace:
+            continue
+        short = target.deployment.removeprefix("testbed-")
+        if any(_word(text, word) for word in (target.deployment, target.container, short)):
+            hits.add(target.key)
+    return hits
+
+
+def scenario_namespace(policy: DecoyPolicy, scenario: Mapping[str, Any]) -> str | None:
+    return policy.domain_namespaces.get(scenario.get("domain"))  # type: ignore[arg-type]
+
+
+def stated_unchanged(
     policy: DecoyPolicy, scenario: Mapping[str, Any]
-) -> tuple[dict[DecoyRelation, list[DecoyTarget]], set[str]]:
-    """Split the policy targets into on-path, same-domain and off-domain."""
+) -> dict[str, list[tuple[str, str]]]:
+    """Targets the answer key says did not change -> [(field, sentence)].
+
+    A decoy rollout on such a target would make the sentence false for that
+    recording, so these are never decoy targets (user decision 2026-11-09).
+    The extraction is mechanical; it errs toward excluding."""
+    namespace = scenario_namespace(policy, scenario)
+    found: dict[str, list[tuple[str, str]]] = {}
+    for field, text in _answer_key_texts(scenario):
+        for sentence in _SENTENCE_SPLIT.split(text):
+            sentence = sentence.strip()
+            if not sentence or not NO_CHANGE.search(sentence):
+                continue
+            keys = mentioned_targets(policy, sentence, namespace)
+            if not keys and namespace and not _NON_TARGET_WORDS.search(sentence):
+                keys = {t.key for t in policy.targets if t.namespace == namespace}
+            for key in keys:
+                found.setdefault(key, []).append((field, sentence))
+    return found
+
+
+def excluded_targets(
+    policy: DecoyPolicy, scenario_id: str, scenario: Mapping[str, Any]
+) -> dict[str, str]:
+    """Target key -> why it may not carry a decoy in this scenario.
+
+    In order: scored names (always the fault path), targets the answer key says
+    did not change, then (``path_scope="mentioned"``) any other target the
+    answer key names, then the policy's own per-scenario list."""
+    namespace = scenario_namespace(policy, scenario)
     names = _scenario_names(scenario)
-    domain = scenario.get("domain")
-    scenario_namespaces = {policy.domain_namespaces[domain]} if domain in policy.domain_namespaces else set()
-    groups: dict[DecoyRelation, list[DecoyTarget]] = {key: [] for key in RELATION_ORDER}
+    reasons: dict[str, str] = {}
     for target in policy.targets:
         if target.names() & names:
-            groups["on_path"].append(target)
-            scenario_namespaces.add(target.namespace)
+            reasons[target.key] = "scored"
+    for key in stated_unchanged(policy, scenario):
+        reasons.setdefault(key, "stated_unchanged")
+    if policy.path_scope == "mentioned":
+        text = "\n".join(value for _, value in _answer_key_texts(scenario))
+        for key in mentioned_targets(policy, text, namespace):
+            reasons.setdefault(key, "mentioned")
+    for key in policy.scenario_exclusions.get(scenario_id, []):
+        reasons.setdefault(key, "policy")
+    return reasons
+
+
+def _usable_kinds(policy: DecoyPolicy, target: DecoyTarget) -> dict[str, int]:
+    return {
+        kind: weight
+        for kind, weight in policy.kind_weights.items()
+        if weight > 0 and (target.rollout_ok or kind not in ROLLOUT_KINDS)
+    }
+
+
+def decoy_candidates(
+    policy: DecoyPolicy, scenario_id: str, scenario: Mapping[str, Any]
+) -> dict[DecoyRelation, list[DecoyTarget]]:
+    """Targets a decoy may use in this scenario, split by relation. Never on
+    the fault path; ``same_domain`` is an unmentioned app in the scenario's own
+    namespace, ``off_domain`` one in another namespace."""
+    namespace = scenario_namespace(policy, scenario)
+    excluded = excluded_targets(policy, scenario_id, scenario)
+    groups: dict[DecoyRelation, list[DecoyTarget]] = {key: [] for key in RELATION_ORDER}
     for target in policy.targets:
-        if target in groups["on_path"]:
+        if target.key in excluded or not _usable_kinds(policy, target):
             continue
-        relation: DecoyRelation = "same_domain" if target.namespace in scenario_namespaces else "off_domain"
+        relation: DecoyRelation = "same_domain" if target.namespace == namespace else "off_domain"
         groups[relation].append(target)
-    return groups, scenario_namespaces
+    return groups
 
 
 def _draw_times(
@@ -258,12 +393,8 @@ def build_schedule(
     if (buffer_start - cycle_start).total_seconds() < policy.min_normal_sec:
         return []
     rng = random.Random(seed)
-    groups, scenario_namespaces = classify_targets(policy, scenario)
-    excluded = set(policy.scenario_exclusions.get(scenario_id, []))
-    groups = {
-        relation: [target for target in targets if target.key not in excluded]
-        for relation, targets in groups.items()
-    }
+    groups = decoy_candidates(policy, scenario_id, scenario)
+    namespace = scenario_namespace(policy, scenario)
     min_gap = timedelta(seconds=policy.min_gap_sec)
     timed: list[tuple[datetime, DecoyWindowName]] = []
     for window_name in WINDOW_ORDER:
@@ -285,12 +416,7 @@ def build_schedule(
             break
         relation = _weighted(rng, relation_weights, RELATION_ORDER)
         target = rng.choice(sorted(groups[relation], key=lambda item: item.key))
-        kind_weights = {
-            kind: weight
-            for kind, weight in policy.kind_weights.items()
-            if target.rollout_ok or kind not in ROLLOUT_KINDS
-        }
-        kind = _weighted(rng, kind_weights, KIND_ORDER)
+        kind = _weighted(rng, _usable_kinds(policy, target), KIND_ORDER)
         token = f"{rng.getrandbits(24):06x}"
         stamp = at.strftime("%Y%m%d%H%M")
         if kind == "configmap":
@@ -298,7 +424,7 @@ def build_schedule(
                 DecoyRecord(
                     id=f"d{index}", window=window_name, planned_at=_format(at), kind=kind,
                     namespace=target.namespace,
-                    relation="same_domain" if target.namespace in scenario_namespaces else "off_domain",
+                    relation="same_domain" if target.namespace == namespace else "off_domain",
                     configmap=policy.configmap.name, value=f"{stamp}-{token}",
                 )
             )
@@ -388,21 +514,38 @@ class KubectlDecoyExecutor:
 # ---------------------------------------------------------------------------
 # Preflight: which firing alarms a decoy explains
 # ---------------------------------------------------------------------------
-def _alert_values(alert: Mapping[str, Any]) -> set[str]:
+# Label keys that name the alert's own subject. Matching any label value (for
+# instance a peer or upstream label) would let a decoy excuse another service's
+# alarm, so only these keys are read. vmalert label names on 119 were not
+# observable when this was written; a label set that uses none of them is
+# simply never excused, which keeps the gate closed (safe side).
+SERVICE_LABEL_KEYS: tuple[str, ...] = ("service_name", "service", "otel_service_name")
+TARGET_LABEL_KEYS: tuple[str, ...] = ("target_id", "targetId", "lucida_target_id")
+WORKLOAD_LABEL_KEYS: tuple[str, ...] = ("deployment", "workload")
+POD_LABEL_KEYS: tuple[str, ...] = ("pod", "pod_name")
+NAMESPACE_LABEL_KEYS: tuple[str, ...] = ("namespace", "k8s_namespace")
+
+
+def _label(labels: Mapping[str, Any], keys: Sequence[str]) -> str | None:
+    for key in keys:
+        value = labels.get(key)
+        if value is not None and str(value):
+            return str(value)
+    return None
+
+
+def _alert_matches(alert: Mapping[str, Any], record: DecoyRecord) -> bool:
     labels = alert.get("labels") or {}
-    return {str(value) for value in labels.values() if value is not None}
-
-
-def _alert_matches(values: set[str], record: DecoyRecord) -> bool:
-    if record.service_name and record.service_name in values:
+    if record.service_name and _label(labels, SERVICE_LABEL_KEYS) == record.service_name:
         return True
-    if record.target_id and record.target_id in values:
+    if record.target_id and _label(labels, TARGET_LABEL_KEYS) == record.target_id:
         return True
-    if record.deployment is None or record.namespace not in values:
+    if record.deployment is None or _label(labels, NAMESPACE_LABEL_KEYS) != record.namespace:
         return False
-    return any(
-        value == record.deployment or value.startswith(f"{record.deployment}-") for value in values
-    )
+    if _label(labels, WORKLOAD_LABEL_KEYS) == record.deployment:
+        return True
+    pod = _label(labels, POD_LABEL_KEYS)
+    return pod is not None and pod.startswith(f"{record.deployment}-")
 
 
 def _alert_started(alert: Mapping[str, Any]) -> datetime | None:
@@ -426,34 +569,46 @@ def partition_decoy_alarms(
     decoys: Iterable[DecoyRecord],
     *,
     grace_sec: int,
+    now: datetime | None = None,
+    buffer_start: datetime | None = None,
 ) -> tuple[list[Mapping[str, Any]], list[dict[str, Any]]]:
     """Split firing alerts into (still blocking, explained by a decoy).
 
-    An alert is explained only when all hold, otherwise it keeps blocking:
-    - it names the decoy's target (service name, target id, or the Deployment
-      or one of its pods together with the namespace);
-    - the decoy actually finished healthy (``applied``): a decoy that failed,
-      was rolled back or never ran explains nothing;
-    - the alert began inside [decoy start - 60s, decoy finish + grace]. An alert
-      that was already firing before the decoy, or began long after it, is not
-      the decoy's.
+    ``now`` is the preflight time (the wall clock when omitted; the queue always
+    passes it). An alert is explained only when all hold, otherwise it blocks:
+    - the decoy rolled pods (restart kinds) and finished healthy (``applied``).
+      A metadata-only decoy cannot cause an alarm, and a failed, undone or
+      unfinished one explains nothing;
+    - the alert names the decoy's target through its own subject labels
+      (service name, target id, or namespace with Deployment or pod);
+    - it began no earlier than the decoy and no later than the decoy's finish
+      plus ``grace_sec``, and before the buffer opened (the buffer is the clean
+      window the gate vouches for);
+    - the preflight runs within ``grace_sec`` of the decoy's finish. A harmless
+      restart settles in minutes; an alarm on its target still firing after
+      that is residue, whatever started it.
     """
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     applied = [
         record for record in decoys
-        if record.status == "applied" and record.started_at and record.finished_at
-        and (record.deployment or record.service_name)
+        if record.kind in ROLLOUT_KINDS and record.status == "applied"
+        and record.started_at and record.finished_at and record.deployment
     ]
     remaining: list[Mapping[str, Any]] = []
     excused: list[dict[str, Any]] = []
     for alert in alerts:
-        values = _alert_values(alert)
         started = _alert_started(alert)
         owner = None
         if started is not None:
             for record in applied:
-                low = _parse(record.started_at) - timedelta(seconds=60)
-                high = _parse(record.finished_at) + timedelta(seconds=grace_sec)
-                if low <= started <= high and _alert_matches(values, record):
+                finished = _parse(record.finished_at)
+                low = _parse(record.started_at)
+                high = finished + timedelta(seconds=grace_sec)
+                if buffer_start is not None:
+                    high = min(high, buffer_start)
+                if now > finished + timedelta(seconds=grace_sec):
+                    continue
+                if low <= started <= high and _alert_matches(alert, record):
                     owner = record
                     break
         if owner is None:
@@ -486,3 +641,62 @@ def decoy_document(
         "cycle_start": cycle_start,
         "decoys": [record.model_dump(mode="json") for record in records],
     }
+
+
+# ---------------------------------------------------------------------------
+# Report: how many decoy targets each scenario keeps (for people, not the queue)
+# ---------------------------------------------------------------------------
+def candidate_report(
+    policy: DecoyPolicy, scenarios: Mapping[str, Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    rows = []
+    for scenario_id in sorted(scenarios):
+        scenario = scenarios[scenario_id]
+        groups = decoy_candidates(policy, scenario_id, scenario)
+        reasons = excluded_targets(policy, scenario_id, scenario)
+        unchanged = stated_unchanged(policy, scenario)
+        rows.append(
+            {
+                "scenario_id": scenario_id,
+                "domain": scenario.get("domain"),
+                "same_domain": [t.key for t in groups["same_domain"]],
+                "off_domain": [t.key for t in groups["off_domain"]],
+                "excluded": reasons,
+                "unchanged_sentences": {
+                    key: sorted(set(items)) for key, items in sorted(unchanged.items())
+                },
+            }
+        )
+    return rows
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="decoy candidate report (markdown)")
+    parser.add_argument("policy", type=Path)
+    parser.add_argument("metadata", type=Path)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    policy, digest = load_decoy_policy(args.policy)
+    scenarios = json.loads(args.metadata.read_text(encoding="utf-8"))["scenarios"]
+    rows = candidate_report(policy, scenarios)
+    if args.json:
+        print(json.dumps({"policy_sha256": digest, "rows": rows}, ensure_ascii=False, indent=1))
+        return 0
+    print(f"policy_sha256 {digest}\n")
+    print("| 시나리오 | 도메인 | 후보 계 | 같은 도메인 | 다른 도메인 | 제외(채점, 언급, 변경 없음 문장) |")
+    print("|---|---|---|---|---|---|")
+    for row in rows:
+        counts = {kind: sum(1 for why in row["excluded"].values() if why == kind)
+                  for kind in ("scored", "mentioned", "stated_unchanged", "policy")}
+        total = len(row["same_domain"]) + len(row["off_domain"])
+        print(
+            f"| {row['scenario_id']} | {row['domain']} | {total} | {len(row['same_domain'])} | "
+            f"{len(row['off_domain'])} | {counts['scored']}, {counts['mentioned']}, {counts['stated_unchanged']} |"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

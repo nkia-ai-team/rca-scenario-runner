@@ -132,8 +132,9 @@ class PreflightVerdict(StrictModel):
     def to_meta(self) -> dict[str, object]:
         """Exactly the ``--preflight-json`` document capture-eval-case.sh reads.
 
-        ``excused_alarms`` is added only when decoys were in play, so a record
-        from a runner without decoys keeps its exact former shape."""
+        ``excused_alarms`` is added only when the runner had decoys on for the
+        cycle (an empty list when nothing was excused or no decoy was drawn), so
+        a record from a runner without decoys keeps its exact former shape."""
         document: dict[str, object] = {
             "window": [self.window[0], self.window[1]],
             "verdict": self.verdict,

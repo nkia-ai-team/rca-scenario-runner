@@ -797,9 +797,11 @@ class FakeDecoyExecutor:
         self.undone.append(record.id)
 
 
-def _decoy_queue(tmp_path: Path, monkeypatch=None, *, seed=None, probe=None, executor=None):
+def _decoy_queue(
+    tmp_path: Path, monkeypatch=None, *, seed=None, probe=None, executor=None, **policy_overrides
+):
     policy_path = tmp_path / "decoy-deployments.json"
-    policy_path.write_text(json.dumps(policy_document()), encoding="utf-8")
+    policy_path.write_text(json.dumps(policy_document(**policy_overrides)), encoding="utf-8")
     if seed is not None:
         monkeypatch.setattr("app.live_queue.cycle_seed", lambda *args: seed)
     executor = executor or FakeDecoyExecutor()
@@ -968,22 +970,29 @@ def _decoy_alarm(record, *, service=None):
     }
 
 
-async def _to_buffer_end_with_applied_decoy(tmp_path, monkeypatch, probe):
+# The excuse holds only while the preflight runs within the grace of the decoy's
+# finish. A near-fault decoy finishes at least ~22 minutes before the preflight,
+# so the excuse path is exercised with a policy grace of 40 minutes; the shipped
+# 15 minutes is checked by the test that a lingering decoy alarm blocks.
+WIDE_GRACE = 2400
+
+
+async def _to_buffer_end_with_applied_decoy(tmp_path, monkeypatch, probe, *, grace=WIDE_GRACE):
     seed = _seed_with(
         lambda records: any(
             r.kind in {"restart", "config_rollout"} and r.window == "near_fault" for r in records
         )
     )
     queue, runner, scheduler, clock, executor, _ = _decoy_queue(
-        tmp_path, monkeypatch, seed=seed, probe=probe
+        tmp_path, monkeypatch, seed=seed, probe=probe, alarm_excuse_grace_sec=grace
     )
     await queue.start()
     await queue.tick()
     state = await _walk_normal(queue, clock)
     assert state.phase == "cycle_buffer"
-    decoy = next(
+    decoy = [
         r for r in state.cycle_decoys if r.kind in {"restart", "config_rollout"} and r.window == "near_fault"
-    )
+    ][-1]
     clock.value = state_expected(state)
     return queue, runner, state, decoy, clock
 
@@ -1056,3 +1065,65 @@ async def test_sweep_does_not_close_incidents_beside_a_real_alarm(tmp_path: Path
 
     assert closed == []
     assert state.phase == "cycle_reset"
+
+
+@pytest.mark.asyncio
+async def test_a_decoy_alarm_still_firing_after_the_grace_blocks(tmp_path: Path, monkeypatch) -> None:
+    """U7-review B2: with the shipped 15-minute grace, an alarm on the decoy's
+    target that is still firing at the preflight (over 20 minutes after any
+    near-fault decoy finished) is residue, not an excuse."""
+    probe = DecoyAwareProbe()
+    queue, runner, _, decoy, _ = await _to_buffer_end_with_applied_decoy(
+        tmp_path, monkeypatch, probe, grace=900
+    )
+    probe.alerts = [_decoy_alarm(decoy)]
+
+    state = await queue.tick()
+
+    assert state.phase == "cycle_reset"
+    assert runner.started == []
+
+
+@pytest.mark.asyncio
+async def test_a_rollback_still_rolling_at_buffer_end_restarts_the_cycle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """U7-review: a decoy undone at the buffer starts a rollback nobody waited
+    for. If it is still rolling when the buffer ends, the window is not clean."""
+    seed = _seed_with(
+        lambda records: bool(records) and records[-1].kind in {"restart", "config_rollout"}
+    )
+    executor = FakeDecoyExecutor(never_done={f"d{n}" for n in range(1, 10)})
+    queue, runner, _, clock, _, _ = _decoy_queue(
+        tmp_path, monkeypatch, seed=seed, probe=DecoyAwareProbe(), executor=executor
+    )
+    await queue.start()
+    state = await queue.tick()
+    last = state.cycle_decoys[-1]
+    clock.value = _parse(last.planned_at)
+    await queue.tick()  # last decoy starts rolling and never becomes healthy
+    clock.value = state_expected(queue.snapshot())
+    state = await queue.tick()  # -> buffer: one last check, then undo
+    assert state.phase == "cycle_buffer"
+    assert state.cycle_decoys[-1].status == "rolled_back"
+
+    clock.value = state_expected(state)
+    state = await queue.tick()
+
+    assert state.phase == "cycle_reset"
+    assert "rollback still rolling" in state.reason
+    assert runner.started == []
+
+
+@pytest.mark.asyncio
+async def test_decoys_on_with_zero_drawn_still_records_an_empty_excuse_list(
+    tmp_path: Path, monkeypatch
+) -> None:
+    seed = _seed_with(lambda records: records == [])
+    probe = DecoyAwareProbe()
+    queue, runner, _, clock, _, _ = _decoy_queue(tmp_path, monkeypatch, seed=seed, probe=probe)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+
+    run_dir = runner.artifact_store.root / state.current_run_id
+    assert json.loads((run_dir / "decoys.json").read_text())["decoys"] == []
+    assert json.loads((run_dir / "preflight.json").read_text())["excused_alarms"] == []
