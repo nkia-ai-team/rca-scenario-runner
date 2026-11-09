@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Awaitable, Callable
@@ -77,7 +78,13 @@ class TopologyCollector:
         self._snapshots: list[dict] = []
         self._failures: list[dict] = []
         self._task: asyncio.Task | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._stopped = False
+        # collect_once runs on a worker thread (its fetches are blocking HTTP
+        # with 10s + 20s timeouts). The guard makes stop() a hard line: once it
+        # returns, a fetch still in flight cannot write into the bundle dir,
+        # which a restarted cycle wipes and reuses.
+        self._guard = threading.Lock()
 
     def set_run_id(self, run_id: str) -> None:
         """Bind the injection run (known only once buffer ends). Persisted on the
@@ -92,31 +99,50 @@ class TopologyCollector:
         stamp = captured_at.replace(":", "-")
         snapshot: dict = {"snapshot_id": captured_at, "captured_at": captured_at}
 
-        graph = self._capture_part(
-            self.graph_url,
-            rel_path=f"graph/{stamp}-part-001.json",
-            captured_at=captured_at,
-            graph_part=True,
-        )
-        snapshot["graph"] = [graph] if graph is not None else []
+        # Fetch first (slow, network), then record under the guard (fast, local).
+        graph_fetched = self._fetch_part(self.graph_url)
+        tree_fetched = self._fetch_part(self.tree_url)
+        with self._guard:
+            if self._stopped:
+                return
+            graph = self._capture_part(
+                self.graph_url,
+                graph_fetched,
+                rel_path=f"graph/{stamp}-part-001.json",
+                captured_at=captured_at,
+                graph_part=True,
+            )
+            snapshot["graph"] = [graph] if graph is not None else []
 
-        tree = self._capture_part(
-            self.tree_url,
-            rel_path=f"service-tree/{stamp}.json",
-            captured_at=captured_at,
-            graph_part=False,
-        )
-        snapshot["service_tree"] = tree
+            tree = self._capture_part(
+                self.tree_url,
+                tree_fetched,
+                rel_path=f"service-tree/{stamp}.json",
+                captured_at=captured_at,
+                graph_part=False,
+            )
+            snapshot["service_tree"] = tree
 
-        self._snapshots.append(snapshot)
-        self._write_manifest()
+            self._snapshots.append(snapshot)
+            self._write_manifest()
+
+    def _fetch_part(self, url: str) -> "tuple[int, bytes] | Exception":
+        try:
+            return self._fetch(url)
+        except Exception as error:  # recorded as a blank by _capture_part
+            return error
 
     def _capture_part(
-        self, url: str, *, rel_path: str, captured_at: str, graph_part: bool
+        self,
+        url: str,
+        fetched: "tuple[int, bytes] | Exception",
+        *,
+        rel_path: str,
+        captured_at: str,
+        graph_part: bool,
     ) -> dict | None:
-        try:
-            status, body = self._fetch(url)
-        except Exception as error:  # transport failure — record the blank
+        if isinstance(fetched, Exception):  # transport failure — record the blank
+            error = fetched
             self._failures.append(
                 {
                     "attempted_at": captured_at,
@@ -126,6 +152,7 @@ class TopologyCollector:
                 }
             )
             return None
+        status, body = fetched
         if not (200 <= int(status) < 300):
             self._failures.append(
                 {
@@ -173,7 +200,11 @@ class TopologyCollector:
     async def run(self) -> None:
         while not self._stopped:
             try:
-                self.collect_once()
+                # Off the loop: inline, a slow 119 query API held the runner's
+                # event loop for up to 50s per tick, all through injection.
+                await asyncio.to_thread(self.collect_once)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 # collect_once already records fetch failures; this only guards
                 # against unexpected local errors so the loop cannot die.
@@ -181,16 +212,28 @@ class TopologyCollector:
             await self._sleeper(self.interval_sec)
 
     def start(self) -> None:
+        """Start the periodic loop. Must be called on the event loop thread."""
         if self._task is None or self._task.done():
+            self._loop = asyncio.get_running_loop()
             self._task = asyncio.create_task(self.run())
 
     def stop(self) -> None:
-        """Signal the loop to end and cancel the task. Sync so cycle ticks (which
-        are not async) can stop the collector without awaiting."""
-        self._stopped = True
-        if self._task is not None:
-            self._task.cancel()
-            self._task = None
+        """Signal the loop to end and cancel the task. Sync and callable from
+        any thread: cycle ticks run on worker threads."""
+        with self._guard:
+            self._stopped = True
+        task, loop = self._task, self._loop
+        self._task = None
+        if task is None:
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or running is loop:
+            task.cancel()
+        elif not loop.is_closed():
+            loop.call_soon_threadsafe(task.cancel)
 
 
 def _truncated_flag(body: bytes) -> bool | None:

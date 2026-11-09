@@ -3,6 +3,7 @@ import inspect
 import json
 import os
 import re
+import threading
 import uuid
 from collections import deque
 from contextlib import suppress
@@ -55,6 +56,51 @@ Sleeper = Callable[[float], Awaitable[None]]
 
 class Clock(Protocol):
     def now(self) -> datetime: ...
+
+
+class LeaseHeartbeat:
+    """Renew a run's coordinator lease from a dedicated thread.
+
+    The renewal used to be an asyncio task that hopped to the shared default
+    thread pool. Anything that held the event loop (a synchronous HTTP fetch,
+    an ssh golden restore, a watchdog cleanup) or filled that pool (readiness
+    self-checks of up to 120s each) stopped the renewals, the 30s lease
+    expired, and the run died on fencing rejection with its injection still in
+    place (F63-R-run-17139f4c, 2026-10-26: DIRTY right after injection).
+
+    A thread of its own renews as long as the process lives and the run is in
+    flight, so neither the loop nor the pool can starve it. A dead process
+    still stops renewing, which is what the lease exists to detect.
+    """
+
+    def __init__(self, renew: Callable[[], object], *, interval_sec: float, name: str) -> None:
+        self._renew = renew
+        self.interval_sec = interval_sec
+        self.error: BaseException | None = None
+        self.beats = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_sec):
+            try:
+                self._renew()
+            except BaseException as error:  # noqa: BLE001 - reported to the run
+                self.error = error
+                return
+            self.beats += 1
+
+    def signal_stop(self) -> None:
+        self._stop.set()
+
+    async def stop(self) -> None:
+        """Stop renewing and wait for an in-flight renewal to settle."""
+        self._stop.set()
+        if self._thread.is_alive():
+            await asyncio.to_thread(self._thread.join, max(1.0, self.interval_sec * 2))
 
 
 def execution_environment() -> dict[str, str]:
@@ -128,6 +174,7 @@ class ScenarioRunner:
             self.artifact_store.root,
             clock=self.clock,
             heartbeat_timeout_sec=self.lease_sec,
+            live_owner=self._owns_live_lease,
         )
 
         self._lock = asyncio.Lock()
@@ -137,6 +184,10 @@ class ScenarioRunner:
         self._task: Optional[asyncio.Task] = None
         self._capture_task: Optional[asyncio.Task] = None
         self._watchdog_task: Optional[asyncio.Task] = None
+        # Set while start() prepares a run off the event loop, so a second
+        # start cannot slip in during that await.
+        self._starting = False
+        self._heartbeat: LeaseHeartbeat | None = None
 
     @property
     def is_busy(self) -> bool:
@@ -144,6 +195,30 @@ class ScenarioRunner:
             "running",
             "cleanup_running",
         }
+
+    def _owns_live_lease(self, run_id: str, fencing_token: int) -> bool:
+        """True while the run holding this lease is still executing here.
+
+        The in-process watchdog exists to recover a lease whose owner died. A
+        run still executing in this very process is not dead: its own
+        controller has timeouts and its own cleanup path. Claiming from under it
+        only makes the two fight over fencing and leaves the testbed DIRTY.
+        """
+        current = self._current
+        task = self._task
+        heartbeat = self._heartbeat
+        return (
+            current is not None
+            and task is not None
+            and not task.done()
+            and current.status in {"running", "cleanup_running"}
+            and current.run_id == run_id
+            and current.fencing_token == fencing_token
+            # A renewal that failed outright leaves the lease to expire for
+            # real; the watchdog keeps its job there.
+            and heartbeat is not None
+            and heartbeat.error is None
+        )
 
     def get_current(self) -> Optional[RunInfo]:
         if self._current is None:
@@ -265,7 +340,7 @@ class ScenarioRunner:
                     scenario, repair_capsule=repair_capsule
                 )
 
-        if self._lock.locked() or self.is_busy:
+        if self._lock.locked() or self.is_busy or self._starting:
             raise RuntimeError("Another scenario is already running")
 
         if mode == "run" and external_manifest is not None:
@@ -297,12 +372,19 @@ class ScenarioRunner:
                 "logical_profile_id": logical_profile,
                 "companion_profiles": scenario.injection.get("companion_profile_ids", []),
             }
-            run_dir, prepared_plan = self.artifact_store.prepare_capsule(
-                run_id,
-                contract_root=self.dispatcher_path.parent,
-                scenario_slug=scenario.injection["catalog_slug"],
-                binding=binding,
-            )
+            # Copying, hashing and compiling the capsule shells out to the
+            # dispatcher; keep it off the event loop that serves the API.
+            self._starting = True
+            try:
+                run_dir, prepared_plan = await asyncio.to_thread(
+                    self.artifact_store.prepare_capsule,
+                    run_id,
+                    contract_root=self.dispatcher_path.parent,
+                    scenario_slug=scenario.injection["catalog_slug"],
+                    binding=binding,
+                )
+            finally:
+                self._starting = False
             if prepared_plan["scenario"]["id"] != scenario.id:
                 raise RuntimeError("compiled capsule plan scenario id does not match manifest")
         manual_dirty_cleanup = False
@@ -398,12 +480,13 @@ class ScenarioRunner:
                 skip_isolation_checks=skip_isolation_checks,
             )
         )
+        self._task.add_done_callback(self._stop_heartbeat_on_exit)
         return self.get_current()  # type: ignore[return-value]
 
     async def _start_external_dirty_cleanup(
         self, scenario, *, repair_capsule: bool = False
     ) -> RunInfo:
-        if self._lock.locked() or self.is_busy:
+        if self._lock.locked() or self.is_busy or self._starting:
             raise RuntimeError("Another scenario is already running")
         dirty = self.coordinator.snapshot().dirty_run
         if dirty is None:
@@ -580,11 +663,23 @@ class ScenarioRunner:
         log_file_path = self.log_path(run_id)
 
         async with self._lock:
-            heartbeat_task = None
+            heartbeat = None
             if not manual_dirty_cleanup:
-                heartbeat_task = asyncio.create_task(
-                    self._heartbeat_loop(lease_run_id, fencing_token)
+                heartbeat = LeaseHeartbeat(
+                    lambda: self.coordinator.heartbeat(
+                        run_id=lease_run_id,
+                        fencing_token=fencing_token,
+                        now=self.clock.now(),
+                        lease_sec=self.lease_sec,
+                    ),
+                    interval_sec=self.heartbeat_interval_sec,
+                    name=f"lease-heartbeat-{lease_run_id}",
                 )
+                # Stopped explicitly below; the task done-callback is the
+                # backstop for cancellation, so a lease can never be renewed by
+                # a run that no longer exists.
+                self._heartbeat = heartbeat
+                heartbeat.start()
             with log_file_path.open("w", encoding="utf-8") as log_file:
                 controller_session = None
                 injection = getattr(scenario, "injection", None)
@@ -610,23 +705,13 @@ class ScenarioRunner:
                         execution, script_path, scenario_id, mode, log_file
                     )
                 heartbeat_failed = False
-                if heartbeat_task is not None and heartbeat_task.done():
-                    heartbeat_error = heartbeat_task.exception()
-                    if heartbeat_error is not None:
+                if heartbeat is not None:
+                    await heartbeat.stop()
+                    if heartbeat.error is not None:
                         heartbeat_failed = True
-                        self._append_log(f"[ERROR] Coordinator heartbeat failed: {heartbeat_error}")
-                if heartbeat_task is not None:
-                    heartbeat_task.cancel()
-                    try:
-                        await heartbeat_task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as heartbeat_error:  # noqa: BLE001 - lease boundary
-                        if not heartbeat_failed:
-                            heartbeat_failed = True
-                            self._append_log(
-                                f"[ERROR] Coordinator heartbeat failed: {heartbeat_error}"
-                            )
+                        self._append_log(
+                            f"[ERROR] Coordinator heartbeat failed: {heartbeat.error}"
+                        )
 
                 clean = False
                 dirty = False
@@ -790,7 +875,10 @@ class ScenarioRunner:
                     clock=self.clock,
                 )
             else:
-                runtime = production_runtime(
+                # Verifying the capsule hashes every contract file and the probe
+                # set is assembled from files; do it off the loop.
+                runtime = await asyncio.to_thread(
+                    production_runtime,
                     scenario=scenario,
                     run_id=run_id,
                     fencing_token=fencing_token,
@@ -1019,16 +1107,10 @@ class ScenarioRunner:
             await self._watchdog_task
         self._watchdog_task = None
 
-    async def _heartbeat_loop(self, run_id: str, fencing_token: int) -> None:
-        while True:
-            await self.sleeper(self.heartbeat_interval_sec)
-            await asyncio.to_thread(
-                self.coordinator.heartbeat,
-                run_id=run_id,
-                fencing_token=fencing_token,
-                now=self.clock.now(),
-                lease_sec=self.lease_sec,
-            )
+    def _stop_heartbeat_on_exit(self, _task: asyncio.Task) -> None:
+        heartbeat, self._heartbeat = self._heartbeat, None
+        if heartbeat is not None:
+            heartbeat.signal_stop()
 
     async def _recovery_verified(self, scenario: object) -> bool:
         if self.recovery_validator is None:

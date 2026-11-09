@@ -149,3 +149,58 @@ async def test_cleanup_failure_or_plan_drift_marks_dirty_and_blocks_restart(tmp_
     dirty = coordinator.snapshot().dirty_run
     assert dirty and dirty.run_id == lease.run_id and dirty.reason == "plan digest drift"
     assert (await WatchdogService(coordinator, tmp_path / "runs", clock=Clock()).tick()).action == "block_dirty"
+
+
+async def test_watchdog_cleanup_runs_off_the_event_loop(tmp_path) -> None:
+    """U1: the watchdog's claim and profile cleanup (subprocess, up to the 420s
+    cleanup wait) ran inline on the runner's event loop, freezing the API and
+    every other task for as long as the cleanup took."""
+    import asyncio
+    import time
+
+    coordinator, _ = setup_expired(tmp_path)
+
+    class SlowApplier:
+        def cleanup(self, request):
+            time.sleep(0.5)
+            return SimpleNamespace(succeeded=True, reason=None)
+
+    service = WatchdogService(
+        coordinator,
+        tmp_path / "runs",
+        clock=Clock(),
+        applier_factory=lambda *args, **kwargs: SlowApplier(),
+    )
+    beats = 0
+
+    async def ticker() -> None:
+        nonlocal beats
+        while True:
+            await asyncio.sleep(0.02)
+            beats += 1
+
+    task = asyncio.create_task(ticker())
+    try:
+        decision = await service.tick()
+    finally:
+        task.cancel()
+    assert decision.reason == "watchdog_cleanup_recovered"
+    assert beats >= 10, f"event loop was held during watchdog cleanup (beats={beats})"
+
+
+async def test_watchdog_leaves_a_lease_alone_while_its_owner_runs_here(tmp_path) -> None:
+    coordinator, lease = setup_expired(tmp_path)
+    service = WatchdogService(
+        coordinator,
+        tmp_path / "runs",
+        clock=Clock(),
+        applier_factory=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError()),
+        live_owner=lambda run_id, token: (run_id, token) == (lease.run_id, lease.fencing_token),
+    )
+
+    decision = await service.tick()
+
+    assert decision.action == "healthy"
+    assert decision.reason == "lease_owner_running_in_process"
+    assert coordinator.snapshot().cleanup_claim is None
+    assert coordinator.snapshot().active_lease is not None

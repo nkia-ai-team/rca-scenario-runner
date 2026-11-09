@@ -129,3 +129,57 @@ def test_non_2xx_status_is_a_recorded_failure(tmp_path: Path) -> None:
     assert "topology/graph" in failure["request_url"]
     # No graph file persisted for a non-2xx response.
     assert not (tmp_path / "bundle" / "graph").exists()
+
+
+async def test_collection_runs_off_the_event_loop(tmp_path: Path) -> None:
+    """U1: collect_once does two blocking HTTP fetches (10s login + 20s fetch
+    timeouts each) against the 119 query API. Inline, a slow API held the
+    runner's event loop through every tick of the cycle, injection included."""
+    import asyncio
+    import time
+
+    def slow_fetch(url: str):
+        time.sleep(0.25)
+        return 200, b'{"ok": true}'
+
+    collector = TopologyCollector(
+        bundle_dir=tmp_path / "bundle", fetch=slow_fetch, clock=FakeClock(), interval_sec=60
+    )
+    beats = 0
+
+    async def ticker() -> None:
+        nonlocal beats
+        while True:
+            await asyncio.sleep(0.02)
+            beats += 1
+
+    task = asyncio.create_task(ticker())
+    collector.start()
+    await asyncio.sleep(0.7)
+    collector.stop()
+    task.cancel()
+    assert beats >= 20, f"event loop was held during topology fetches (beats={beats})"
+    assert len(json.loads((tmp_path / "bundle" / "manifest.json").read_text())["snapshots"]) == 1
+
+
+async def test_stop_during_an_in_flight_fetch_writes_nothing_after(tmp_path: Path) -> None:
+    """A restarted cycle wipes and reuses the bundle dir; a fetch that finishes
+    after stop() must not drop files the new manifest cannot cover."""
+    import asyncio
+    import threading
+
+    release = threading.Event()
+
+    def blocked_fetch(url: str):
+        release.wait(2)
+        return 200, b'{"ok": true}'
+
+    collector = TopologyCollector(
+        bundle_dir=tmp_path / "bundle", fetch=blocked_fetch, clock=FakeClock(), interval_sec=60
+    )
+    collector.start()
+    await asyncio.sleep(0.05)  # the first fetch is in flight on a worker thread
+    collector.stop()
+    release.set()
+    await asyncio.sleep(0.1)
+    assert not (tmp_path / "bundle").exists()

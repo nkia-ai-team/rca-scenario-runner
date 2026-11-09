@@ -328,6 +328,138 @@ async def test_runner_heartbeats_persistent_lease_while_process_runs(
     assert coordinator.snapshot().active_lease is None
 
 
+def _heartbeat_age(coordinator: GlobalCoordinator) -> float:
+    lease = coordinator.snapshot().active_lease
+    assert lease is not None
+    return (datetime.now(timezone.utc) - lease.heartbeat_at).total_seconds()
+
+
+async def test_lease_keeps_renewing_while_the_event_loop_is_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U1: a synchronous call holding the loop longer than the lease used to
+    stop renewals, so the watchdog fenced the live run out (F63-R-run-17139f4c,
+    2026-10-26: DIRTY right after injection). The renewal runs on its own
+    thread now, so the lease stays current while the loop is held."""
+    import time
+
+    script = tmp_path / "scenario.sh"
+    script.write_text("#!/bin/sh\nsleep 2\n", encoding="utf-8")
+    scenario = _runner_scenario(script)
+    monkeypatch.setattr("app.runner.get_scenario", lambda _: scenario)
+    coordinator = GlobalCoordinator(tmp_path / "state.json")
+    runner = ScenarioRunner(
+        tmp_path, tmp_path / "logs", coordinator=coordinator,
+        lease_sec=1, heartbeat_interval_sec=0.05,
+    )
+    await runner.start(scenario.id, "run")
+    await asyncio.sleep(0.1)
+
+    time.sleep(1.5)  # hold the event loop well past the 1s lease
+
+    assert _heartbeat_age(coordinator) < 0.5
+    decision = decide_watchdog(
+        coordinator.snapshot(), now=datetime.now(timezone.utc), heartbeat_timeout_sec=1
+    )
+    assert decision.action == "healthy"
+    assert runner._task is not None
+    await runner._task
+    finished = runner.get_current()
+    assert finished is not None and finished.status == "succeeded" and finished.dirty is False
+
+
+async def test_lease_keeps_renewing_while_the_default_thread_pool_is_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U1: renewals used to queue behind whatever filled asyncio's default pool
+    (readiness self-checks of up to 120s each, probes, captures)."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    loop = asyncio.get_running_loop()
+    pool = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(pool)
+    script = tmp_path / "scenario.sh"
+    script.write_text("#!/bin/sh\nsleep 2\n", encoding="utf-8")
+    scenario = _runner_scenario(script)
+    monkeypatch.setattr("app.runner.get_scenario", lambda _: scenario)
+    coordinator = GlobalCoordinator(tmp_path / "state.json")
+    runner = ScenarioRunner(
+        tmp_path, tmp_path / "logs", coordinator=coordinator,
+        lease_sec=1, heartbeat_interval_sec=0.05,
+    )
+    await runner.start(scenario.id, "run")
+    hog = loop.run_in_executor(None, time.sleep, 1.6)  # the only pool worker
+
+    await asyncio.sleep(1.4)
+
+    assert _heartbeat_age(coordinator) < 0.5
+    await hog
+    assert runner._task is not None
+    await runner._task
+    pool.shutdown(wait=False)
+    finished = runner.get_current()
+    assert finished is not None and finished.status == "succeeded" and finished.dirty is False
+
+
+async def test_watchdog_does_not_reclaim_a_lease_whose_run_is_live_here(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U1: an expired heartbeat on a run still executing in this process means
+    the renewal was held up, not that the owner died. Claiming it fenced the
+    live run out mid-injection and left the testbed DIRTY."""
+    script = tmp_path / "scenario.sh"
+    script.write_text("#!/bin/sh\nsleep 1.5\n", encoding="utf-8")
+    scenario = _runner_scenario(script)
+    monkeypatch.setattr("app.runner.get_scenario", lambda _: scenario)
+    coordinator = GlobalCoordinator(tmp_path / "state.json")
+    runner = ScenarioRunner(
+        tmp_path, tmp_path / "logs", coordinator=coordinator,
+        lease_sec=1, heartbeat_interval_sec=30,  # renewals effectively stalled
+    )
+    started = await runner.start(scenario.id, "run")
+    await asyncio.sleep(1.1)
+    stale = decide_watchdog(
+        coordinator.snapshot(), now=datetime.now(timezone.utc), heartbeat_timeout_sec=1
+    )
+    assert stale.action == "claim_cleanup"
+
+    decision = await runner.watchdog_service.tick()
+
+    assert decision.action == "healthy"
+    assert decision.reason == "lease_owner_running_in_process"
+    assert decision.run_id == started.run_id
+    assert coordinator.snapshot().cleanup_claim is None
+    assert runner._task is not None
+    await runner._task
+    assert coordinator.snapshot().active_lease is None
+
+
+async def test_watchdog_still_reclaims_a_lease_no_live_run_here_owns(
+    tmp_path: Path,
+) -> None:
+    """The exemption is only for a live in-process owner. A lease left by a
+    previous process (or a finished run) is still claimed."""
+    coordinator = GlobalCoordinator(tmp_path / "state.json")
+    from app.production_runtime import RunArtifactStore
+
+    runner = ScenarioRunner(
+        tmp_path, tmp_path / "logs", coordinator=coordinator, lease_sec=1,
+        artifact_store=RunArtifactStore(tmp_path / "runs"),
+    )
+    coordinator.acquire(
+        run_id="orphan-run", scenario_id="F07-H",
+        now=datetime.now(timezone.utc) - timedelta(minutes=5), lease_sec=1,
+    )
+    assert runner._owns_live_lease("orphan-run", 1) is False
+
+    decision = await runner.watchdog_service.tick()
+
+    # Claimed (then failed closed: the orphan has no capsule in this tmp dir).
+    assert decision.action == "block_dirty"
+    assert coordinator.snapshot().dirty_run is not None
+
+
 async def test_two_runners_race_for_one_persistent_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
