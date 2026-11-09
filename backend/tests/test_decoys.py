@@ -525,10 +525,50 @@ def test_a_short_word_names_another_domain_only_when_that_domain_is_named() -> N
     assert reasons["rca-testbed-commerce/testbed-gateway"] == "scored_item"
     assert "rca-testbed-food/testbed-order" not in reasons
     assert "rca-testbed-food/testbed-payment" not in reasons
+    # A unique name (게이트웨이, gateway) is not ambiguous: it counts even when
+    # nothing else names commerce (U7b review M1).
     unnamed = {**banking, "description": "the load generator calls transfer directly."}
-    assert "rca-testbed-commerce/testbed-gateway" not in excluded_targets(active, "X", unnamed)
-    checkout = {**unnamed, "user_impact": "체크아웃이 게이트웨이에서 502 로 끝난다"}
-    assert "rca-testbed-commerce/testbed-gateway" in excluded_targets(active, "X", checkout)
+    assert excluded_targets(active, "X", unnamed)["rca-testbed-commerce/testbed-gateway"] == "scored_item"
+
+
+def _real_policy_or_three_domains():
+    if (REGISTRY / "decoy-deployments.json").is_file():
+        return load_decoy_policy(REGISTRY / "decoy-deployments.json")[0]
+    return _three_domains()
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Path: gateway -> order -> cart -> pricing -> product -> inventory -> payment -> transfer.",
+        "정산 이체가 실패해 게이트웨이가 502 를 낸다.",
+    ],
+)
+def test_a_path_in_an_unnamed_domain_written_with_unique_names_stays_on_the_path(description) -> None:
+    """U7b review M1 (S1, S2): a bank answer key that never says commerce but
+    lists commerce apps by their unique names (cart, pricing, gateway,
+    게이트웨이). Those names count, name commerce, and so pull in the
+    ambiguous ones (order, payment) of the same listing."""
+    active = _real_policy_or_three_domains()
+    scenario = {"domain": "core-banking", "scoring": {"accept": ["core-banking-ledger"]}, "description": description}
+    reasons = excluded_targets(active, "X", scenario)
+    commerce = {t.key for t in active.targets if t.namespace == "rca-testbed-commerce"}
+    if "cart" in description:
+        expected = {k for k in commerce if k.rsplit("testbed-", 1)[1] in description}
+    else:
+        expected = {"rca-testbed-commerce/testbed-gateway"}
+    assert expected <= set(reasons), sorted(expected - set(reasons))
+    keys = _candidate_keys(active, "X", scenario, "mentioned")
+    assert not expected & keys
+    forbidden, _ = _oracle_forbidden(active, scenario, "mentioned")
+    assert expected <= forbidden, "the exhaustive oracle must see the same path on its own"
+
+
+def test_a_policy_domain_without_domain_words_is_refused() -> None:
+    """U7b review M2: a policy domain the module has no words for would be read
+    as never named. The policy is refused with the reason instead."""
+    with pytest.raises(ValueError, match="logistics.*no domain words"):
+        policy(domain_namespaces={"commerce": "rca-testbed-commerce", "logistics": "rca-testbed-logistics"})
 
 
 def test_no_change_sentences_stay_blunt_across_domains() -> None:
@@ -637,10 +677,17 @@ def _oracle_hits(active, text):
     return hits
 
 
-# U7b: on the path reading a short word of another domain is a name only when
-# the answer key names that domain. The oracle says "named" on a wider
-# vocabulary than the module (more words make it stricter), and it drops only
-# the literal URL prefix "/api/", not every route's first segment.
+# U7b: on the path reading an everyday short word of another domain is a name
+# only when the answer key names that domain. The oracle keeps its own, shorter
+# list of such words (the ones the reviews actually read as data: "in order",
+# "application account", "/api/orders"); every other short name, and the
+# Korean names below, count everywhere and name their domain (review M1). It
+# says "named" on a wider vocabulary than the module (more words make it
+# stricter), and it drops only the literal URL prefix "/api/".
+_ORACLE_EVERYDAY = {"order", "payment", "api", "account", "ledger", "inventory", "dispatch"}
+# 장바구니 is not here: answer keys use it for the data ("장바구니 품목마다",
+# order's cart items), not for the cart app.
+_ORACLE_KOREAN = {"gateway": "게이트웨이"}
 _ORACLE_DOMAIN = {
     "rca-testbed-commerce": re.compile(r"commerce|커머스|checkout|체크아웃|상품|장바구니", re.IGNORECASE),
     "rca-testbed-banking": re.compile(r"banking|은행|뱅킹|oracle|이체|계좌", re.IGNORECASE),
@@ -648,11 +695,21 @@ _ORACLE_DOMAIN = {
 }
 
 
+def _oracle_strong(target):
+    short = target.deployment.removeprefix("testbed-")
+    names = [target.service_name, target.target_id, *target.aliases, target.deployment, target.container]
+    return names if short in _ORACLE_EVERYDAY else [*names, short]
+
+
+def _oracle_korean(target, text):
+    korean = _ORACLE_KOREAN.get(target.deployment.removeprefix("testbed-"))
+    return korean is not None and korean in text
+
+
 def _oracle_named(active, whole):
     named = {ns for ns, words in _ORACLE_DOMAIN.items() if ns in whole or words.search(whole)}
     for target in active.targets:
-        strong = [target.service_name, target.target_id, *target.aliases, target.deployment, target.container]
-        if any(_oracle_word(name, whole) for name in strong):
+        if any(_oracle_word(name, whole) for name in _oracle_strong(target)) or _oracle_korean(target, whole):
             named.add(target.namespace)
     return named
 
@@ -662,8 +719,11 @@ def _oracle_path_hits(active, text, home, named):
     unprefixed = text.replace("/api/", "/~/")
     for target in active.targets:
         short = target.deployment.removeprefix("testbed-")
-        strong = [n for n in _oracle_names(target) if n != short]
-        if target.namespace in text or any(_oracle_word(name, text) for name in strong):
+        if (
+            target.namespace in text
+            or any(_oracle_word(name, text) for name in _oracle_strong(target))
+            or _oracle_korean(target, text)
+        ):
             hits.add(target.key)
         elif target.namespace == home or home is None:
             if _oracle_word(short, text):

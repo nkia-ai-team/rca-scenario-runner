@@ -949,6 +949,23 @@ async def test_missed_decoys_are_skipped_and_a_stuck_rollout_is_undone(
 
 
 @pytest.mark.asyncio
+async def test_a_policy_domain_without_domain_words_pauses_with_the_reason(tmp_path: Path) -> None:
+    """U7b review M2: a decoy policy with a domain the runner has no domain
+    words for is refused, not read as "never named". The queue pauses before
+    any decoy is planned and says why."""
+    queue, _, _, _, executor, _ = _decoy_queue(
+        tmp_path,
+        domain_namespaces={"commerce": "rca-testbed-commerce", "logistics": "rca-testbed-logistics"},
+    )
+    await queue.start()
+    state = await queue.tick()
+    assert state.phase == "paused"
+    assert "decoy plan failed for F01-R" in state.reason
+    assert "logistics" in state.reason and "no domain words" in state.reason
+    assert state.cycle_decoys == [] and executor.applied == []
+
+
+@pytest.mark.asyncio
 async def test_decoys_off_keeps_the_former_records(tmp_path: Path) -> None:
     """Without a policy the runner writes no decoys.json and the preflight
     record keeps exactly its former keys (meta.json additions only)."""

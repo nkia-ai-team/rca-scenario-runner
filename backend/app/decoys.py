@@ -155,6 +155,15 @@ class DecoyPolicy(_Strict):
             # A rollout started at the last allowed moment must be over before
             # the buffer opens, or it bleeds into the preflight window.
             raise ValueError("rollout_timeout_sec must end before the buffer opens")
+        missing = sorted(set(self.domain_namespaces) - set(_DOMAIN_WORDS))
+        if missing:
+            # U7b review M2: a domain without words would be read as "never
+            # named" and its short names silently stop counting. Refuse the
+            # policy (the queue pauses with this reason) until the words exist.
+            raise ValueError(
+                f"decoy policy domains {missing} have no domain words in app.decoys._DOMAIN_WORDS; "
+                "add them before decoys may run for these domains"
+            )
         return self
 
 
@@ -285,6 +294,16 @@ _DOMAIN_WORDS: dict[str, tuple[str, ...]] = {
     "core-banking": ("banking", "은행"),
     "food-delivery": ("food", "배달", "음식"),
 }
+# Short names that also mean something else: everyday words an answer key uses
+# for data, not apps ("in order", "application account", "ledger window").
+# Short names two domains share (order, payment) are found from the policy.
+# Only these are held to the domain boundary; any other short name (cart,
+# pricing, gateway, restaurant, notify and every name a new domain brings)
+# counts in every domain and also names its domain (U7b review M1).
+_COMMON_SHORT_WORDS = frozenset({
+    "order", "payment", "product", "inventory", "notification", "user",
+    "api", "account", "transfer", "ledger", "dispatch",
+})
 # An HTTP route: a URL with a host, or a path that starts a token ("/api/...",
 # "(/api/...)"). File paths inside source trees ("src/main/java/...") do not
 # start a token and are not routes.
@@ -326,7 +345,8 @@ def _route_prefixes(text: str) -> set[tuple[int, int]]:
 def named_namespaces(policy: DecoyPolicy, scenario: Mapping[str, Any]) -> set[str]:
     """Namespaces the answer key names by something stronger than a short word:
     the namespace itself, a full app name (service name, alias, target id,
-    Deployment, container) of any app in it, or a word for its domain.
+    Deployment, container) of any app in it, a unique short or Korean name of
+    one of its apps (``cart``, 게이트웨이), or a word for its domain.
 
     A short word of another domain only counts as a mention when its domain is
     named here (U7b). A container shared by two domains (``order-service``)
@@ -335,17 +355,32 @@ def named_namespaces(policy: DecoyPolicy, scenario: Mapping[str, Any]) -> set[st
     lowered = text.lower()
     named: set[str] = set()
     for domain, namespace in policy.domain_namespaces.items():
-        words = (domain, *_DOMAIN_WORDS.get(domain, ()))
+        words = (domain, *_DOMAIN_WORDS[domain])
         if namespace in text or any(word.lower() in lowered for word in words):
             named.add(namespace)
     for target in policy.targets:
         if target.namespace in named:
             continue
-        if any(name in text for name in target.names()) or any(
-            _word(text, word) for word in (target.deployment, target.container)
+        short = _short(target)
+        if (
+            any(name in text for name in target.names())
+            or any(_word(text, word) for word in (target.deployment, target.container))
+            or (not _ambiguous_short(policy, short) and _word(text, short))
+            or any(korean in text for korean in _KOREAN_NAMES.get(short, ()))
         ):
             named.add(target.namespace)
     return named
+
+
+def _short(target: DecoyTarget) -> str:
+    return target.deployment.removeprefix("testbed-")
+
+
+def _ambiguous_short(policy: DecoyPolicy, short: str) -> bool:
+    """A short name that is an everyday word or belongs to two domains."""
+    if short in _COMMON_SHORT_WORDS:
+        return True
+    return len({t.namespace for t in policy.targets if _short(t) == short}) > 1
 
 
 def mentioned_targets(
@@ -363,10 +398,13 @@ def mentioned_targets(
     two domains (``order``, ``payment``) excludes both; too many is safe.
 
     With ``home`` (the scenario's namespace) and ``named`` (from
-    ``named_namespaces``) the short word and the Korean name are held to the
-    domain boundary (U7b): for an app outside ``home`` they count only when the
-    answer key names that app's domain somewhere, and never as the first
-    segment of an HTTP route. Inside ``home`` they always count. Without
+    ``named_namespaces``) an ambiguous short word (an everyday word, or a name
+    two domains share) is held to the domain boundary (U7b): for an app outside
+    ``home`` it counts only when the answer key names that app's domain
+    somewhere, and never as the first segment of an HTTP route. Inside ``home``
+    it always counts. A unique short name and the Korean name count in every
+    domain (review M1: a path listing "cart -> pricing" in another domain's
+    answer key is still the fault path). Without
     ``home`` the reading stays blunt (every short word everywhere), which is
     what the no-change reading uses."""
     hits: set[str] = set()
@@ -378,11 +416,12 @@ def mentioned_targets(
         if any(_word(text, word) for word in (target.deployment, target.container)):
             hits.add(target.key)
             continue
-        short = target.deployment.removeprefix("testbed-")
+        short = _short(target)
+        if any(korean in text for korean in _KOREAN_NAMES.get(short, ())):
+            hits.add(target.key)
+            continue
         spans = _word_spans(text, short)
-        for korean in _KOREAN_NAMES.get(short, ()):
-            spans += [match.span() for match in re.finditer(re.escape(korean), text)]
-        if home is not None and target.namespace != home:
+        if home is not None and target.namespace != home and _ambiguous_short(policy, short):
             if named is None or target.namespace not in named:
                 continue
             spans = [span for span in spans if span not in prefixes]
