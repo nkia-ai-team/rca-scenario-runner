@@ -169,6 +169,14 @@ async def api_get_scenario(scenario_id: str) -> Scenario:
 @app.post("/api/scenarios/{scenario_id}/run", response_model=RunInfo)
 async def api_run(scenario_id: str) -> RunInfo:
     runner = get_runner()
+    if get_live_queue().injection_reserved:
+        # The live queue has decided to restore the golden or inject and is
+        # doing the slow part off the event loop. A manual run started now would
+        # inject during the restore or take the queue's slot (review R3).
+        raise HTTPException(
+            status_code=409,
+            detail="live queue is restoring or injecting; manual run refused",
+        )
     try:
         # 큐(live_queue.py:702)와 같은 판단을 쓴다. 이 엔드포인트만 pass mode 를
         # 읽지 않아, smoke pass 에서 큐는 통과하는 런이 단독 실행으로는

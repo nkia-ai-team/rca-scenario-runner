@@ -1411,3 +1411,163 @@ async def test_restart_reason_carries_the_run_failure_text_into_api_and_log(
     async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://t") as client:
         body = (await client.get("/api/live-queue")).json()
     assert detail in body["reason"]
+
+
+# --- review 1st round ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_after_cancel_waits_out_the_last_runs_settle(tmp_path: Path) -> None:
+    """Review R2: testbed-operate holds a scenario with cancel and starts the
+    next. That start built cycle_reset at now and so opened the normal window
+    inside the tail of the run just cleaned up by hand (F63-R 2026-10-26)."""
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+    _write_run_timeline(runner, run_id, applied_at="2026-07-16T10:10:30Z", effect_ended_at=None)
+    runner.current = runner.current.model_copy(update={"status": "failed", "dirty": True})
+    assert (await queue.tick()).phase == "paused"
+    (runner.artifact_store.root / run_id / "cleanup.json").write_text(
+        json.dumps({"succeeded": True, "effect_ended_at": "2026-07-16T10:20:00+00:00"}),
+        encoding="utf-8",
+    )
+    clock.value = datetime(2026, 7, 16, 10, 25, tzinfo=timezone.utc)
+    await queue.cancel(reason="hold F01-R")
+
+    state = await queue.start()
+
+    assert state.phase == "cycle_reset"
+    assert state.expected_transition_at == "2026-07-16T10:50:00Z"
+    assert "held until 2026-07-16T10:50:00Z" in state.reason
+    clock.value = datetime(2026, 7, 16, 10, 49, tzinfo=timezone.utc)
+    assert (await queue.tick()).phase == "cycle_reset"
+    clock.value = datetime(2026, 7, 16, 10, 50, tzinfo=timezone.utc)
+    assert (await queue.tick()).phase == "cycle_normal"
+
+
+@pytest.mark.asyncio
+async def test_resume_keeps_a_settle_a_restart_had_already_scheduled(tmp_path: Path) -> None:
+    """Review R2: _restart_cycle clears current_run_id. A pause while the reset
+    is held, then resume, used to reset at once and lose the rest of the settle."""
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    _write_run_timeline(
+        runner, state.current_run_id,
+        applied_at="2026-07-16T10:10:30Z", effect_ended_at="2026-07-16T10:20:00Z",
+    )
+    runner.current = runner.current.model_copy(update={"status": "failed", "dirty": False})
+    clock.value = datetime(2026, 7, 16, 10, 21, tzinfo=timezone.utc)
+    state = await queue.tick()
+    assert state.expected_transition_at == "2026-07-16T10:50:00Z"
+    assert state.current_run_id is None
+    queue._pause(state, "operator halt")
+
+    clock.value = datetime(2026, 7, 16, 10, 30, tzinfo=timezone.utc)
+    resumed = await queue.resume()
+
+    assert resumed.expected_transition_at == "2026-07-16T10:50:00Z"
+
+
+@pytest.mark.asyncio
+async def test_manual_run_is_refused_while_the_queue_restores_the_golden(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Review R3: with the restore off the loop, a web run landed between the
+    queue's busy check and its restore/injection."""
+    import asyncio
+
+    from httpx import ASGITransport, AsyncClient
+
+    from app import main
+
+    queue, runner, _, _, _ = _golden_queue(tmp_path, monkeypatch, delay=0.5)
+    await queue.start()
+    monkeypatch.setattr(main, "get_live_queue", lambda: queue)
+    monkeypatch.setattr(main, "get_runner", lambda: runner)
+
+    async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://t") as client:
+        tick = asyncio.create_task(queue.tick())
+        await asyncio.sleep(0.1)
+        response = await client.post("/api/scenarios/F01-R/run")
+        state = await tick
+
+    assert response.status_code == 409
+    assert "live queue" in response.json()["detail"]
+    assert runner.started == []
+    assert state.phase == "cycle_normal"
+    assert queue.injection_reserved is False
+
+
+@pytest.mark.asyncio
+async def test_manual_run_is_refused_between_the_buffer_gate_and_the_injection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import asyncio
+    import time
+
+    from httpx import ASGITransport, AsyncClient
+
+    from app import main
+
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    await queue.start()
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()  # -> cycle_buffer
+    clock.value = state_expected(state)
+
+    def slow_preflight(now, waited_sec, **_gate):
+        time.sleep(0.4)
+        return SimpleNamespace(is_clean=True, verdict="clean", checks=[])
+
+    queue.preflight_probe = object()  # type: ignore[assignment]
+    queue._evaluate_preflight = slow_preflight  # type: ignore[method-assign]
+    queue._write_preflight = lambda run_id, verdict: None  # type: ignore[method-assign]
+    monkeypatch.setattr(main, "get_live_queue", lambda: queue)
+    monkeypatch.setattr(main, "get_runner", lambda: runner)
+
+    async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://t") as client:
+        tick = asyncio.create_task(queue.tick())
+        await asyncio.sleep(0.1)
+        response = await client.post("/api/scenarios/F01-H/run")
+        state = await tick
+
+    assert response.status_code == 409
+    assert runner.started == [("F01-R", "run")]  # only the queue's own injection
+    assert state.phase == "running"
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_pause_runs_off_the_event_loop(tmp_path: Path, monkeypatch) -> None:
+    """Review residual: the worker's failure pause thaws the trainer over ssh."""
+    queue, runner, _, _, _ = _golden_queue(tmp_path, monkeypatch, delay=0.4)
+    await queue.start()
+    queue.poll_interval_sec = 0
+
+    async def failing_tick():
+        raise RuntimeError("boom")
+
+    queue.tick = failing_tick  # type: ignore[method-assign]
+
+    _, beats = await _count_beats_during(queue._loop())
+
+    assert queue.snapshot().phase == "paused"
+    assert "queue worker failed" in queue.snapshot().reason
+    assert beats >= 10, f"event loop was held during the failure pause (beats={beats})"
+
+
+@pytest.mark.asyncio
+async def test_failed_collector_start_unbinds_the_collector(tmp_path: Path) -> None:
+    """Review residual: a start that fails on the loop must not leave an empty
+    bundle bound to the next run."""
+
+    class BrokenCollector(FakeTopologyCollector):
+        def start(self) -> None:
+            raise RuntimeError("no loop")
+
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    queue.topology_collector_factory = lambda bundle_dir: BrokenCollector(bundle_dir)
+    await queue.start()
+    state = await queue.tick()  # cycle_reset on a worker thread, start on the loop
+    assert state.phase == "cycle_normal"
+    assert queue._topology_collector is None
