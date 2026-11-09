@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,9 +19,30 @@ from app.live_catalog import domains_of, list_live_scenarios
 from app.watchdog import WatchdogDecision, WatchdogRequest, decide_watchdog
 from app.live_queue import LiveQueueState, OperationalReadiness, get_live_queue
 from app.pass_mode import isolation_checks_enabled
+from app.restart_recovery import recover_after_restart
+
+logger = logging.getLogger(__name__)
+
+
+async def _recover_after_restart() -> None:
+    """Before the watchdog and the queue look at the coordinator: a lease or
+    cleanup claim the previous process left would otherwise block them for
+    good (U10)."""
+    runner = get_runner()
+    try:
+        await asyncio.to_thread(
+            recover_after_restart,
+            runner.coordinator,
+            runner.artifact_store.root,
+            now=runner.clock.now(),
+        )
+    except Exception:
+        logger.exception("restart recovery failed; coordinator state left as it was")
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await _recover_after_restart()
     runner = get_runner()
     # The DIRTY cleanup retry (U9) yields to the queue the way the manual
     # cleanup route does: never while it restores the golden or injects.

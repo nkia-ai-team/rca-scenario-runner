@@ -540,6 +540,288 @@ async def test_restart_observes_existing_lease_before_subprocess(
     assert not (tmp_path / "logs").exists()
 
 
+# --- U10: a runner restart leaves no lease or cleanup claim behind -----------
+#
+# "Previous runner process" is a real child process here: it writes through its
+# own coordinator (its own owner and marker) and exits, so the kernel drops its
+# flock exactly as a container stop or crash does.
+
+_BACKEND_ROOT = Path(__file__).resolve().parents[1]
+
+_PREVIOUS_PROCESS = r"""
+import sys, time
+from datetime import datetime, timezone
+from pathlib import Path
+from app.coordinator import GlobalCoordinator
+
+state_path, steps, linger = Path(sys.argv[1]), sys.argv[2].split(","), sys.argv[3] == "linger"
+coordinator = GlobalCoordinator(state_path)
+now = datetime.now(timezone.utc)
+if "alive_only" in steps:
+    coordinator.hold_owner_marker()
+else:
+    lease = coordinator.acquire(run_id="run-before", scenario_id="F07-H", now=now, lease_sec=600)
+if "dirty" in steps:
+    coordinator.mark_dirty(run_id="run-before", fencing_token=lease.fencing_token, reason="cleanup_failed", now=now)
+if "claim" in steps:
+    coordinator.claim_cleanup(run_id="run-before", fencing_token=lease.fencing_token, claimant="manual-cleanup-cut", now=now)
+if "watchdog_claim" in steps:
+    coordinator.claim_cleanup(run_id="run-before", fencing_token=lease.fencing_token, claimant="watchdog-cut", now=now)
+print(coordinator.owner, flush=True)
+if linger:
+    time.sleep(120)
+"""
+
+
+def _previous_process(state_path: Path, *steps: str, linger: bool = False):
+    import subprocess
+    import sys
+
+    process = subprocess.Popen(
+        [
+            sys.executable, "-c", _PREVIOUS_PROCESS, str(state_path),
+            ",".join(steps) or "-", "linger" if linger else "exit",
+        ],
+        cwd=_BACKEND_ROOT,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    owner = process.stdout.readline().strip()
+    assert owner, "previous runner process did not start"
+    if not linger:
+        assert process.wait(timeout=30) == 0
+    return process, owner
+
+
+def _recover(state_path: Path, runs_root: Path):
+    from app.restart_recovery import recover_after_restart
+
+    return recover_after_restart(
+        GlobalCoordinator(state_path), runs_root, now=datetime.now(timezone.utc)
+    )
+
+
+def test_restart_recovery_marks_the_run_cut_mid_way_dirty(tmp_path: Path) -> None:
+    state_path = tmp_path / "state" / "coordinator.json"
+    runs_root = tmp_path / "runs"
+    (runs_root / "run-before").mkdir(parents=True)
+    _, previous_owner = _previous_process(state_path)
+    assert GlobalCoordinator(state_path).snapshot().active_lease.owner == previous_owner
+
+    recovered = _recover(state_path, runs_root)
+
+    assert [(item.action, item.run_id, item.reason) for item in recovered] == [
+        ("marked_dirty", "run-before", "runner_restarted_mid_run")
+    ]
+    state = GlobalCoordinator(state_path).snapshot()
+    assert state.active_lease is None and state.cleanup_claim is None
+    assert state.dirty_run is not None
+    assert (state.dirty_run.run_id, state.dirty_run.fencing_token) == ("run-before", 1)
+    assert state.dirty_run.reason == "runner_restarted_mid_run"
+    record = json.loads((runs_root / "run-before" / "restart-recovery.json").read_text())
+    assert record["action"] == "marked_dirty"
+    assert record["previous_owner"] == previous_owner
+    # No cleanup ran, so none is reported.
+    assert not (runs_root / "run-before" / "cleanup.json").exists()
+    # It is now an ordinary DIRTY run: it blocks starts and takes a cleanup.
+    now = datetime.now(timezone.utc)
+    assert decide_watchdog(state, now=now, heartbeat_timeout_sec=30).action == "block_dirty"
+    coordinator = GlobalCoordinator(state_path)
+    with pytest.raises(RuntimeError, match="dirty run"):
+        coordinator.acquire(run_id="run-after", scenario_id="F07-H", now=now, lease_sec=60)
+    claim = coordinator.claim_cleanup(
+        run_id="run-before", fencing_token=1, claimant="manual-cleanup-next", now=now
+    )
+    assert claim.owner == coordinator.owner
+    # The previous process's marker is swept once it is found dead.
+    assert not (state_path.parent / "coordinator.json.owners" / f"{previous_owner}.lock").exists()
+
+
+def test_restart_recovery_releases_a_cut_cleanup_claim_and_keeps_dirty(tmp_path: Path) -> None:
+    state_path = tmp_path / "state" / "coordinator.json"
+    runs_root = tmp_path / "runs"
+    (runs_root / "run-before").mkdir(parents=True)
+    _previous_process(state_path, "dirty", "claim")
+    before = GlobalCoordinator(state_path).snapshot()
+    assert before.dirty_run is not None and before.cleanup_claim is not None
+    now = datetime.now(timezone.utc)
+    assert decide_watchdog(before, now=now, heartbeat_timeout_sec=30).action == "cleanup_claimed"
+
+    recovered = _recover(state_path, runs_root)
+
+    assert [(item.action, item.claimant) for item in recovered] == [
+        ("released_cleanup_claim", "manual-cleanup-cut")
+    ]
+    state = GlobalCoordinator(state_path).snapshot()
+    assert state.cleanup_claim is None
+    assert state.dirty_run == before.dirty_run
+    cleanup = json.loads((runs_root / "run-before" / "cleanup.json").read_text())
+    assert cleanup["succeeded"] is False and cleanup["source"] == "restart-recovery"
+    assert "manual-cleanup-cut" in cleanup["reason"] and cleanup["finished_at"]
+    # The next cleanup can claim it again.
+    GlobalCoordinator(state_path).claim_cleanup(
+        run_id="run-before", fencing_token=1, claimant="manual-cleanup-next", now=now
+    )
+
+
+def test_restart_recovery_keeps_a_cleanup_success_already_recorded(tmp_path: Path) -> None:
+    state_path = tmp_path / "state" / "coordinator.json"
+    run_dir = tmp_path / "runs" / "run-before"
+    run_dir.mkdir(parents=True)
+    _previous_process(state_path, "dirty", "claim")
+    succeeded = {"schema_version": 1, "source": "manual-dirty-cleanup", "succeeded": True,
+                 "effect_ended_at": "2026-11-09T00:00:00+00:00"}
+    (run_dir / "cleanup.json").write_text(json.dumps(succeeded))
+
+    _recover(state_path, tmp_path / "runs")
+
+    # Cut between the successful cleanup and clear_dirty: stays DIRTY for the
+    # next cleanup, but the success it recorded is not overwritten.
+    state = GlobalCoordinator(state_path).snapshot()
+    assert state.dirty_run is not None and state.cleanup_claim is None
+    assert json.loads((run_dir / "cleanup.json").read_text()) == succeeded
+
+
+def test_restart_recovery_marks_a_lease_whose_cleanup_was_cut_dirty(tmp_path: Path) -> None:
+    state_path = tmp_path / "state" / "coordinator.json"
+    runs_root = tmp_path / "runs"
+    (runs_root / "run-before").mkdir(parents=True)
+    _previous_process(state_path, "watchdog_claim")
+
+    recovered = _recover(state_path, runs_root)
+
+    assert [(item.action, item.reason, item.claimant) for item in recovered] == [
+        ("marked_dirty", "runner_restarted_during_cleanup", "watchdog-cut")
+    ]
+    state = GlobalCoordinator(state_path).snapshot()
+    assert state.active_lease is None and state.cleanup_claim is None
+    assert state.dirty_run is not None
+    assert state.dirty_run.reason == "runner_restarted_during_cleanup"
+    cleanup = json.loads((runs_root / "run-before" / "cleanup.json").read_text())
+    assert cleanup["succeeded"] is False
+
+
+def test_restart_recovery_leaves_a_live_runner_process_alone(tmp_path: Path) -> None:
+    state_path = tmp_path / "state" / "coordinator.json"
+    runs_root = tmp_path / "runs"
+    for steps in [(), ("dirty", "claim")]:
+        if state_path.exists():
+            state_path.unlink()
+        process, _ = _previous_process(state_path, *steps, linger=True)
+        try:
+            before = GlobalCoordinator(state_path).snapshot()
+            assert _recover(state_path, runs_root) == []
+            assert GlobalCoordinator(state_path).snapshot() == before
+        finally:
+            process.kill()
+            process.wait(timeout=30)
+        # Once that process is gone the same state is taken back.
+        assert _recover(state_path, runs_root) != []
+        state = GlobalCoordinator(state_path).snapshot()
+        assert state.active_lease is None and state.cleanup_claim is None
+
+
+def test_restart_recovery_takes_nothing_from_a_run_live_in_this_process(tmp_path: Path) -> None:
+    """No restart: this process holds the lease (a run is executing) or a
+    cleanup claim (a cleanup is running). Nothing is recovered."""
+    state_path = tmp_path / "coordinator.json"
+    coordinator = GlobalCoordinator(state_path)
+    now = datetime.now(timezone.utc)
+    assert _recover(state_path, tmp_path / "runs") == []  # empty coordinator
+    lease = coordinator.acquire(run_id="run-live", scenario_id="F07-H", now=now, lease_sec=60)
+    before = coordinator.snapshot()
+    assert _recover(state_path, tmp_path / "runs") == []
+    assert coordinator.snapshot() == before
+    coordinator.mark_dirty(run_id="run-live", fencing_token=lease.fencing_token, reason="x", now=now)
+    coordinator.claim_cleanup(
+        run_id="run-live", fencing_token=lease.fencing_token, claimant="manual-cleanup-live", now=now
+    )
+    before = coordinator.snapshot()
+    assert _recover(state_path, tmp_path / "runs") == []
+    assert coordinator.snapshot() == before
+
+
+def test_restart_recovery_sweeps_markers_of_gone_processes(tmp_path: Path) -> None:
+    state_path = tmp_path / "state" / "coordinator.json"
+    owners = state_path.parent / "coordinator.json.owners"
+    _, gone_owner = _previous_process(state_path, "alive_only")
+    assert (owners / f"{gone_owner}.lock").exists()
+    assert _recover(state_path, tmp_path / "runs") == []
+    assert [marker.stem for marker in owners.glob("*.lock")] == [GlobalCoordinator(state_path).owner]
+
+
+def _legacy_state(state_path: Path, *, claim: bool) -> None:
+    """State as a runner built before owners were recorded left it."""
+    now = datetime.now(timezone.utc).isoformat()
+    document = {
+        "next_fencing_token": 2,
+        "active_lease": {
+            "run_id": "run-old", "scenario_id": "F07-H", "fencing_token": 1,
+            "acquired_at": now, "heartbeat_at": now, "expires_at": now,
+        },
+        "dirty_run": None,
+        "cleanup_claim": (
+            {"run_id": "run-old", "fencing_token": 1, "claimant": "watchdog-old", "claimed_at": now}
+            if claim else None
+        ),
+    }
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(document))
+
+
+def test_restart_recovery_takes_back_owner_less_state_only_when_no_other_runner_lives(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state" / "coordinator.json"
+    runs_root = tmp_path / "runs"
+    _legacy_state(state_path, claim=True)
+    process, _ = _previous_process(state_path, "alive_only", linger=True)
+    try:
+        # Another runner lives on this state: an owner-less entry cannot be
+        # told apart from it, so it is left alone.
+        before = GlobalCoordinator(state_path).snapshot()
+        assert _recover(state_path, runs_root) == []
+        assert GlobalCoordinator(state_path).snapshot() == before
+    finally:
+        process.kill()
+        process.wait(timeout=30)
+
+    recovered = _recover(state_path, runs_root)
+
+    assert [(item.action, item.reason, item.previous_owner) for item in recovered] == [
+        ("marked_dirty", "runner_restarted_during_cleanup", None)
+    ]
+    state = GlobalCoordinator(state_path).snapshot()
+    assert state.active_lease is None and state.cleanup_claim is None
+    assert state.dirty_run is not None and state.dirty_run.run_id == "run-old"
+
+
+async def test_runner_startup_recovers_before_the_watchdog_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import live_queue as live_queue_module
+    from app import runner as runner_module
+    from app.main import app, lifespan
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("COORDINATOR_STATE_PATH", str(state_dir / "coordinator.json"))
+    monkeypatch.setenv("CAPTURE_STATE_PATH", str(state_dir / "capture-jobs.json"))
+    monkeypatch.setenv("LIVE_QUEUE_STATE_PATH", str(state_dir / "live-queue.json"))
+    monkeypatch.setenv("TRUSTED_RUNS_ROOT", str(tmp_path / "runs"))
+    (tmp_path / "runs" / "run-before").mkdir(parents=True)
+    _previous_process(state_dir / "coordinator.json", "dirty", "claim")
+    runner_module.reset_runner_for_tests(script_dir=tmp_path, log_dir=tmp_path / "logs")
+    monkeypatch.setattr(live_queue_module, "_queue", None)
+
+    async with lifespan(app):
+        state = runner_module.get_runner().coordinator.snapshot()
+
+    assert state.cleanup_claim is None
+    assert state.dirty_run is not None and state.dirty_run.run_id == "run-before"
+    assert (tmp_path / "runs" / "run-before" / "restart-recovery.json").is_file()
+
+
 async def test_failure_attempts_cleanup_once_then_dirty_blocks_until_manual_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

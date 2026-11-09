@@ -3,17 +3,44 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
+import socket
 import tempfile
+import threading
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+_OWNER_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _new_process_owner() -> str:
+    # pid alone repeats across container restarts (the runner is often pid 1),
+    # so a random part makes each process its own owner.
+    host = _OWNER_UNSAFE.sub("_", socket.gethostname())[:40] or "host"
+    return f"{host}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+
+# The runner process that writes a lease or a cleanup claim. Kept per process,
+# not per coordinator object: every coordinator this process builds speaks for
+# the same process.
+PROCESS_OWNER = _new_process_owner()
+
+# Owner markers this process holds open (and flocked) for its whole life. The
+# kernel drops a flock when its process dies, however it dies, so "can I lock
+# that owner's marker" answers "is that owner process gone" without pids,
+# heartbeats or clocks.
+_held_markers: dict[Path, int] = {}
+_held_markers_lock = threading.Lock()
 
 
 class ActiveLease(StrictModel):
@@ -23,6 +50,9 @@ class ActiveLease(StrictModel):
     acquired_at: datetime
     heartbeat_at: datetime
     expires_at: datetime
+    # Runner process that holds the lease (PROCESS_OWNER). None in state
+    # written before owners were recorded.
+    owner: str | None = None
 
 
 class DirtyRun(StrictModel):
@@ -38,6 +68,9 @@ class CleanupClaim(StrictModel):
     fencing_token: int = Field(gt=0)
     claimant: str
     claimed_at: datetime
+    # Runner process doing the cleanup; None in state written before owners
+    # were recorded.
+    owner: str | None = None
 
 
 class CoordinatorState(StrictModel):
@@ -47,12 +80,86 @@ class CoordinatorState(StrictModel):
     cleanup_claim: CleanupClaim | None = None
 
 
+class RestartRecovery(StrictModel):
+    """One lease or cleanup claim taken back from a runner process that is gone."""
+
+    action: Literal["marked_dirty", "released_cleanup_claim"]
+    run_id: str
+    scenario_id: str | None
+    fencing_token: int
+    previous_owner: str | None
+    # The interrupted cleanup's claimant, when a cleanup was what got cut.
+    claimant: str | None = None
+    reason: str
+
+
 class GlobalCoordinator:
     """Small JSON store guarded by ``flock`` and atomic replacement."""
 
-    def __init__(self, state_path: Path) -> None:
+    def __init__(self, state_path: Path, *, owner: str | None = None) -> None:
         self.state_path = state_path
         self.lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+        self.owner = _OWNER_UNSAFE.sub("_", owner) if owner else PROCESS_OWNER
+        self.owners_dir = state_path.with_name(state_path.name + ".owners")
+
+    def _marker(self, owner: str) -> Path:
+        return self.owners_dir / f"{_OWNER_UNSAFE.sub('_', owner)}.lock"
+
+    def hold_owner_marker(self) -> None:
+        """Lock this process's owner marker for the rest of its life.
+
+        Called before anything is written under this owner, so a lease or claim
+        naming an owner always has a marker that stays locked while that owner
+        lives.
+        """
+        path = self._marker(self.owner)
+        with _held_markers_lock:
+            if path in _held_markers:
+                return
+            self.owners_dir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o640)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                os.close(fd)
+                raise RuntimeError(f"owner marker is held by another process: {self.owner}") from error
+            _held_markers[path] = fd
+
+    def owner_alive(self, owner: str) -> bool:
+        """Whether the runner process ``owner`` still runs.
+
+        Its marker stays locked while it lives. A missing marker or one that
+        locks now means the process is gone; the stale marker is removed.
+        """
+        if _OWNER_UNSAFE.sub("_", owner) == self.owner:
+            return True
+        path = self._marker(owner)
+        with _held_markers_lock:
+            if path in _held_markers:
+                return True
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            return False
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            path.unlink(missing_ok=True)
+            return False
+        finally:
+            os.close(fd)
+
+    def other_live_owners(self) -> list[str]:
+        """Other runner processes alive on this state (stale markers are swept)."""
+        if not self.owners_dir.is_dir():
+            return []
+        live = []
+        for marker in sorted(self.owners_dir.glob("*.lock")):
+            if marker.stem != self.owner and self.owner_alive(marker.stem):
+                live.append(marker.stem)
+        return live
 
     def snapshot(self) -> CoordinatorState:
         if not self.state_path.exists():
@@ -104,7 +211,9 @@ class GlobalCoordinator:
                 acquired_at=now,
                 heartbeat_at=now,
                 expires_at=datetime.fromtimestamp(now.timestamp() + lease_sec, timezone.utc),
+                owner=self.owner,
             )
+            self.hold_owner_marker()
             updated = state.model_copy(
                 update={
                     "next_fencing_token": token + 1,
@@ -202,7 +311,9 @@ class GlobalCoordinator:
                 fencing_token=fencing_token,
                 claimant=claimant,
                 claimed_at=now,
+                owner=self.owner,
             )
+            self.hold_owner_marker()
             self._write(state.model_copy(update={"cleanup_claim": claim}))
             return claim
 
@@ -230,7 +341,9 @@ class GlobalCoordinator:
                 fencing_token=lease.fencing_token,
                 claimant=claimant,
                 claimed_at=now,
+                owner=self.owner,
             )
+            self.hold_owner_marker()
             self._write(state.model_copy(update={"cleanup_claim": claim}))
             return claim
 
@@ -262,6 +375,121 @@ class GlobalCoordinator:
             ):
                 raise RuntimeError("cleanup claim release rejected by fencing token or claimant")
             self._write(state.model_copy(update={"cleanup_claim": None}))
+
+    def recover_dead_owners(self, *, now: datetime) -> list[RestartRecovery]:
+        """Take back what a runner process that is gone left in the coordinator.
+
+        A restart kills the process between a claim (or a lease) and its
+        release. Nothing else ever releases them: a cleanup claim has no expiry
+        and blocks every later claim and, through the lease or DIRTY run under
+        it, every acquisition; the queue stays stopped until someone edits the
+        state file (U9 note 4, review R1).
+
+        Called once at startup, before the watchdog and the queue run:
+
+        * A cleanup claim whose owner is gone is dropped. The cleanup it guarded
+          did not finish, so whatever it was cleaning stays (or becomes) DIRTY.
+        * A lease whose owner is gone was a run cut mid-way: its effect on the
+          testbed is unknown, so it becomes DIRTY and waits for cleanup like any
+          other DIRTY run.
+        * Anything held by a live process, this one or another runner sharing
+          the state, is left alone. So is everything under a live claim: that
+          cleanup is still running somewhere.
+
+        Owner-less entries come from a runner built before owners were
+        recorded. They count as gone only when no other runner process is alive
+        on this state; with another live runner around their owner cannot be
+        told apart, and they are left as they are.
+        """
+        self.hold_owner_marker()
+        with self._locked() as state:
+            # Also sweeps the markers of every runner process that has gone, so
+            # one empty marker per restart does not pile up.
+            others_alive = bool(self.other_live_owners())
+
+            def gone(owner: str | None) -> bool:
+                if owner is not None:
+                    return not self.owner_alive(owner)
+                return not others_alive
+
+            recovered: list[RestartRecovery] = []
+            updated = state
+            interrupted: CleanupClaim | None = None
+            claim = state.cleanup_claim
+            if claim is not None:
+                if not gone(claim.owner):
+                    return []
+                interrupted = claim
+                target = state.active_lease or state.dirty_run
+                matches = (
+                    target is not None
+                    and target.run_id == claim.run_id
+                    and target.fencing_token == claim.fencing_token
+                )
+                updated = updated.model_copy(update={"cleanup_claim": None})
+                if state.dirty_run is not None or not matches:
+                    # The DIRTY run stays DIRTY: its cleanup never finished.
+                    recovered.append(
+                        RestartRecovery(
+                            action="released_cleanup_claim",
+                            run_id=claim.run_id,
+                            scenario_id=target.scenario_id if matches and target else None,
+                            fencing_token=claim.fencing_token,
+                            previous_owner=claim.owner,
+                            claimant=claim.claimant,
+                            reason="runner_restarted_during_cleanup",
+                        )
+                    )
+            lease = updated.active_lease
+            if lease is not None and updated.dirty_run is None and gone(lease.owner):
+                during_cleanup = (
+                    interrupted is not None
+                    and interrupted.run_id == lease.run_id
+                    and interrupted.fencing_token == lease.fencing_token
+                )
+                reason = (
+                    "runner_restarted_during_cleanup"
+                    if during_cleanup
+                    else "runner_restarted_mid_run"
+                )
+                dirty = DirtyRun(
+                    run_id=lease.run_id,
+                    scenario_id=lease.scenario_id,
+                    fencing_token=lease.fencing_token,
+                    reason=reason,
+                    marked_at=now,
+                )
+                updated = updated.model_copy(update={"active_lease": None, "dirty_run": dirty})
+                recovered.append(
+                    RestartRecovery(
+                        action="marked_dirty",
+                        run_id=lease.run_id,
+                        scenario_id=lease.scenario_id,
+                        fencing_token=lease.fencing_token,
+                        previous_owner=lease.owner,
+                        claimant=interrupted.claimant if during_cleanup and interrupted else None,
+                        reason=reason,
+                    )
+                )
+            elif interrupted is not None and not recovered:
+                # The claim sat on a lease whose own owner still runs (another
+                # runner's watchdog claimed a live runner's lease and died). The
+                # claim already fenced that run's heartbeat, so the live owner
+                # closes its run itself; only the dead claim is ours to drop.
+                recovered.append(
+                    RestartRecovery(
+                        action="released_cleanup_claim",
+                        run_id=interrupted.run_id,
+                        scenario_id=lease.scenario_id if lease is not None else None,
+                        fencing_token=interrupted.fencing_token,
+                        previous_owner=interrupted.owner,
+                        claimant=interrupted.claimant,
+                        reason="runner_restarted_during_cleanup",
+                    )
+                )
+            if updated != state:
+                self._write(updated)
+            return recovered
 
     @staticmethod
     def _require_lease(state: CoordinatorState, run_id: str, token: int) -> ActiveLease:
