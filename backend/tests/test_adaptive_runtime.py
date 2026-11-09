@@ -654,3 +654,36 @@ def test_skip_isolation_still_enforces_baseline_active():
     evidence = _isolation_evidence(now).model_copy(update={"baseline_active": False})
     reasons = _eligibility_reasons(request, evidence, skip_isolation_checks=True)
     assert "baseline_inactive" in reasons
+
+
+async def test_profile_apply_failure_keeps_the_executor_message_whole() -> None:
+    """U3: 2026-10-22 F35-P's run said only "profile preflight failed: no detail".
+    Once the executor names the failed check, its words come after
+    profile-control's own prefix; a 160-character tail cut them off."""
+    import subprocess
+
+    message = (
+        "profile control refused: profile preflight failed: tablespace of BANKING.ACCOUNTS "
+        "has 267MB free, preflight needs at least 1024MB (the dropped table must stay in "
+        "the recycle bin for the whole window)\n"
+        "failed at line 57: [[ \"$free\" -ge \"$free_mb\" ]]\n"
+    )
+
+    class PreflightRefusingApplier(FakeApplier):
+        def apply(self, request: ApplyRequest) -> ApplyResult:
+            raise subprocess.CalledProcessError(3, ["profile-control.py"], output="", stderr=message)
+
+    clock = FakeClock()
+    values = {
+        "loadgen.achieved_rps": 100,
+        "http.entry_health": 200,
+        "database.tagged_session_count": 0,
+    }
+    runtime, _, _ = _runtime(clock, values, applier=PreflightRefusingApplier(clock))
+    await runtime.begin()
+
+    reason = runtime.session.controller_state.reason
+    assert reason.startswith("profile_apply_failed:CalledProcessError:profile control refused")
+    assert "267MB free, preflight needs at least 1024MB" in reason
+    assert 'failed at line 57: [[ "$free" -ge "$free_mb" ]]' in reason
+    assert "\n" not in reason

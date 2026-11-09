@@ -35,13 +35,19 @@ from app.observations import (
 )
 
 
-def stderr_detail(error: BaseException, *, limit: int = 160) -> str:
+def stderr_detail(error: BaseException, *, limit: int = 600) -> str:
     """Reason suffix carrying a failed subprocess's stderr tail, or "" if none.
 
     A reason of only the exception class name cannot be diagnosed from the run
     artifacts — the operator sees "CalledProcessError" and has to reproduce the
     call by hand to learn anything (F09-P run 2333e298, F01-R run 0104bd01).
     Whitespace is collapsed so the tail stays one line inside a reason string.
+
+    The tail used to be 160 characters. profile-control prefixes the executor's
+    own words with "profile control refused: profile preflight failed: ", and a
+    failed check reports its command line, so 160 kept the end of a SQL text
+    and dropped what failed (2026-10-22 F35-P read "no detail" for a full
+    Oracle tablespace). 600 keeps the executor's message whole.
     """
     tail = " ".join(str(getattr(error, "stderr", "") or "").split())[-limit:]
     return f":{tail}" if tail else ""
