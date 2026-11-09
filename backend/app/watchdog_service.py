@@ -98,6 +98,7 @@ class WatchdogService:
                         "source": "watchdog",
                         "succeeded": True,
                         "effect_ended_at": effect_ended_at.isoformat(),
+                        "finished_at": self.clock.now().isoformat(),
                     },
                 )
                 atomic_json(
@@ -119,7 +120,15 @@ class WatchdogService:
         )
         atomic_json(
             self.runs_root / decision.run_id / "cleanup.json",
-            {"schema_version": 1, "source": "watchdog", "succeeded": False, "reason": reason},
+            {
+                "schema_version": 1,
+                "source": "watchdog",
+                "succeeded": False,
+                "reason": reason,
+                # app.dirty_retry: the node's undo timer was postponed, if this
+                # cleanup reached it, from some moment before this.
+                "finished_at": self.clock.now().isoformat(),
+            },
         )
         atomic_json(
             self.runs_root / decision.run_id / "recovery.json",

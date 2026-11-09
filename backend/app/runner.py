@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import logging
 import os
 import re
 import threading
@@ -41,6 +42,9 @@ from app.production_runtime import (
     production_runtime,
 )
 from app.watchdog_service import WatchdogService
+from app import dirty_retry
+
+logger = logging.getLogger(__name__)
 
 _LOG_TAIL_SIZE = 200
 _HISTORY_SIZE = 20
@@ -193,6 +197,11 @@ class ScenarioRunner:
         # start cannot slip in during that await.
         self._starting = False
         self._heartbeat: LeaseHeartbeat | None = None
+        # U9: a DIRTY run whose cleanup failed is cleaned again once the node's
+        # own undo deadline has passed (see app.dirty_retry). The live queue
+        # sets the hold so a retry never starts while it restores or injects.
+        self.dirty_retry_policy = dirty_retry.RetryPolicy.from_env()
+        self.cleanup_retry_hold: Callable[[], bool] | None = None
 
     @property
     def is_busy(self) -> bool:
@@ -554,10 +563,12 @@ class ScenarioRunner:
 
     async def _execute_external_dirty_cleanup(
         self, dirty_run_id: str, fencing_token: int, claimant: str,
-        *, repair_capsule: bool = False,
-    ) -> None:
+        *, repair_capsule: bool = False, source: str = "manual-dirty-cleanup",
+    ) -> tuple[bool, str | None]:
+        """Clean a DIRTY run once; returns whether it cleared and why not."""
         assert self._current is not None
         success = False
+        failure: str | None = None
         try:
             run_dir = self.artifact_store.root / dirty_run_id
             if repair_capsule:
@@ -592,7 +603,11 @@ class ScenarioRunner:
                     scenario_id=plan["scenario"]["id"],
                     fencing_token=fencing_token,
                     profile_id=binding["logical_profile_id"],
-                    idempotency_key=f"manual-cleanup:{dirty_run_id}:{fencing_token}",
+                    idempotency_key=(
+                        f"manual-cleanup:{dirty_run_id}:{fencing_token}"
+                        if source == "manual-dirty-cleanup"
+                        else f"{source}:{dirty_run_id}:{fencing_token}:{claimant}"
+                    ),
                     requested_at=self.clock.now(),
                 ),
             )
@@ -606,19 +621,23 @@ class ScenarioRunner:
                 self.artifact_store.root / dirty_run_id / "cleanup.json",
                 {
                     "schema_version": 1,
-                    "source": "manual-dirty-cleanup",
+                    "source": source,
                     "succeeded": result.succeeded,
                     "effect_ended_at": (
                         effect_ended_at.isoformat() if effect_ended_at else None
                     ),
                     "reason": result.reason,
+                    # When this attempt was over: a cleanup that reached a node
+                    # postponed its undo timer from some moment before this
+                    # (app.dirty_retry reads it).
+                    "finished_at": self.clock.now().isoformat(),
                 },
             )
             atomic_json(
                 self.artifact_store.root / dirty_run_id / "recovery.json",
                 {
                     "schema_version": 1,
-                    "source": "manual-dirty-cleanup",
+                    "source": source,
                     "status": "succeeded" if result.succeeded else "failed",
                 },
             )
@@ -629,7 +648,10 @@ class ScenarioRunner:
                     recovery_verified=True,
                 )
                 success = True
+            else:
+                failure = result.reason or "cleanup reported failure without a reason"
         except Exception as error:
+            failure = f"{type(error).__name__}: {error}"
             self._append_log(f"[ERROR] External DIRTY cleanup failed: {error}")
             # The in-memory log tail is the only place this used to land, and it
             # dies with the process — #21 in the 2026-08-03 batch read as
@@ -641,7 +663,7 @@ class ScenarioRunner:
                     self.artifact_store.root / dirty_run_id / "manual-cleanup-error.json",
                     {
                         "schema_version": 1,
-                        "source": "manual-dirty-cleanup",
+                        "source": source,
                         "claimant": claimant,
                         "repair_capsule": repair_capsule,
                         "error": f"{type(error).__name__}: {error}",
@@ -665,6 +687,7 @@ class ScenarioRunner:
                 "dirty": not success,
             }
         )
+        return success, failure
 
     async def _execute(
         self,
@@ -1118,7 +1141,121 @@ class ScenarioRunner:
                 await self.watchdog_service.tick()
             except Exception as error:
                 self._append_log(f"[ERROR] Watchdog tick failed: {error}")
+            try:
+                await self.retry_dirty_cleanup_when_due()
+            except Exception as error:
+                self._append_log(f"[ERROR] DIRTY cleanup retry check failed: {error}")
             await self.sleeper(max(1, self.heartbeat_interval_sec))
+
+    def _retry_blocked(self) -> str | None:
+        if self._lock.locked() or self.is_busy or self._starting:
+            return "runner_busy"
+        hold = self.cleanup_retry_hold
+        if hold is not None and hold():
+            return "live_queue_restoring_or_injecting"
+        return None
+
+    async def retry_dirty_cleanup_when_due(self) -> str:
+        """Clean a DIRTY run again once the node has undone it by itself (U9).
+
+        A cleanup that could not reach a node leaves the run DIRTY while the
+        node's own timer puts it back later (testbed-services U8). After that
+        deadline the same cleanup has nothing left to do and succeeds, which
+        clears DIRTY the way an operator's manual cleanup does. Never before
+        the deadline (app.dirty_retry), never while a run, a start, a manual
+        cleanup or the queue's restore/injection holds the testbed, and only a
+        bounded number of times; after the last failure the run stays DIRTY
+        and dirty-retry.json says why. Returns what it decided, for tests and
+        the log.
+        """
+        blocked = self._retry_blocked()
+        if blocked is not None:
+            return blocked
+        state = self.coordinator.snapshot()
+        dirty = state.dirty_run
+        if dirty is None:
+            return "no_dirty_run"
+        if state.cleanup_claim is not None:
+            return "cleanup_already_claimed"
+        run_dir = self.artifact_store.root / dirty.run_id
+        if run_dir.parent != self.artifact_store.root or run_dir.is_symlink():
+            return "run_dir_outside_trusted_root"
+        policy = self.dirty_retry_policy
+        decision = await asyncio.to_thread(
+            dirty_retry.decide, run_dir, dirty, now=self.clock.now(), policy=policy
+        )
+        if not decision.due:
+            if decision.reason == "waiting_for_node_undo_deadline":
+                await asyncio.to_thread(dirty_retry.note_waiting, run_dir, dirty, decision)
+            return decision.reason
+        # The decision ran off the loop: look again before taking the testbed.
+        blocked = self._retry_blocked()
+        if blocked is not None:
+            return blocked
+        claimant = f"cleanup-retry-{uuid.uuid4().hex[:8]}"
+        try:
+            # Fenced: refuses if the DIRTY run changed or anyone else claimed it.
+            self.coordinator.claim_cleanup(
+                run_id=dirty.run_id,
+                fencing_token=dirty.fencing_token,
+                claimant=claimant,
+                now=self.clock.now(),
+            )
+        except RuntimeError:
+            return "cleanup_claim_lost"
+        started_at = self.clock.now()
+        self._current = RunInfo(
+            run_id=claimant,
+            scenario_id=dirty.scenario_id,
+            mode="cleanup",
+            status="cleanup_running",
+            started_at=started_at,
+            fencing_token=dirty.fencing_token,
+        )
+        message = (
+            f"DIRTY cleanup retry {decision.attempt}/{policy.max_attempts} for "
+            f"{dirty.run_id}: node undo deadline {decision.node_undo_deadline.isoformat()} passed"
+        )
+        self._append_log(f"[INFO] {message}")
+        logger.warning("%s", message)
+        try:
+            dirty_retry.note_started(run_dir, dirty, claimant=claimant, started_at=started_at)
+        except Exception:
+            self.coordinator.finish_cleanup_claim(
+                run_id=dirty.run_id, fencing_token=dirty.fencing_token, claimant=claimant
+            )
+            self._current = None
+            raise
+        self._task = asyncio.create_task(
+            self._execute_dirty_cleanup_retry(dirty, run_dir, claimant)
+        )
+        return "cleanup_retry_started"
+
+    async def _execute_dirty_cleanup_retry(self, dirty, run_dir: Path, claimant: str) -> None:
+        succeeded, reason = await self._execute_external_dirty_cleanup(
+            dirty.run_id, dirty.fencing_token, claimant, source=dirty_retry.RETRY_SOURCE
+        )
+        record = await asyncio.to_thread(
+            dirty_retry.note_finished,
+            run_dir,
+            dirty,
+            claimant=claimant,
+            finished_at=self.clock.now(),
+            succeeded=succeeded,
+            reason=reason,
+            policy=self.dirty_retry_policy,
+        )
+        if succeeded:
+            message = f"DIRTY cleared by cleanup retry for {dirty.run_id}"
+            self._append_log(f"[INFO] {message}")
+            logger.warning("%s", message)
+        elif record.get("status") == "gave_up":
+            self._append_log(f"[ERROR] {record['reason']} ({dirty.run_id})")
+            logger.warning("DIRTY cleanup retry gave up for %s: %s", dirty.run_id, record["reason"])
+        else:
+            message = f"DIRTY cleanup retry failed for {dirty.run_id}: {reason}"
+            self._append_log(f"[WARN] {message}")
+            logger.warning("%s", message)
 
     async def stop_watchdog_worker(self) -> None:
         if self._watchdog_task is None:

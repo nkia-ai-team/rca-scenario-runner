@@ -148,6 +148,9 @@ async def test_cleanup_failure_or_plan_drift_marks_dirty_and_blocks_restart(tmp_
     assert decision.action == "block_dirty"
     dirty = coordinator.snapshot().dirty_run
     assert dirty and dirty.run_id == lease.run_id and dirty.reason == "plan digest drift"
+    # U9: when this failed cleanup ended bounds the node's postponed undo timer.
+    cleanup = json.loads((tmp_path / "runs" / lease.run_id / "cleanup.json").read_text())
+    assert cleanup["succeeded"] is False and cleanup["finished_at"] == NOW.isoformat()
     assert (await WatchdogService(coordinator, tmp_path / "runs", clock=Clock()).tick()).action == "block_dirty"
 
 

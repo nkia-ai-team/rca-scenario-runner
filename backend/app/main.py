@@ -22,6 +22,9 @@ from app.pass_mode import isolation_checks_enabled
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     runner = get_runner()
+    # The DIRTY cleanup retry (U9) yields to the queue the way the manual
+    # cleanup route does: never while it restores the golden or injects.
+    runner.cleanup_retry_hold = lambda: get_live_queue().injection_reserved
     runner.ensure_capture_worker()
     runner.ensure_watchdog_worker()
     get_live_queue().ensure_worker()
