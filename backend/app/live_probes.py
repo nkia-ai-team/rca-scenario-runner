@@ -1821,9 +1821,10 @@ class LiveProbeSet:
         old pod keeps serving while the new one crash-loops or never passes
         readiness. That is a broken target, and a recovery gate must not read
         it as healthy (review R5). So a not-Ready pod counts as starting only
-        while it has not restarted, is not waiting on a failure reason, and is
-        younger than the workload's progress deadline; and a Deployment that
-        reports ProgressDeadlineExceeded is not available."""
+        while its containers have not finished starting (startup probe), it
+        has not restarted, is not waiting on a failure reason, and is younger
+        than the workload's progress deadline; and a Deployment that reports
+        ProgressDeadlineExceeded is not available."""
         key, _, value = selector.partition("=")
         result = self._kubectl(
             "get", "deployments,statefulsets", "--namespace", namespace, "-o", "json",
@@ -2472,6 +2473,15 @@ STUCK_WAITING_REASONS = frozenset(
 
 def _pod_is_stuck(pod: Mapping[str, Any], *, now: datetime, deadline_sec: int) -> bool:
     for status in pod.get("status", {}).get("containerStatuses", []) or []:
+        # Started (startup probe passed, or none) but not Ready: the readiness
+        # probe is failing. Every testbed app has a startup probe on the same
+        # health endpoint, so a healthy pod leaves this state within one
+        # readiness period (10s); one that stays here is broken, and waiting
+        # for the 600s progress deadline let a recovery gate pass on it in 30s
+        # (review 2 N2). Read it as stuck at once; a healthy rollout costs at
+        # most one tick inside that 10s gap.
+        if status.get("started") is True and status.get("ready") is False:
+            return True
         restarts = status.get("restartCount", 0)
         if isinstance(restarts, int) and not isinstance(restarts, bool) and restarts > 0:
             return True

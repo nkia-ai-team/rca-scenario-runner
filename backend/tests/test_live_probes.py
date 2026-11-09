@@ -1874,6 +1874,7 @@ def _pod(
     age_sec: int = 30,
     restarts: int = 0,
     waiting: str | None = None,
+    started: bool | None = None,
 ) -> dict:
     metadata: dict = {
         "name": name,
@@ -1881,7 +1882,14 @@ def _pod(
     }
     if terminating:
         metadata["deletionTimestamp"] = NOW.isoformat()
-    container: dict = {"name": "app", "restartCount": restarts, "state": {"running": {}}}
+    # A not-Ready pod is, by default, still inside its startup probe.
+    container: dict = {
+        "name": "app",
+        "restartCount": restarts,
+        "state": {"running": {}},
+        "ready": ready,
+        "started": ready if started is None else started,
+    }
     if waiting is not None:
         container["state"] = {"waiting": {"reason": waiting}}
     return {
@@ -2082,3 +2090,29 @@ def test_pod_ready_stays_readable_when_the_workload_lookup_fails(tmp_path) -> No
 
     assert observed["quality"] == "good"
     assert observed["value"] is False
+
+
+
+def test_pod_ready_reads_a_new_pod_failing_only_readiness_as_not_ready(tmp_path) -> None:
+    """Review 2 N2: the release starts (startup probe passes) but readiness keeps
+    failing, no restart. Waiting for the 600s deadline let a recovery gate of
+    two 15s ticks pass on it."""
+    fakes = RolloutFakes(
+        pods=[_pod("old", ready=True, age_sec=86_400), _pod("new", ready=False, started=True, age_sec=90)],
+        workloads=[_deployment("testbed-restaurant", replicas=1, available=1)],
+    )
+
+    observed = _restaurant_ready(tmp_path, fakes)
+
+    assert observed["quality"] == "good"
+    assert observed["value"] is False
+
+
+def test_pod_ready_still_reads_a_pod_inside_its_startup_probe_as_starting(tmp_path) -> None:
+    # 2m15s into a release (F76-P measured rollout), still in the startup probe.
+    fakes = RolloutFakes(
+        pods=[_pod("old", ready=True, age_sec=86_400), _pod("new", ready=False, started=False, age_sec=135)],
+        workloads=[_deployment("testbed-restaurant", replicas=1, available=1)],
+    )
+
+    assert _restaurant_ready(tmp_path, fakes)["value"] is True
