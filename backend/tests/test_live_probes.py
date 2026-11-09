@@ -1866,13 +1866,30 @@ class RolloutFakes(Fakes):
         return super().process(argv, **kwargs)
 
 
-def _pod(name: str, *, ready: bool, terminating: bool = False) -> dict:
-    metadata: dict = {"name": name}
+def _pod(
+    name: str,
+    *,
+    ready: bool,
+    terminating: bool = False,
+    age_sec: int = 30,
+    restarts: int = 0,
+    waiting: str | None = None,
+) -> dict:
+    metadata: dict = {
+        "name": name,
+        "creationTimestamp": (NOW - timedelta(seconds=age_sec)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
     if terminating:
         metadata["deletionTimestamp"] = NOW.isoformat()
+    container: dict = {"name": "app", "restartCount": restarts, "state": {"running": {}}}
+    if waiting is not None:
+        container["state"] = {"waiting": {"reason": waiting}}
     return {
         "metadata": metadata,
-        "status": {"conditions": [{"type": "Ready", "status": "True" if ready else "False"}]},
+        "status": {
+            "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+            "containerStatuses": [container],
+        },
     }
 
 
@@ -2002,3 +2019,66 @@ def test_container_restart_count_is_named_after_its_own_target(tmp_path) -> None
         "kubernetes:rca-testbed-banking:testbed-transfer:transfer-service:restart-count"
     )
     assert "payment" not in observed["source"]
+
+
+
+@pytest.mark.parametrize(
+    "new_pod",
+    [
+        # The release crash-loops while the old pod keeps serving.
+        _pod("new", ready=False, restarts=3, waiting="CrashLoopBackOff"),
+        _pod("new", ready=False, waiting="ErrImageNeverPull"),
+        # Readiness never passes, no restart: stuck past the progress deadline.
+        _pod("new", ready=False, age_sec=700),
+    ],
+)
+def test_pod_ready_reads_a_stuck_surge_rollout_as_not_ready(tmp_path, new_pod) -> None:
+    """Review R5: availableReplicas stays 1 because the old pod still serves, but
+    the target is broken; a recovery gate must not read it as healthy."""
+    fakes = RolloutFakes(
+        pods=[_pod("old", ready=True, age_sec=86_400), new_pod],
+        workloads=[_deployment("testbed-restaurant", replicas=1, available=1)],
+    )
+
+    observed = _restaurant_ready(tmp_path, fakes)
+
+    assert observed["quality"] == "good"
+    assert observed["value"] is False
+
+
+def test_pod_ready_honours_progress_deadline_exceeded(tmp_path) -> None:
+    workload = _deployment("testbed-restaurant", replicas=1, available=1)
+    workload["status"]["conditions"] = [
+        {"type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded"}
+    ]
+    fakes = RolloutFakes(
+        pods=[_pod("old", ready=True), _pod("new", ready=False)], workloads=[workload]
+    )
+
+    assert _restaurant_ready(tmp_path, fakes)["value"] is False
+
+
+def test_pod_ready_uses_the_workloads_own_progress_deadline(tmp_path) -> None:
+    workload = _deployment("testbed-restaurant", replicas=1, available=1)
+    workload["spec"]["progressDeadlineSeconds"] = 900
+    fakes = RolloutFakes(
+        pods=[_pod("old", ready=True), _pod("new", ready=False, age_sec=700)],
+        workloads=[workload],
+    )
+
+    assert _restaurant_ready(tmp_path, fakes)["value"] is True
+
+
+def test_pod_ready_stays_readable_when_the_workload_lookup_fails(tmp_path) -> None:
+    class FailingLookup(RolloutFakes):
+        def process(self, argv, **kwargs):
+            if "deployments,statefulsets" in list(argv):
+                raise subprocess.CalledProcessError(1, list(argv), "", "forbidden")
+            return super().process(argv, **kwargs)
+
+    fakes = FailingLookup(pods=[_pod("a", ready=True), _pod("b", ready=False)], workloads=[])
+
+    observed = _restaurant_ready(tmp_path, fakes)
+
+    assert observed["quality"] == "good"
+    assert observed["value"] is False

@@ -1792,22 +1792,38 @@ class LiveProbeSet:
         # down", so ask the owning workload whether its desired replicas are
         # available. A target with no single owning workload keeps the pod
         # answer.
-        available = self._workload_available(str(namespace), selector)
+        try:
+            available = self._workload_available(str(namespace), selector, items)
+        except (LiveProbeError, subprocess.SubprocessError, ValueError, KeyError):
+            # The pods already answered; a failed second look must not turn a
+            # readable "not ready" into an unreadable observation.
+            available = None
         if available is None:
             return False, _aware(self.clock()), f"kubernetes:{namespace}:{resource}:ready"
         return available, _aware(self.clock()), (
             f"kubernetes:{namespace}:{resource}:workload-available"
         )
 
-    def _workload_available(self, namespace: str, selector: str) -> bool | None:
+    def _workload_available(
+        self, namespace: str, selector: str, pods: list[Mapping[str, Any]]
+    ) -> bool | None:
         """Whether the one Deployment/StatefulSet selecting ``selector`` has all
-        its desired replicas available; None when no single workload owns it.
+        its desired replicas available while every not-Ready pod is still
+        plausibly starting; None when no single workload owns it.
 
         Kubernetes' own measure: availableReplicas counts Ready pods (past
         minReadySeconds) and never a terminating one, old and new ReplicaSets
         together. So it stays at the desired count through a surge rollout and
         falls when serving capacity really falls (readiness fault, crash loop,
-        maxSurge 0 rollout to a broken image, scale to zero)."""
+        maxSurge 0 rollout to a broken image, scale to zero).
+
+        It also stays at the desired count when a surge rollout is stuck: the
+        old pod keeps serving while the new one crash-loops or never passes
+        readiness. That is a broken target, and a recovery gate must not read
+        it as healthy (review R5). So a not-Ready pod counts as starting only
+        while it has not restarted, is not waiting on a failure reason, and is
+        younger than the workload's progress deadline; and a Deployment that
+        reports ProgressDeadlineExceeded is not available."""
         key, _, value = selector.partition("=")
         result = self._kubectl(
             "get", "deployments,statefulsets", "--namespace", namespace, "-o", "json",
@@ -1821,6 +1837,21 @@ class LiveProbeSet:
             return None
         spec = owners[0].get("spec", {})
         status = owners[0].get("status", {})
+        if any(
+            condition.get("type") == "Progressing"
+            and condition.get("reason") == "ProgressDeadlineExceeded"
+            for condition in status.get("conditions", [])
+        ):
+            return False
+        deadline = spec.get("progressDeadlineSeconds", DEFAULT_PROGRESS_DEADLINE_SEC)
+        if isinstance(deadline, bool) or not isinstance(deadline, int) or deadline <= 0:
+            deadline = DEFAULT_PROGRESS_DEADLINE_SEC
+        now = _aware(self.clock())
+        for pod in pods:
+            if pod.get("metadata", {}).get("deletionTimestamp") is not None or _pod_is_ready(pod):
+                continue
+            if _pod_is_stuck(pod, now=now, deadline_sec=deadline):
+                return False
         desired = spec.get("replicas", 1)
         available = status.get("availableReplicas")
         if available is None and owners[0].get("kind") == "StatefulSet":
@@ -2420,6 +2451,43 @@ def _run_intervals(run_dir: Path) -> list[tuple[datetime, datetime]]:
             )
         )
     return intervals
+
+
+# Kubernetes' default Deployment progressDeadlineSeconds.
+DEFAULT_PROGRESS_DEADLINE_SEC = 600
+# Waiting reasons that mean a container is failing, not starting.
+STUCK_WAITING_REASONS = frozenset(
+    {
+        "CrashLoopBackOff",
+        "ErrImagePull",
+        "ImagePullBackOff",
+        "ErrImageNeverPull",
+        "InvalidImageName",
+        "CreateContainerConfigError",
+        "CreateContainerError",
+        "RunContainerError",
+    }
+)
+
+
+def _pod_is_stuck(pod: Mapping[str, Any], *, now: datetime, deadline_sec: int) -> bool:
+    for status in pod.get("status", {}).get("containerStatuses", []) or []:
+        restarts = status.get("restartCount", 0)
+        if isinstance(restarts, int) and not isinstance(restarts, bool) and restarts > 0:
+            return True
+        if status.get("state", {}).get("waiting", {}).get("reason") in STUCK_WAITING_REASONS:
+            return True
+        if status.get("state", {}).get("terminated") is not None:
+            return True
+    created = pod.get("metadata", {}).get("creationTimestamp")
+    if isinstance(created, str):
+        try:
+            age = (now - _aware(datetime.fromisoformat(created.replace("Z", "+00:00")))).total_seconds()
+        except ValueError:
+            return False
+        if age > deadline_sec:
+            return True
+    return False
 
 
 def _pod_is_ready(item: Mapping[str, Any]) -> bool:
