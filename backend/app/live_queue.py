@@ -816,7 +816,7 @@ class LiveScenarioQueue:
     ) -> tuple[LiveQueueState | None, str | None, PreflightVerdict | None]:
         if state.next_index >= len(state.scenario_ids):
             return self._complete(state), None, None
-        if self.runner.is_busy or self.runner.coordinator.snapshot().active_lease is not None:
+        if self._runner_engaged():
             return state, None, None
         scenario_id = state.scenario_ids[state.next_index]
         # Daily normal-segment protection: never let an injection start
@@ -1078,7 +1078,7 @@ class LiveScenarioQueue:
         """
         if state.next_index >= len(state.scenario_ids):
             return self._complete(state)
-        if self.runner.is_busy or self.runner.coordinator.snapshot().active_lease is not None:
+        if self._runner_engaged():
             return state
         # A restart or resume schedules this phase for after the previous
         # run's effect has ended and cooled down (see _settle_not_before); the
@@ -1173,7 +1173,7 @@ class LiveScenarioQueue:
         The gate (preflight probe, incident sweep) runs on a worker thread and
         the bookkeeping after the start does too; runner.start stays on the
         loop because it creates the run's task there."""
-        if self.runner.is_busy or self.runner.coordinator.snapshot().active_lease is not None:
+        if self._runner_engaged():
             return state
         if not self._transition_due(state):
             return state
@@ -1483,6 +1483,22 @@ class LiveScenarioQueue:
         )
         self._write(state)
         return state
+
+    def _runner_engaged(self) -> bool:
+        """The queue's "someone else holds the testbed" check.
+
+        Besides a running run and a held lease, a manual start that is still
+        preparing its capsule off the loop counts: it has passed the runner's
+        own gate but has neither a run nor a lease yet, and a golden restore or
+        injection decided now would overlap it (review 2 N1, the reverse of R3).
+        The manual route checks ``injection_reserved`` and the runner sets
+        ``is_starting`` with no await in between, so whichever side moves first
+        on the loop, the other sees it."""
+        return (
+            self.runner.is_busy
+            or bool(getattr(self.runner, "is_starting", False))
+            or self.runner.coordinator.snapshot().active_lease is not None
+        )
 
     def _settle_not_before(self, run_id: str | None, now: datetime) -> datetime | None:
         """When a fresh normal window may start after ``run_id``.

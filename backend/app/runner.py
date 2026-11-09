@@ -201,6 +201,13 @@ class ScenarioRunner:
             "cleanup_running",
         }
 
+    @property
+    def is_starting(self) -> bool:
+        """A start has passed the busy gate and is preparing off the loop
+        (capsule copy and compile, orphan DIRTY scan); it has no run or lease
+        yet. The live queue treats this as busy."""
+        return self._starting
+
     def _owns_live_lease(self, run_id: str, fencing_token: int) -> bool:
         """True while the run holding this lease is still executing here.
 

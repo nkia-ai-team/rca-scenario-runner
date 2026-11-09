@@ -214,6 +214,13 @@ async def api_cleanup(scenario_id: str, repair_capsule: bool = False) -> RunInfo
     clean.
     """
     runner = get_runner()
+    if get_live_queue().injection_reserved:
+        # An external cleanup may re-adopt an orphaned DIRTY run and undo its
+        # effect; not while the queue restores the golden or injects.
+        raise HTTPException(
+            status_code=409,
+            detail="live queue is restoring or injecting; cleanup refused, retry shortly",
+        )
     try:
         return await runner.start(
             scenario_id=scenario_id, mode="cleanup", repair_capsule=repair_capsule

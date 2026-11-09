@@ -1571,3 +1571,86 @@ async def test_failed_collector_start_unbinds_the_collector(tmp_path: Path) -> N
     state = await queue.tick()  # cycle_reset on a worker thread, start on the loop
     assert state.phase == "cycle_normal"
     assert queue._topology_collector is None
+
+
+@pytest.mark.asyncio
+async def test_queue_waits_while_a_manual_run_prepares_its_capsule(tmp_path: Path, monkeypatch) -> None:
+    """Review 2 N1 (the reverse of R3): a manual run preparing its capsule off
+    the loop has passed the runner's gate but holds neither a run nor a lease.
+    The queue's busy check did not see it and restored the golden meanwhile."""
+    import asyncio
+    import threading
+
+    from app.coordinator import GlobalCoordinator
+    from app.runner import ScenarioRunner
+    from tests.test_controller_orchestration import (
+        _controller_yaml,
+        _runner_scenario,
+        parse_controller,
+    )
+
+    script = tmp_path / "scenario.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    scenario = _runner_scenario(
+        script, controller=parse_controller(_controller_yaml(mode="evaluation"))
+    ).model_copy(update={"injection": {"profile_id": "p", "catalog_slug": "s"}})
+    monkeypatch.setattr("app.runner.get_scenario", lambda _: scenario)
+    real = ScenarioRunner(
+        tmp_path, tmp_path / "logs", coordinator=GlobalCoordinator(tmp_path / "state.json")
+    )
+    release = threading.Event()
+    entered = threading.Event()
+
+    def blocking_prepare(run_id, **kwargs):
+        entered.set()
+        release.wait(5)
+        raise RuntimeError("prepare refused")
+
+    monkeypatch.setattr(real.artifact_store, "prepare_capsule", blocking_prepare)
+
+    (tmp_path / "q").mkdir()
+    queue, runner, _, _, _ = _golden_queue(tmp_path / "q", monkeypatch, delay=0)
+    # The queue sees the real runner's start state through the same attribute.
+    type(runner).is_starting = property(lambda self: real.is_starting)
+    try:
+        await queue.start()
+        manual = asyncio.create_task(real.start(scenario.id, "run"))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+
+        state = await queue.tick()
+
+        assert state.phase == "cycle_reset"
+        assert queue._restore_runner.remotes == []  # no golden restore meanwhile
+        release.set()
+        with pytest.raises(RuntimeError, match="prepare refused"):
+            await manual
+        state = await queue.tick()
+        assert state.phase == "cycle_normal"
+    finally:
+        del type(runner).is_starting
+
+
+@pytest.mark.asyncio
+async def test_manual_cleanup_is_refused_while_the_queue_restores_the_golden(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import asyncio
+
+    from httpx import ASGITransport, AsyncClient
+
+    from app import main
+
+    queue, runner, _, _, _ = _golden_queue(tmp_path, monkeypatch, delay=0.5)
+    await queue.start()
+    monkeypatch.setattr(main, "get_live_queue", lambda: queue)
+    monkeypatch.setattr(main, "get_runner", lambda: runner)
+
+    async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://t") as client:
+        tick = asyncio.create_task(queue.tick())
+        await asyncio.sleep(0.1)
+        response = await client.post("/api/scenarios/F01-R/cleanup")
+        await tick
+
+    assert response.status_code == 409
+    assert runner.started == []
