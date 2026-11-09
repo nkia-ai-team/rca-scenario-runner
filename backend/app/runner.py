@@ -202,6 +202,10 @@ class ScenarioRunner:
         # sets the hold so a retry never starts while it restores or injects.
         self.dirty_retry_policy = dirty_retry.RetryPolicy.from_env()
         self.cleanup_retry_hold: Callable[[], bool] | None = None
+        self._retry_task: Optional[asyncio.Task] = None
+        # An attempt cut off with an earlier process may have reached a node up
+        # to that process's end; this process's start bounds it.
+        self._process_started_at = self.clock.now()
 
     @property
     def is_busy(self) -> bool:
@@ -1148,7 +1152,10 @@ class ScenarioRunner:
             await self.sleeper(max(1, self.heartbeat_interval_sec))
 
     def _retry_blocked(self) -> str | None:
-        if self._lock.locked() or self.is_busy or self._starting:
+        # The retry task counts until it has written its outcome, not just
+        # until the cleanup returned: the record is only final after that.
+        retrying = self._retry_task is not None and not self._retry_task.done()
+        if self._lock.locked() or self.is_busy or self._starting or retrying:
             return "runner_busy"
         hold = self.cleanup_retry_hold
         if hold is not None and hold():
@@ -1175,14 +1182,32 @@ class ScenarioRunner:
         dirty = state.dirty_run
         if dirty is None:
             return "no_dirty_run"
-        if state.cleanup_claim is not None:
-            return "cleanup_already_claimed"
         run_dir = self.artifact_store.root / dirty.run_id
         if run_dir.parent != self.artifact_store.root or run_dir.is_symlink():
             return "run_dir_outside_trusted_root"
+        claim = state.cleanup_claim
+        if claim is not None:
+            # Nothing in this runner is cleaning (checked above), so the claim
+            # was left by an attempt whose process is gone. Only its holder
+            # releases it; say why the retry is stuck instead of waiting silently.
+            if claim.run_id == dirty.run_id and await asyncio.to_thread(
+                dirty_retry.note_blocked_by_claim, run_dir, dirty, claim
+            ):
+                message = (
+                    f"DIRTY cleanup retry for {dirty.run_id} blocked: cleanup claim held by "
+                    f"{claim.claimant} since {claim.claimed_at.isoformat()} and no attempt runs here"
+                )
+                self._append_log(f"[WARN] {message}")
+                logger.warning("%s", message)
+            return "cleanup_already_claimed"
         policy = self.dirty_retry_policy
         decision = await asyncio.to_thread(
-            dirty_retry.decide, run_dir, dirty, now=self.clock.now(), policy=policy
+            dirty_retry.decide,
+            run_dir,
+            dirty,
+            now=self.clock.now(),
+            policy=policy,
+            process_started_at=self._process_started_at,
         )
         if not decision.due:
             if decision.reason == "waiting_for_node_undo_deadline":
@@ -1229,6 +1254,7 @@ class ScenarioRunner:
         self._task = asyncio.create_task(
             self._execute_dirty_cleanup_retry(dirty, run_dir, claimant)
         )
+        self._retry_task = self._task
         return "cleanup_retry_started"
 
     async def _execute_dirty_cleanup_retry(self, dirty, run_dir: Path, claimant: str) -> None:

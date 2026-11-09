@@ -347,6 +347,11 @@ async def test_refused_capsule_repair_leaves_a_readable_reason(tmp_path, monkeyp
 # injection duration + 600s, or the last cleanup that reached the node + 960s).
 
 U9_T0 = datetime(2026, 11, 9, 3, 0, tzinfo=timezone.utc)
+U9_PROFILE = "load.north_south"
+U9_LEVELS = [
+    {"level_index": 0, "level_id": "low", "parameters": {"target_rps": 60}},
+    {"level_index": 1, "level_id": "high", "parameters": {"target_rps": 70}},
+]
 
 
 class MovingClock:
@@ -357,19 +362,121 @@ class MovingClock:
         return self.at
 
 
+def minutes(value: float) -> timedelta:
+    return timedelta(minutes=value)
+
+
+def journal_applies(run_dir, slug: str, plan: dict, clock: MovingClock, applies) -> list:
+    """Drive the real applier through the run's applies; returns the level changes.
+
+    Each apply is ``(level, called_at, returned_at, outcome)``: profile-control
+    reports ``applied_at = called_at`` (it takes the time before its executor
+    runs) and returns at ``returned_at``. ``outcome`` is "ok", "failed"
+    (profile-control exits non-zero) or "died" (the process went away in it)."""
+    import subprocess
+
+    from app.adaptive_runtime import ApplyRequest
+    from app.production_runtime import TrustedDispatcherApplier as RealApplier
+
+    contracts = run_dir / "capsule" / "contracts"
+    current: dict = {}
+
+    def process_runner(argv, **kwargs):
+        if argv[0] == str(contracts / "run-scenario.sh"):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"normalized_plan": plan}), "")
+        clock.at = current["returned_at"]
+        if current["outcome"] == "failed":
+            raise subprocess.CalledProcessError(1, argv, "", "unit did not become active")
+        if current["outcome"] == "died":
+            raise RuntimeError("process went away mid-apply")
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"applied_at": current["called_at"].isoformat()}), ""
+        )
+
+    applier = RealApplier(
+        slug,
+        primary_profile=U9_PROFILE,
+        dispatcher=contracts / "run-scenario.sh",
+        profile_control=contracts / "profile-control.py",
+        process_runner=process_runner,
+        clock=clock,
+        run_dir=run_dir,
+    )
+    changes = []
+    for level, called_at, returned_at, outcome in applies:
+        current.update(called_at=called_at, returned_at=returned_at, outcome=outcome)
+        clock.at = called_at
+        request = ApplyRequest(
+            run_id="dirty-run",
+            scenario_id="F07-E",
+            fencing_token=1,
+            profile_id=U9_PROFILE,
+            level_index=level,
+            level_id=U9_LEVELS[level]["level_id"],
+            parameters=U9_LEVELS[level]["parameters"],
+            idempotency_key=f"apply:dirty-run:1:{level}",
+            requested_at=called_at,
+        )
+        if outcome == "ok":
+            result = applier.apply(request)
+            changes.append(
+                {"level_index": level, "level_id": U9_LEVELS[level]["level_id"],
+                 "applied_at": result.applied_at.isoformat()}
+            )
+        else:
+            with pytest.raises(Exception):
+                applier.apply(request)
+    return changes
+
+
+def dirty_session(
+    level_changes: list, *, terminal: datetime, reason: str, cleanup_succeeded: bool = False
+) -> dict:
+    """state.json as the controller leaves it, reason through the real finalize_cleanup."""
+    from app.adaptive import ControllerAction, ControllerPhase, ControllerState, finalize_cleanup
+
+    terminal_state = ControllerState(
+        phase=ControllerPhase.ABORTED, action=ControllerAction.ABORT, reason=reason
+    )
+    final = (
+        finalize_cleanup(terminal_state, cleanup_succeeded=False)
+        if not cleanup_succeeded
+        else terminal_state
+    )
+    return {
+        "status": "dirty",
+        "scenario_id": "F07-E",
+        "level_changes": level_changes,
+        "controller_state": final.model_dump(mode="json"),
+        "terminal_at": terminal.isoformat(),
+        "cleanup": {
+            "requested_at": terminal.isoformat(),
+            "idempotency_key": "cleanup:dirty-run:1",
+            "succeeded": cleanup_succeeded,
+            "reason": None
+            if cleanup_succeeded
+            else "cleanup_exception:CalledProcessError: ssh: connect to host tb-w2 port 22: No route to host",
+        },
+    }
+
+
 def dirty_cleanup_run(
     tmp_path,
     monkeypatch,
     *,
     marked_at: datetime,
-    session: dict | None,
+    applies=((0, U9_T0, U9_T0, "ok"),),
+    terminal: datetime | None = None,
+    reason: str = "profile_apply_failed:CalledProcessError",
+    write_session: bool = True,
+    cleanup_succeeded: bool = False,
     flat_cleanup: dict | None = None,
     max_injection="20m",
     outcomes=None,
 ):
     """A DIRTY capsule run, as a failed node cleanup leaves it, and a runner on a movable clock.
 
-    ``outcomes`` lists what successive cleanup calls report (True, or a failure reason)."""
+    ``outcomes`` lists what successive retry cleanups report (True, or a failure reason)."""
     selected = manifest("evaluation")
     monkeypatch.setattr("app.runner.get_scenario", lambda _: None)
     monkeypatch.setattr("app.runner.get_manifest", lambda _: selected)
@@ -388,16 +495,10 @@ def dirty_cleanup_run(
             return SimpleNamespace(succeeded=False, reason=outcome, effect_ended_at=None)
 
     monkeypatch.setattr("app.runner.TrustedDispatcherApplier", Applier)
-    clock = MovingClock(marked_at)
+    clock = MovingClock(U9_T0)
     coordinator = GlobalCoordinator(tmp_path / "coordinator.json")
     lease = coordinator.acquire(
         run_id="dirty-run", scenario_id=selected.id, now=U9_T0, lease_sec=30
-    )
-    coordinator.mark_dirty(
-        run_id=lease.run_id,
-        fencing_token=lease.fencing_token,
-        reason="adaptive_controller_dirty",
-        now=marked_at,
     )
     store = RunArtifactStore(tmp_path / "runs")
     contract = tmp_path / "contracts"
@@ -406,7 +507,7 @@ def dirty_cleanup_run(
         "scenario": {"id": selected.id, "slug": selected.slug},
         "live_allowed": True,
         "plan_digest": "a" * 64,
-        "profile_instances": [],
+        "profile_instances": [{"profile_id": U9_PROFILE, "approved_levels": U9_LEVELS}],
         "controller": {"runtime": {"mode": "evaluation", "max_injection_duration": max_injection}},
     }
     dispatcher = contract / "run-scenario.sh"
@@ -423,15 +524,31 @@ def dirty_cleanup_run(
         scenario_slug=selected.slug,
         binding={
             "catalog_slug": selected.slug,
-            "primary_profile": "load.north_south",
+            "primary_profile": U9_PROFILE,
             "logical_profile_id": "F07-E.fixed.v1",
             "companion_profiles": [],
         },
     )
-    if session is not None:
-        store.persist_session(run_dir, session)
+    changes = journal_applies(run_dir, selected.slug, plan, clock, applies)
+    if write_session:
+        store.persist_session(
+            run_dir,
+            dirty_session(
+                changes,
+                terminal=terminal or marked_at - minutes(1),
+                reason=reason,
+                cleanup_succeeded=cleanup_succeeded,
+            ),
+        )
     if flat_cleanup is not None:
         (run_dir / "cleanup.json").write_text(json.dumps(flat_cleanup), encoding="utf-8")
+    coordinator.mark_dirty(
+        run_id=lease.run_id,
+        fencing_token=lease.fencing_token,
+        reason="adaptive_controller_dirty",
+        now=marked_at,
+    )
+    clock.at = marked_at
     runner = ScenarioRunner(
         tmp_path,
         tmp_path / "logs",
@@ -444,27 +561,6 @@ def dirty_cleanup_run(
     )
 
 
-def failed_cleanup_session(
-    *, applied: list[datetime], terminal: datetime, reason: str = "success_conditions_met"
-) -> dict:
-    return {
-        "status": "dirty",
-        "scenario_id": "F07-E",
-        "level_changes": [
-            {"level_index": 0, "level_id": "fixed", "applied_at": moment.isoformat()}
-            for moment in applied
-        ],
-        "controller_state": {"phase": "succeeded", "reason": reason},
-        "terminal_at": terminal.isoformat(),
-        "cleanup": {
-            "requested_at": terminal.isoformat(),
-            "idempotency_key": "cleanup:dirty-run:1",
-            "succeeded": False,
-            "reason": "cleanup_exception:CalledProcessError: ssh: connect to host tb-w2 port 22: No route to host",
-        },
-    }
-
-
 async def settle(runner) -> str:
     """One retry check; if it started a cleanup, wait for it."""
     decision = await runner.retry_dirty_cleanup_when_due()
@@ -474,57 +570,66 @@ async def settle(runner) -> str:
     return decision
 
 
-def minutes(value: float) -> timedelta:
-    return timedelta(minutes=value)
+U9_DEADLINE_CASES = {
+    # The node deadline counts from when the arming apply returned: + 20m + 10m, + 5m slack.
+    "arm-bound": (dict(marked_at=U9_T0 + minutes(2)), minutes(35)),
+    # A late failed cleanup postponed the node timer: marked + 16m + 5m.
+    "cleanup-postponed": (dict(marked_at=U9_T0 + minutes(25)), minutes(25 + 16 + 5)),
+    # An escalation applied later re-armed the node from there.
+    "re-armed-by-escalation": (
+        dict(
+            marked_at=U9_T0 + minutes(10),
+            applies=((0, U9_T0, U9_T0, "ok"), (1, U9_T0 + minutes(8), U9_T0 + minutes(8), "ok")),
+            reason="success_conditions_met",
+        ),
+        minutes(8 + 30 + 5),
+    ),
+    # Review H1: the escalation's apply armed the node, then failed. The level
+    # change list has only level 0, and the controller reason reads
+    # "cleanup_failed after profile_apply_failed:...". The failed call's end bounds the arm.
+    "escalation-failed-after-arm": (
+        dict(
+            marked_at=U9_T0 + minutes(10),
+            applies=(
+                (0, U9_T0, U9_T0, "ok"),
+                (1, U9_T0 + minutes(8), U9_T0 + minutes(9), "failed"),
+            ),
+            terminal=U9_T0 + minutes(9),
+        ),
+        minutes(9 + 30 + 5),
+    ),
+    # Review M1: profile-control reports applied_at before its executor runs;
+    # checks and the guard lock wait put the arm minutes later (here 4m).
+    "slow-executor": (
+        dict(marked_at=U9_T0 + minutes(5), applies=((0, U9_T0, U9_T0 + minutes(4), "ok"),)),
+        minutes(4 + 30 + 5),
+    ),
+    # The process died inside an apply and the watchdog cleaned up: the session
+    # never closed and the apply has only its intent. The DIRTY mark bounds every arm.
+    "died-mid-apply": (
+        dict(
+            marked_at=U9_T0 + minutes(4),
+            applies=((0, U9_T0, U9_T0, "died"),),
+            write_session=False,
+            flat_cleanup={
+                "schema_version": 1,
+                "source": "watchdog",
+                "succeeded": False,
+                "reason": "watchdog_cleanup_failed:CalledProcessError",
+            },
+        ),
+        minutes(4 + 30 + 5),
+    ),
+}
 
 
-@pytest.mark.parametrize(
-    ("case", "first_retry_at"),
-    [
-        # Node deadline from the arm: last apply + 20m + 10m, plus 5m slack.
-        ("arm-bound", minutes(35)),
-        # A late failed cleanup postponed the node timer: marked + 16m + 5m.
-        ("cleanup-postponed", minutes(25 + 16 + 5)),
-        # An escalation applied later re-armed the node from there.
-        ("re-armed-by-escalation", minutes(8 + 30 + 5)),
-        # An apply that failed may have armed before failing: terminal_at bounds it.
-        ("apply-failed-after-arm", minutes(12 + 30 + 5)),
-        # The session never closed (watchdog cleanup): the DIRTY mark bounds every arm.
-        ("watchdog-no-session", minutes(4 + 30 + 5)),
-    ],
-)
+@pytest.mark.parametrize("case", list(U9_DEADLINE_CASES))
 async def test_dirty_cleanup_retry_waits_for_the_node_undo_deadline_then_clears_dirty(
-    tmp_path, monkeypatch, case, first_retry_at
+    tmp_path, monkeypatch, case
 ) -> None:
-    session = failed_cleanup_session(applied=[U9_T0], terminal=U9_T0 + minutes(1))
-    marked = U9_T0 + minutes(2)
-    flat_cleanup = None
-    if case == "cleanup-postponed":
-        marked = U9_T0 + minutes(25)
-    elif case == "re-armed-by-escalation":
-        session = failed_cleanup_session(
-            applied=[U9_T0, U9_T0 + minutes(8)], terminal=U9_T0 + minutes(9)
-        )
-        marked = U9_T0 + minutes(10)
-    elif case == "apply-failed-after-arm":
-        session = failed_cleanup_session(
-            applied=[U9_T0],
-            terminal=U9_T0 + minutes(12),
-            reason="profile_apply_failed:CalledProcessError",
-        )
-        marked = U9_T0 + minutes(13)
-    elif case == "watchdog-no-session":
-        session = None
-        marked = U9_T0 + minutes(4)
-        flat_cleanup = {
-            "schema_version": 1,
-            "source": "watchdog",
-            "succeeded": False,
-            "reason": "watchdog_cleanup_failed:CalledProcessError",
-        }
-    run = dirty_cleanup_run(
-        tmp_path, monkeypatch, marked_at=marked, session=session, flat_cleanup=flat_cleanup
-    )
+    setup, first_retry_at = U9_DEADLINE_CASES[case]
+    run = dirty_cleanup_run(tmp_path, monkeypatch, **setup)
+    marked = setup["marked_at"]
 
     # Before the node's deadline: never call cleanup (it would race the node's own undo).
     for at in (marked, U9_T0 + first_retry_at - timedelta(seconds=1)):
@@ -557,6 +662,25 @@ async def test_dirty_cleanup_retry_waits_for_the_node_undo_deadline_then_clears_
     assert all(end <= U9_T0 + first_retry_at for _, end in _run_intervals(run.run_dir))
 
 
+def test_the_applier_journals_when_a_failed_apply_call_ended(tmp_path, monkeypatch) -> None:
+    """The retry's arm bound: a failed profile-control call leaves its end in
+    mutations.json; a call the process never came back from leaves only its intent."""
+    run = dirty_cleanup_run(
+        tmp_path,
+        monkeypatch,
+        marked_at=U9_T0 + minutes(20),
+        applies=(
+            (0, U9_T0, U9_T0 + minutes(1), "ok"),
+            (1, U9_T0 + minutes(8), U9_T0 + minutes(9), "failed"),
+        ),
+    )
+    operations = json.loads((run.run_dir / "mutations.json").read_text())["operations"]
+    assert [(op["complete_at"], op.get("failed_at")) for op in operations] == [
+        ((U9_T0 + minutes(1)).isoformat(), None),
+        (None, (U9_T0 + minutes(9)).isoformat()),
+    ]
+
+
 async def test_failed_dirty_cleanup_retries_stop_at_the_limit_and_keep_dirty(
     tmp_path, monkeypatch
 ) -> None:
@@ -564,7 +688,6 @@ async def test_failed_dirty_cleanup_retries_stop_at_the_limit_and_keep_dirty(
         tmp_path,
         monkeypatch,
         marked_at=U9_T0 + minutes(2),
-        session=failed_cleanup_session(applied=[U9_T0], terminal=U9_T0 + minutes(1)),
         outcomes=["ssh refused 1", "ssh refused 2", "ssh refused 3", True],
     )
     assert run.runner.dirty_retry_policy.max_attempts == 3
@@ -603,13 +726,59 @@ async def test_failed_dirty_cleanup_retries_stop_at_the_limit_and_keep_dirty(
     assert len(run.calls) == 3
 
 
-async def test_a_retry_attempt_that_raises_counts_and_keeps_dirty(tmp_path, monkeypatch) -> None:
+async def test_the_retry_holds_the_runner_until_its_outcome_is_recorded(
+    tmp_path, monkeypatch
+) -> None:
+    """Review L1: the cleanup released the runner before the attempt's outcome
+    was written, and a waiting note written in that gap erased the outcome and
+    the give-up reason. The runner stays held until the record is final, and
+    a waiting note never overwrites a final record."""
+    import asyncio
+
+    from app import dirty_retry
+
     run = dirty_cleanup_run(
         tmp_path,
         monkeypatch,
         marked_at=U9_T0 + minutes(2),
-        session=failed_cleanup_session(applied=[U9_T0], terminal=U9_T0 + minutes(1)),
+        outcomes=["ssh refused 1", "ssh refused 2", "ssh refused 3"],
     )
+    run.runner.dirty_retry_policy = dirty_retry.RetryPolicy(max_attempts=1)
+    finished = dirty_retry.note_finished
+
+    def slow_note_finished(*args, **kwargs):
+        # Runs on a worker thread after the cleanup has returned and released
+        # its claim: the window the review found.
+        import time
+
+        time.sleep(0.2)
+        return finished(*args, **kwargs)
+
+    monkeypatch.setattr(dirty_retry, "note_finished", slow_note_finished)
+    run.clock.at = U9_T0 + minutes(35)
+    assert await run.runner.retry_dirty_cleanup_when_due() == "cleanup_retry_started"
+    for _ in range(500):
+        if run.runner.get_current().status != "cleanup_running":
+            break
+        await asyncio.sleep(0.01)
+    assert run.runner.get_current().status == "failed"
+    assert run.coordinator.snapshot().cleanup_claim is None
+    # The cleanup is over but its outcome is not written yet: no new decision.
+    assert await run.runner.retry_dirty_cleanup_when_due() == "runner_busy"
+    await run.runner._task
+
+    record = json.loads((run.run_dir / "dirty-retry.json").read_text())
+    assert record["status"] == "gave_up" and "ssh refused 1" in record["reason"]
+    waiting = dirty_retry.RetryDecision(
+        due=False, reason="waiting_for_node_undo_deadline", not_before=run.clock.at
+    )
+    dirty = run.coordinator.snapshot().dirty_run
+    dirty_retry.note_waiting(run.run_dir, dirty, waiting)
+    assert json.loads((run.run_dir / "dirty-retry.json").read_text()) == record
+
+
+async def test_a_retry_attempt_that_raises_counts_and_keeps_dirty(tmp_path, monkeypatch) -> None:
+    run = dirty_cleanup_run(tmp_path, monkeypatch, marked_at=U9_T0 + minutes(2))
 
     def broken(_run_dir):
         raise RuntimeError("capsule contract hash mismatch")
@@ -629,21 +798,77 @@ async def test_a_retry_attempt_that_raises_counts_and_keeps_dirty(tmp_path, monk
     assert await settle(run.runner) == "waiting_for_node_undo_deadline"
 
 
-@pytest.mark.parametrize(
-    "reason",
-    ["recovery_timeout", "heartbeat_failed"],
-)
+async def test_an_attempt_cut_off_with_its_process_counts_from_this_process_start(
+    tmp_path, monkeypatch
+) -> None:
+    """Review M2: an attempt the previous process never finished may have
+    reached a node (and postponed its timer) any time until that process was
+    gone. Its start alone is too early; this process's start bounds it."""
+    from app import dirty_retry
+
+    run = dirty_cleanup_run(tmp_path, monkeypatch, marked_at=U9_T0 + minutes(2))
+    dirty = run.coordinator.snapshot().dirty_run
+    dirty_retry.note_started(
+        run.run_dir, dirty, claimant="cleanup-retry-gone", started_at=U9_T0 + minutes(35)
+    )
+    # The new process starts an hour later.
+    run.clock.at = U9_T0 + minutes(95)
+    restarted = ScenarioRunner(
+        tmp_path,
+        tmp_path / "logs",
+        coordinator=run.coordinator,
+        artifact_store=run.runner.artifact_store,
+        clock=run.clock,
+    )
+    assert await settle(restarted) == "waiting_for_node_undo_deadline"
+    record = json.loads((run.run_dir / "dirty-retry.json").read_text())
+    assert record["not_before"] == (U9_T0 + minutes(95 + 16 + 5)).isoformat()
+    run.clock.at = U9_T0 + minutes(95 + 16 + 5)
+    assert await settle(restarted) == "cleanup_retry_started"
+    assert run.coordinator.snapshot().dirty_run is None
+
+
+async def test_a_claim_left_by_a_killed_attempt_is_reported_not_waited_on_silently(
+    tmp_path, monkeypatch
+) -> None:
+    """Review M2: a process killed mid-attempt leaves its cleanup claim, which
+    only its holder releases. The retry cannot run; it says so once, in the
+    record and the log, and goes on once the claim is gone."""
+    run = dirty_cleanup_run(tmp_path, monkeypatch, marked_at=U9_T0 + minutes(2))
+    token = run.coordinator.snapshot().dirty_run.fencing_token
+    run.coordinator.claim_cleanup(
+        run_id="dirty-run", fencing_token=token, claimant="cleanup-retry-killed",
+        now=U9_T0 + minutes(35),
+    )
+    run.clock.at = U9_T0 + minutes(60)
+    assert await settle(run.runner) == "cleanup_already_claimed"
+    assert await settle(run.runner) == "cleanup_already_claimed"
+    record = json.loads((run.run_dir / "dirty-retry.json").read_text())
+    assert record["status"] == "blocked"
+    assert "cleanup-retry-killed" in record["reason"]
+    assert sum("blocked" in line for line in run.runner._log_buffer) == 1
+    assert run.calls == []
+
+    run.coordinator.finish_cleanup_claim(
+        run_id="dirty-run", fencing_token=token, claimant="cleanup-retry-killed"
+    )
+    assert await settle(run.runner) == "cleanup_retry_started"
+    assert run.coordinator.snapshot().dirty_run is None
+
+
+@pytest.mark.parametrize("reason", ["recovery_timeout", "heartbeat_failed"])
 async def test_dirty_cleanup_retry_leaves_a_run_whose_cleanup_succeeded(
     tmp_path, monkeypatch, reason
 ) -> None:
     """DIRTY after a successful cleanup (recovery never came, the heartbeat
     broke) is not something a second cleanup can fix; clearing it that way
     would hide it."""
-    session = failed_cleanup_session(applied=[U9_T0], terminal=U9_T0 + minutes(1))
-    session["cleanup"]["succeeded"] = True
-    session["controller_state"]["reason"] = reason
     run = dirty_cleanup_run(
-        tmp_path, monkeypatch, marked_at=U9_T0 + minutes(12), session=session
+        tmp_path,
+        monkeypatch,
+        marked_at=U9_T0 + minutes(12),
+        reason=reason,
+        cleanup_succeeded=True,
     )
     run.clock.at = U9_T0 + timedelta(hours=6)
     assert await settle(run.runner) == "dirty_not_from_a_failed_cleanup"
@@ -654,12 +879,7 @@ async def test_dirty_cleanup_retry_leaves_a_run_whose_cleanup_succeeded(
 async def test_dirty_cleanup_retry_yields_to_whatever_holds_the_testbed(
     tmp_path, monkeypatch
 ) -> None:
-    run = dirty_cleanup_run(
-        tmp_path,
-        monkeypatch,
-        marked_at=U9_T0 + minutes(2),
-        session=failed_cleanup_session(applied=[U9_T0], terminal=U9_T0 + minutes(1)),
-    )
+    run = dirty_cleanup_run(tmp_path, monkeypatch, marked_at=U9_T0 + minutes(2))
     run.clock.at = U9_T0 + minutes(40)
 
     run.runner.cleanup_retry_hold = lambda: True
@@ -669,20 +889,7 @@ async def test_dirty_cleanup_retry_yields_to_whatever_holds_the_testbed(
     run.runner._starting = True
     assert await settle(run.runner) == "runner_busy"
     run.runner._starting = False
-
-    run.coordinator.claim_cleanup(
-        run_id="dirty-run",
-        fencing_token=run.coordinator.snapshot().dirty_run.fencing_token,
-        claimant="manual-cleanup-elsewhere",
-        now=run.clock.at,
-    )
-    assert await settle(run.runner) == "cleanup_already_claimed"
     assert run.calls == []
-    run.coordinator.finish_cleanup_claim(
-        run_id="dirty-run",
-        fencing_token=run.coordinator.snapshot().dirty_run.fencing_token,
-        claimant="manual-cleanup-elsewhere",
-    )
 
     # A failed manual cleanup in the meantime may have postponed the node timer too.
     (run.run_dir / "manual-cleanup-error.json").write_text(
@@ -695,12 +902,7 @@ async def test_dirty_cleanup_retry_yields_to_whatever_holds_the_testbed(
 
 
 async def test_watchdog_loop_runs_the_dirty_cleanup_retry(tmp_path, monkeypatch) -> None:
-    run = dirty_cleanup_run(
-        tmp_path,
-        monkeypatch,
-        marked_at=U9_T0 + minutes(2),
-        session=failed_cleanup_session(applied=[U9_T0], terminal=U9_T0 + minutes(1)),
-    )
+    run = dirty_cleanup_run(tmp_path, monkeypatch, marked_at=U9_T0 + minutes(2))
     run.clock.at = U9_T0 + minutes(35)
 
     class Stop(Exception):
@@ -715,6 +917,57 @@ async def test_watchdog_loop_runs_the_dirty_cleanup_retry(tmp_path, monkeypatch)
     assert run.runner._task is not None
     await run.runner._task
     assert run.coordinator.snapshot().dirty_run is None
+
+
+def test_dirty_retry_settings_never_call_before_the_node_and_never_stop_the_runner(
+    monkeypatch,
+) -> None:
+    """Review L2: a zero margin, hold or slack called cleanup before the node's
+    own deadline, and a malformed value stopped the runner from starting."""
+    from app import dirty_retry
+
+    for name in (
+        "DIRTY_RETRY_NODE_UNDO_MARGIN_SEC",
+        "DIRTY_RETRY_NODE_UNDO_HOLD_SEC",
+        "DIRTY_RETRY_SLACK_SEC",
+    ):
+        monkeypatch.setenv(name, "0")
+    monkeypatch.setenv("DIRTY_RETRY_MAX_ATTEMPTS", "many")
+    policy = dirty_retry.RetryPolicy.from_env()
+    assert policy == dirty_retry.RetryPolicy(
+        max_attempts=3, slack_sec=60, node_margin_sec=600, node_hold_sec=960
+    )
+    monkeypatch.setenv("DIRTY_RETRY_SLACK_SEC", "five minutes")
+    monkeypatch.setenv("DIRTY_RETRY_NODE_UNDO_HOLD_SEC", "20m")
+    policy = dirty_retry.RetryPolicy.from_env()
+    assert (policy.slack_sec, policy.node_hold_sec) == (300, 1200)
+    with pytest.raises(ValueError):
+        dirty_retry.RetryPolicy(node_margin_sec=0)
+
+
+def test_dirty_retry_node_constants_match_testbed_services() -> None:
+    """The node's own undo margin, cleanup hold and default injection limit,
+    copied here, must be the values the node guard uses."""
+    import re
+    from pathlib import Path
+
+    from app import dirty_retry
+
+    source = Path(__file__).resolve().parents[2].parent / (
+        "testbed-services/scripts/scenarios/profiles/executor_common.py"
+    )
+    if not source.is_file():
+        pytest.skip("external testbed-services checkout is not present")
+    text = source.read_text(encoding="utf-8")
+
+    def constant(name: str) -> int:
+        match = re.search(rf"^{name} = (\d+)$", text, re.MULTILINE)
+        assert match, name
+        return int(match.group(1))
+
+    assert constant("GUARD_MARGIN_SECONDS") == dirty_retry.NODE_UNDO_MARGIN_SEC
+    assert constant("GUARD_CLEANUP_HOLD_SECONDS") == dirty_retry.NODE_UNDO_HOLD_SEC
+    assert constant("DEFAULT_MAX_INJECTION_SECONDS") == dirty_retry.DEFAULT_MAX_INJECTION_SEC
 
 
 def test_every_live_controller_observation_binds_against_the_runner_registry():

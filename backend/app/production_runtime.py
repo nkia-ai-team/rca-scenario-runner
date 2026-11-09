@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import urllib.request
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -843,13 +844,23 @@ class TrustedDispatcherApplier:
                 )
             argv.extend(["--plan-digest", digest, "--confirm", confirmation])
             self._journal(operation_key, profile_id, "apply", "intent")
-            completed = self.process_runner(
-                argv,
-                check=True,
-                capture_output=True,
-                text=True,
-                env=_trusted_environment(),
-            )
+            try:
+                completed = self.process_runner(
+                    argv,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=_trusted_environment(),
+                )
+            except subprocess.CalledProcessError:
+                # profile-control exited, so whatever its executor did on a node
+                # (a node undo timer armed before the failure, U8) is done by
+                # now. The DIRTY cleanup retry (app.dirty_retry) counts the
+                # node's deadline from this. Any other exception leaves only the
+                # intent, and the retry then takes the DIRTY mark as the bound.
+                with suppress(Exception):
+                    self._journal(operation_key, profile_id, "apply", "failed")
+                raise
             self._journal(operation_key, profile_id, "apply", "complete")
             responses.append(json.loads(completed.stdout))
         if not responses:
@@ -976,6 +987,8 @@ class TrustedDispatcherApplier:
             operations.append(record)
         if phase == "complete":
             record["complete_at"] = self.clock.now().isoformat()
+        elif phase == "failed":
+            record["failed_at"] = self.clock.now().isoformat()
         atomic_json(path, document)
 
     def _intended_profiles(self) -> set[str]:
