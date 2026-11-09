@@ -59,8 +59,15 @@ COPY --from=ghcr.io/astral-sh/uv:0.8.0 /uv /usr/local/bin/uv
 # not the app venv, so it goes into the system site-packages. 2.5.1 is the first version
 # checked to accept program/machine/osuser on connect. Its dependencies are pinned too
 # (the set pip resolves for cp312 on 2026-11-10) so a rebuild cannot change them.
+# PyMySQL (pure python, no dependencies of its own; caching_sha2_password uses the
+# cryptography already pinned above), v4 C6b: the MySQL change executors in
+# testbed-services (db_operator_session.py) and this backend's database probes
+# (live_probes.py) connect to the food MySQL listener from this container instead of
+# exec'ing `mysql` inside the DB pod, which left a runc exec and a mysql process on the
+# DB node for 119 to record.
 RUN uv pip install --system --no-cache \
-      "oracledb==2.5.1" "cryptography==50.0.2" "cffi==2.1.1" "pycparser==3.12" "typing_extensions==4.16.0"
+      "oracledb==2.5.1" "cryptography==50.0.2" "cffi==2.1.1" "pycparser==3.12" "typing_extensions==4.16.0" \
+      "PyMySQL==1.1.1"
 
 # Backend dependencies (cache friendly: lock+pyproject first)
 COPY backend/pyproject.toml backend/uv.lock ./backend/

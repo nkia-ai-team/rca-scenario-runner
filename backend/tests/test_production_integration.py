@@ -1539,3 +1539,15 @@ def test_image_carries_the_oracle_client_the_lock_executor_calls() -> None:
     for pin in ("oracledb==2.5.1", "cryptography==50.0.2", "cffi==2.1.1", "pycparser==3.12", "typing_extensions==4.16.0"):
         assert f'"{pin}"' in install
     assert dockerfile.index("oracledb==2.5.1") > dockerfile.index("FROM python:3.12-slim AS backend")
+
+
+def test_image_carries_the_mysql_client_the_db_executors_and_probes_call() -> None:
+    # v4 C6b: the MySQL change executors (testbed-services db_operator_session.py) and the
+    # database probes (live_probes.py) open network sessions from this container through
+    # /usr/local/bin/python3 instead of exec'ing `mysql` in the DB pod. PyMySQL has no
+    # dependencies of its own (its caching_sha2_password path uses the pinned cryptography).
+    dockerfile = (Path(__file__).resolve().parents[2] / "Dockerfile").read_text(encoding="utf-8")
+    install = dockerfile[dockerfile.index("RUN uv pip install --system --no-cache"):]
+    install = install[: install.index("\n\n")]
+    assert '"PyMySQL==1.1.1"' in install
+    assert dockerfile.index("PyMySQL==1.1.1") > dockerfile.index("FROM python:3.12-slim AS backend")
