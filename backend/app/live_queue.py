@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -35,6 +36,7 @@ from app.decoys import (
     load_decoy_policy,
     partition_decoy_alarms,
 )
+from app.live_probes import _run_intervals
 from app.pass_mode import (
     capture_enabled,
     golden_reset_enabled,
@@ -52,6 +54,11 @@ from app.runner import ScenarioRunner, get_runner
 
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+# Pauses and cycle restarts are the queue's operator-facing events. The root
+# logger has no handler under uvicorn, so WARNING lands on stderr through
+# logging.lastResort and therefore in `docker logs scenario-runner`.
+logger = logging.getLogger("scenario_runner.live_queue")
 
 
 # F03-G, F09-P and F11-G left this queue on 2026-07-27: the golden audit parked
@@ -387,6 +394,10 @@ class LiveScenarioQueue:
         self.manifest_root = manifest_root
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
+        # The loop that owns the topology collector task. Ticks run their
+        # blocking work on worker threads, and those must hand loop-bound calls
+        # (create_task) back to it.
+        self._event_loop: asyncio.AbstractEventLoop | None = None
         self._functional_cache: tuple[datetime, dict[str, bool]] | None = None
         self._functional_details: dict[str, str] = {}
         # First tick at which the probe alone blocked readiness; None while ready.
@@ -565,7 +576,16 @@ class LiveScenarioQueue:
                 # restart the current scenario's cycle from trainer_reset. Timed
                 # phases resume on their own (expected_transition_at persists), so
                 # only the paused case reaches here.
-                now = self._format(self.clock.now())
+                now_at = self.clock.now()
+                now = self._format(now_at)
+                # The paused run (a DIRTY one cleaned up by hand, typically)
+                # gets the same settle a restart gives before the next normal
+                # window. F63-R on 2026-10-26: cleanup ended 06:44:09, resume
+                # at 06:49:28 started the baseline 15 minutes inside its tail.
+                settle_until = self._settle_not_before(state.current_run_id, now_at)
+                reset_at = (
+                    self._format(max(now_at, settle_until)) if settle_until is not None else now
+                )
                 state = state.model_copy(
                     update={
                         "phase": "cycle_reset",
@@ -579,8 +599,12 @@ class LiveScenarioQueue:
                         # shouldn't leave a stale count that pauses again immediately.
                         "cycle_restart_counts": {},
                         "phase_started_at": now,
-                        "expected_transition_at": now,
-                        "reason": None,
+                        "expected_transition_at": reset_at,
+                        "reason": (
+                            f"resumed; normal window held until {reset_at}"
+                            if reset_at != now
+                            else None
+                        ),
                         "updated_at": now,
                     }
                 )
@@ -649,7 +673,7 @@ class LiveScenarioQueue:
             if state.phase != "paused":
                 raise RuntimeError("only a paused live queue can be cancelled")
             previous = state.reason or "no pause reason"
-            state = self._complete(state)
+            state = await asyncio.to_thread(self._complete, state)
             note = f"cancelled by operator: {reason}" if reason else "cancelled by operator"
             state = state.model_copy(update={"reason": f"{note} (paused: {previous})"})
             self._write(state)
@@ -677,11 +701,14 @@ class LiveScenarioQueue:
 
     async def tick(self) -> LiveQueueState:
         async with self._lock:
+            self._event_loop = asyncio.get_running_loop()
             state = self.snapshot()
             if state.phase in {"idle", "paused", "completed"}:
                 return state
             if self.runner.coordinator.snapshot().dirty_run is not None:
-                return self._pause(state, "DIRTY coordinator state blocks the live queue")
+                return await asyncio.to_thread(
+                    self._pause, state, "DIRTY coordinator state blocks the live queue"
+                )
             if state.cycle_mode:
                 return await self._tick_cycle(state)
             state = self._append_promoted_if_available(state)
@@ -722,61 +749,88 @@ class LiveScenarioQueue:
         return state
 
     async def _tick_running(self, state: LiveQueueState) -> LiveQueueState:
-        if state.current_run_id is None:
-            if state.next_index >= len(state.scenario_ids):
-                return self._complete(state)
-            if self.runner.is_busy or self.runner.coordinator.snapshot().active_lease is not None:
-                return state
-            scenario_id = state.scenario_ids[state.next_index]
-            # Daily normal-segment protection: never let an injection start
-            # inside — or bleed into — the 00:00-02:00 KST clean window.
-            deferral = self._protection_window_reason(self.clock.now())
-            if deferral is not None:
-                if state.reason == deferral:
-                    return state
-                deferred = state.model_copy(
-                    update={"reason": deferral, "updated_at": self._format(self.clock.now())}
-                )
-                self._write(deferred)
-                return deferred
-            # R6 preflight gate: prove [t1-10m, t1] is clean before injecting.
-            short_circuit, verdict = self._preflight_gate(state, scenario_id)
-            if short_circuit is not None:
-                return short_circuit
-            try:
-                self._restore_golden(scenario_id)
-            except Exception as error:
-                return self._pause(state, f"golden restore failed for {scenario_id}: {error}")
-            try:
-                # The clean-window / scenario_overlap gates enforce capture-window
-                # separation, so a pass that captures nothing has nothing for them
-                # to protect. The preflight gate above still ran, and it measures
-                # cleanliness rather than assuming a gap.
-                run = await self.runner.start(
-                    scenario_id=scenario_id,
-                    mode="run",
-                    skip_isolation_checks=not isolation_checks_enabled(),
-                )
-            except Exception as error:
-                return self._pause(state, f"start failed for {scenario_id}: {error}")
-            if verdict is not None:
-                self._write_preflight(run.run_id, verdict)
-            self._write_normal_segment_marker(run.run_id)
-            self._write_batch_marker(run.run_id, state)
-            state = state.model_copy(
-                update={
-                    "current_scenario_id": scenario_id,
-                    "current_run_id": run.run_id,
-                    "preflight_attempts": 0,
-                    "preflight_retry_not_before": None,
-                    "reason": None,
-                    "updated_at": self._format(self.clock.now()),
-                }
+        """v2 running tick. The gate before the start (protection window, R6
+        preflight probe, golden restore over ssh) and the evidence reads after
+        it are blocking, so they run on worker threads; only runner.start runs
+        on the loop."""
+        if state.current_run_id is not None:
+            current = self.runner.get_current()
+            return await asyncio.to_thread(self._tick_running_watch, state, current)
+        early, scenario_id, verdict = await asyncio.to_thread(self._prepare_v2_injection, state)
+        if early is not None:
+            return early
+        try:
+            # The clean-window / scenario_overlap gates enforce capture-window
+            # separation, so a pass that captures nothing has nothing for them
+            # to protect. The preflight gate above still ran, and it measures
+            # cleanliness rather than assuming a gap.
+            run = await self.runner.start(
+                scenario_id=scenario_id,
+                mode="run",
+                skip_isolation_checks=not isolation_checks_enabled(),
             )
-            self._write(state)
-            return state
+        except Exception as error:
+            return await asyncio.to_thread(
+                self._pause, state, f"start failed for {scenario_id}: {error}"
+            )
+        return await asyncio.to_thread(
+            self._enter_v2_running, state, scenario_id, run, verdict
+        )
 
-        current = self.runner.get_current()
+    def _prepare_v2_injection(
+        self, state: LiveQueueState
+    ) -> tuple[LiveQueueState | None, str | None, PreflightVerdict | None]:
+        if state.next_index >= len(state.scenario_ids):
+            return self._complete(state), None, None
+        if self.runner.is_busy or self.runner.coordinator.snapshot().active_lease is not None:
+            return state, None, None
+        scenario_id = state.scenario_ids[state.next_index]
+        # Daily normal-segment protection: never let an injection start
+        # inside — or bleed into — the 00:00-02:00 KST clean window.
+        deferral = self._protection_window_reason(self.clock.now())
+        if deferral is not None:
+            if state.reason == deferral:
+                return state, None, None
+            deferred = state.model_copy(
+                update={"reason": deferral, "updated_at": self._format(self.clock.now())}
+            )
+            self._write(deferred)
+            return deferred, None, None
+        # R6 preflight gate: prove [t1-10m, t1] is clean before injecting.
+        short_circuit, verdict = self._preflight_gate(state, scenario_id)
+        if short_circuit is not None:
+            return short_circuit, None, None
+        try:
+            self._restore_golden(scenario_id)
+        except Exception as error:
+            return (
+                self._pause(state, f"golden restore failed for {scenario_id}: {error}"),
+                None,
+                None,
+            )
+        return None, scenario_id, verdict
+
+    def _enter_v2_running(
+        self, state: LiveQueueState, scenario_id: str, run, verdict: PreflightVerdict | None
+    ) -> LiveQueueState:
+        if verdict is not None:
+            self._write_preflight(run.run_id, verdict)
+        self._write_normal_segment_marker(run.run_id)
+        self._write_batch_marker(run.run_id, state)
+        state = state.model_copy(
+            update={
+                "current_scenario_id": scenario_id,
+                "current_run_id": run.run_id,
+                "preflight_attempts": 0,
+                "preflight_retry_not_before": None,
+                "reason": None,
+                "updated_at": self._format(self.clock.now()),
+            }
+        )
+        self._write(state)
+        return state
+
+    def _tick_running_watch(self, state: LiveQueueState, current) -> LiveQueueState:
         if current is not None and current.run_id == state.current_run_id:
             if current.status in {"running", "cleanup_running"}:
                 return state
@@ -943,19 +997,35 @@ class LiveScenarioQueue:
     # v3 continuous-cycle state machine (CYCLE_MODE only)
     # ------------------------------------------------------------------
     async def _tick_cycle(self, state: LiveQueueState) -> LiveQueueState:
-        if state.phase == "cycle_reset":
-            return self._tick_cycle_reset(state)
+        """Dispatch one cycle tick.
+
+        Every phase does blocking work: ssh golden restore and trainer
+        freeze/thaw (up to 900s), the R6 preflight probe and incident sweep
+        against 119, run artifact reads. Done inline they froze the event loop
+        that serves the API and runs the watchdog, which is how the runner went
+        unresponsive for minutes after a cycle restart (2026-10-12, 10-22) and
+        how a watchdog reclaimed a live run's lease (2026-10-26). So each phase
+        runs on a worker thread. Two stay here and push their own blocking
+        steps to threads: the buffer, whose injection start belongs to the
+        runner's loop, and the normal window, whose decoy steps are async.
+        """
         if state.phase == "cycle_normal":
             return await self._tick_cycle_normal(state)
         if state.phase == "cycle_buffer":
             return await self._tick_cycle_buffer(state)
         if state.phase == "running":
-            return await self._tick_cycle_running(state)
-        if state.phase == "cycle_cooldown":
-            return self._tick_cycle_cooldown(state)
-        if state.phase == "waiting_capture":
-            return self._tick_cycle_capture(state)
-        return self._pause(state, f"unknown cycle phase: {state.phase}")
+            current = self.runner.get_current()
+            return await asyncio.to_thread(self._tick_cycle_running, state, current)
+        handler = {
+            "cycle_reset": self._tick_cycle_reset,
+            "cycle_cooldown": self._tick_cycle_cooldown,
+            "waiting_capture": self._tick_cycle_capture,
+        }.get(state.phase)
+        if handler is None:
+            return await asyncio.to_thread(
+                self._pause, state, f"unknown cycle phase: {state.phase}"
+            )
+        return await asyncio.to_thread(handler, state)
 
     def _tick_cycle_reset(self, state: LiveQueueState) -> LiveQueueState:
         """Start a cycle: restore golden, then resume trainer for the 2h lead-in.
@@ -968,6 +1038,11 @@ class LiveScenarioQueue:
         if state.next_index >= len(state.scenario_ids):
             return self._complete(state)
         if self.runner.is_busy or self.runner.coordinator.snapshot().active_lease is not None:
+            return state
+        # A restart or resume schedules this phase for after the previous
+        # run's effect has ended and cooled down (see _settle_not_before); the
+        # 2h normal window must not begin before then.
+        if not self._transition_due(state):
             return state
         scenario_id = state.scenario_ids[state.next_index]
         try:
@@ -996,7 +1071,10 @@ class LiveScenarioQueue:
                 "cycle_decoy_seed": decoy_seed,
                 "cycle_decoy_policy_sha256": decoy_policy_sha256,
                 "cycle_decoys": decoys,
-                "reason": None,
+                # Keep why the previous attempt was restarted visible for the
+                # whole normal window. Clearing it here is how the 2026-10-22
+                # F35-P restart reason vanished before anyone read it.
+                "reason": state.reason,
                 "updated_at": self._format(now),
             }
         )
@@ -1009,15 +1087,20 @@ class LiveScenarioQueue:
         """Hold the 2h lead-in. Baseline load is supplied out-of-band by the
         tb-runner systemd loadgen; the queue health-checks and runs the cycle's
         planned decoy deployments (U7). Any health failure restarts the whole
-        cycle (resume table: normal)."""
-        health_error = self._cycle_health_error()
+        cycle (resume table: normal).
+
+        Runs on the loop because the decoy steps are async; each blocking step
+        (health probe, restart, trainer freeze over ssh) goes to a thread."""
+        health_error = await asyncio.to_thread(self._cycle_health_error)
         if health_error is not None:
-            return self._restart_cycle(state, f"normal-phase health failed: {health_error}")
+            return await asyncio.to_thread(
+                self._restart_cycle, state, f"normal-phase health failed: {health_error}"
+            )
         state = await self._advance_decoys(state)
         if not self._transition_due(state):
             return state
         state = await self._settle_decoys_at_buffer(state)
-        return self._enter_cycle_buffer(state)
+        return await asyncio.to_thread(self._enter_cycle_buffer, state)
 
     def _enter_cycle_buffer(self, state: LiveQueueState) -> LiveQueueState:
         """Freeze the trainer at buffer start (=t1-10m) and open the 10m gate."""
@@ -1044,16 +1127,41 @@ class LiveScenarioQueue:
     async def _tick_cycle_buffer(self, state: LiveQueueState) -> LiveQueueState:
         """Hold the 10m buffer, then run the R6 preflight gate over that same
         window and inject. A dirty buffer restarts the cycle rather than skipping
-        (resume table: buffer -> cleanup-guaranteed cycle restart)."""
+        (resume table: buffer -> cleanup-guaranteed cycle restart).
+
+        The gate (preflight probe, incident sweep) runs on a worker thread and
+        the bookkeeping after the start does too; runner.start stays on the
+        loop because it creates the run's task there."""
         if self.runner.is_busy or self.runner.coordinator.snapshot().active_lease is not None:
             return state
         if not self._transition_due(state):
             return state
         scenario_id = state.scenario_ids[state.next_index]
-        verdict = None
         unsettled = await self._unsettled_decoy(state)
         if unsettled is not None:
-            return self._restart_cycle(state, unsettled)
+            return await asyncio.to_thread(self._restart_cycle, state, unsettled)
+        early, verdict = await asyncio.to_thread(self._cycle_buffer_gate, state, scenario_id)
+        if early is not None:
+            return early
+        try:
+            # The cycle time axis provides injection separation, so opt out of the
+            # v2 clean-window / scenario_overlap eligibility gates (root fix for the
+            # abandoned-run overlap that the exemption marker only patched).
+            run = await self.runner.start(
+                scenario_id=scenario_id, mode="run", skip_isolation_checks=True
+            )
+        except Exception as error:
+            return await asyncio.to_thread(
+                self._restart_cycle,
+                state,
+                f"injection start failed for {scenario_id}: {error}",
+            )
+        return await asyncio.to_thread(self._enter_cycle_running, state, run, verdict)
+
+    def _cycle_buffer_gate(
+        self, state: LiveQueueState, scenario_id: str
+    ) -> tuple[LiveQueueState | None, PreflightVerdict | None]:
+        verdict = None
         # None = decoys off; a list (possibly empty) = decoys on for this cycle.
         decoys = state.cycle_decoys if state.cycle_decoy_seed is not None else None
         if self.preflight_probe is not None:
@@ -1072,20 +1180,22 @@ class LiveScenarioQueue:
                         now, waited_sec=0, decoys=decoys, buffer_start=buffer_start
                     )
             except Exception as error:
-                return self._pause(state, f"preflight probe failed for {scenario_id}: {error}")
-            if not verdict.is_clean:
-                return self._restart_cycle(
-                    state, f"preflight not clean at buffer end ({verdict.verdict})"
+                return (
+                    self._pause(state, f"preflight probe failed for {scenario_id}: {error}"),
+                    None,
                 )
-        try:
-            # The cycle time axis provides injection separation, so opt out of the
-            # v2 clean-window / scenario_overlap eligibility gates (root fix for the
-            # abandoned-run overlap that the exemption marker only patched).
-            run = await self.runner.start(
-                scenario_id=scenario_id, mode="run", skip_isolation_checks=True
-            )
-        except Exception as error:
-            return self._restart_cycle(state, f"injection start failed for {scenario_id}: {error}")
+            if not verdict.is_clean:
+                return (
+                    self._restart_cycle(
+                        state, f"preflight not clean at buffer end ({verdict.verdict})"
+                    ),
+                    None,
+                )
+        return None, verdict
+
+    def _enter_cycle_running(
+        self, state: LiveQueueState, run, verdict: PreflightVerdict | None
+    ) -> LiveQueueState:
         if verdict is not None:
             self._write_preflight(run.run_id, verdict)
         # Decoys are final once the buffer opened; bind them to the run so the
@@ -1107,21 +1217,30 @@ class LiveScenarioQueue:
         self._write(state)
         return state
 
-    async def _tick_cycle_running(self, state: LiveQueueState) -> LiveQueueState:
+    def _tick_cycle_running(self, state: LiveQueueState, current) -> LiveQueueState:
         """Watch the injection; on clean success enter cooldown, on a dirty run
-        pause (cleanup not guaranteed), on any other failure restart the cycle."""
-        current = self.runner.get_current()
+        pause (cleanup not guaranteed), on any other failure restart the cycle.
+
+        ``current`` is the runner's run snapshot, taken on the loop thread."""
         if current is not None and current.run_id == state.current_run_id:
             if current.status in {"running", "cleanup_running"}:
                 return state
             if current.dirty:
-                return self._pause(state, f"DIRTY run: {current.run_id}")
+                return self._pause(
+                    state, self._with_run_reason(f"DIRTY run: {current.run_id}", current.run_id)
+                )
             if current.status != "succeeded":
-                return self._restart_cycle(state, f"scenario evidence failed: {current.run_id}")
+                return self._restart_cycle(
+                    state,
+                    self._with_run_reason(
+                        f"scenario evidence failed: {current.run_id}", current.run_id
+                    ),
+                )
         elif self.runner.coordinator.snapshot().active_lease is not None:
             return state
         evidence_error = self._controller_evidence_error(state.current_run_id)
         if evidence_error is not None:
+            evidence_error = self._with_run_reason(evidence_error, state.current_run_id)
             if "did not recover cleanly" in evidence_error:
                 return self._pause(state, evidence_error)
             return self._restart_cycle(state, evidence_error)
@@ -1273,6 +1392,10 @@ class LiveScenarioQueue:
         # The abandoned cycle's topology collector stops now; the fresh cycle_reset
         # starts a new one.
         self._stop_cycle_topology()
+        # Read the run's effect window before the excuse marker below creates
+        # its directory (a missing directory means nothing was applied).
+        now = self.clock.now()
+        settle_until = self._settle_not_before(state.current_run_id, now)
         # A run that actually started must not linger in the next cycle's overlap
         # window; excuse it before rewinding (only when injection reached a run).
         if state.current_run_id is not None:
@@ -1284,7 +1407,16 @@ class LiveScenarioQueue:
             return self._pause(
                 state, f"cycle restart budget exhausted for {scenario_id}: {reason}"
             )
-        now = self.clock.now()
+        # The next 2h normal window is the case's clean baseline. Starting it
+        # the moment an injected run gives up let that run's recovery echo
+        # (incidents, error tails, restarts) into the baseline: F50-R's dump
+        # was discarded for it on 2026-10-13. Hold cycle_reset until the run's
+        # effect has ended plus the same cooldown a successful cycle gets.
+        reset_at = max(now, settle_until) if settle_until is not None else now
+        restart_reason = f"cycle restart {count}/{MAX_CYCLE_RESTARTS}: {reason}"
+        if reset_at > now:
+            restart_reason += f" (normal window held until {self._format(reset_at)})"
+        logger.warning("live queue %s: %s", state.queue_id, restart_reason)
         state = state.model_copy(
             update={
                 "phase": "cycle_reset",
@@ -1299,13 +1431,46 @@ class LiveScenarioQueue:
                 "cycle_decoys": [],
                 "cycle_restart_counts": {**state.cycle_restart_counts, scenario_id: count},
                 "phase_started_at": self._format(now),
-                "expected_transition_at": self._format(now),
-                "reason": f"cycle restart {count}/{MAX_CYCLE_RESTARTS}: {reason}",
+                "expected_transition_at": self._format(reset_at),
+                "reason": restart_reason,
                 "updated_at": self._format(now),
             }
         )
         self._write(state)
         return state
+
+    def _settle_not_before(self, run_id: str | None, now: datetime) -> datetime | None:
+        """When a fresh normal window may start after ``run_id``.
+
+        The run's effect end plus CYCLE_COOLDOWN_DURATION, the settle a
+        successful cycle already gets after t2. None when the run never touched
+        the testbed (no run directory, or one that proves no effect was
+        applied). An effect whose end is unknown or still open counts as ending
+        now: the caller only gets here once the run has stopped.
+        """
+        if run_id is None:
+            return None
+        run_dir = self.runner.artifact_store.root / run_id
+        if not run_dir.is_dir():
+            return None
+        try:
+            intervals = _run_intervals(run_dir)
+        except Exception:
+            intervals = [(now, now)]
+        if not intervals:
+            return None
+        effect_end = min(max(end for _, end in intervals), now)
+        return effect_end + CYCLE_COOLDOWN_DURATION
+
+    def _with_run_reason(self, message: str, run_id: str | None) -> str:
+        """Append the run's own failure reason (controller reason, which carries
+        the profile's stderr) so the queue says why, not only which run."""
+        if run_id is None:
+            return message
+        detail = self._controller_retry_reason(run_id)
+        if not detail or detail in message:
+            return message
+        return f"{message}: {detail}"
 
     def _transition_due(self, state: LiveQueueState) -> bool:
         if state.expected_transition_at is None:
@@ -1422,10 +1587,27 @@ class LiveScenarioQueue:
             if bundle_dir.exists():
                 shutil.rmtree(bundle_dir)
             collector = self.topology_collector_factory(bundle_dir)
-            collector.start()
+            self._call_on_event_loop(collector.start)
             self._topology_collector = collector
         except Exception:
             self._topology_collector = None
+
+    def _call_on_event_loop(self, fn: Callable[[], object]) -> None:
+        """Run a loop-bound call (create_task) from wherever the tick runs.
+
+        On the loop thread it runs now. From a tick's worker thread it is queued
+        on the loop ahead of the tick's own completion, so it has run by the
+        time the awaiting tick resumes."""
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:
+            on_loop = False
+        loop = self._event_loop
+        if on_loop or loop is None or loop.is_closed():
+            fn()
+        else:
+            loop.call_soon_threadsafe(fn)
 
     def _stop_cycle_topology(self) -> None:
         collector = self._topology_collector
@@ -2161,6 +2343,7 @@ class LiveScenarioQueue:
         self._task = None
 
     def _pause(self, state: LiveQueueState, reason: str) -> LiveQueueState:
+        logger.warning("live queue %s paused: %s", state.queue_id, reason)
         self._stop_cycle_topology()
         self._thaw_trainer()
         state = state.model_copy(

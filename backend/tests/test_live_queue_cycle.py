@@ -1129,3 +1129,285 @@ async def test_decoys_on_with_zero_drawn_still_records_an_empty_excuse_list(
     run_dir = runner.artifact_store.root / state.current_run_id
     assert json.loads((run_dir / "decoys.json").read_text())["decoys"] == []
     assert json.loads((run_dir / "preflight.json").read_text())["excused_alarms"] == []
+
+# --- U1: cycle ticks keep the event loop free -------------------------------
+
+
+class SlowRestoreRunner(FakeRestoreRunner):
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+
+    def __call__(self, cmd, **kwargs):
+        import time
+
+        time.sleep(self.delay)
+        return super().__call__(cmd, **kwargs)
+
+
+def _golden_queue(tmp_path: Path, monkeypatch, *, delay: float):
+    monkeypatch.setenv("MODEL_SNAPSHOT_SSH_TARGET", "ydkim@192.168.230.119")
+    queue, runner, coordinator, scheduler, clock = make_cycle_queue(tmp_path)
+    ssh_key = queue.state_path.parent / "ssh_key"
+    ssh_key.write_text("key", encoding="utf-8")
+    queue.golden_reset_enabled = True
+    queue.restore_retry_delay_sec = 0
+    queue._restore_runner = SlowRestoreRunner(delay)  # type: ignore[assignment]
+    queue.required_paths["ssh_key"] = ssh_key
+    return queue, runner, coordinator, scheduler, clock
+
+
+async def _count_beats_during(coro):
+    import asyncio
+
+    beats = 0
+
+    async def ticker() -> None:
+        nonlocal beats
+        while True:
+            await asyncio.sleep(0.02)
+            beats += 1
+
+    task = asyncio.create_task(ticker())
+    try:
+        result = await coro
+    finally:
+        task.cancel()
+    return result, beats
+
+
+@pytest.mark.asyncio
+async def test_cycle_reset_golden_restore_runs_off_the_event_loop(tmp_path: Path, monkeypatch) -> None:
+    """U1: cycle_reset restores the golden over ssh and thaws the trainer (up to
+    900s + 60s). Inline that froze the runner's loop: the API went unanswered
+    for minutes after a cycle restart (2026-10-12, 2026-10-22)."""
+    import threading
+
+    queue, runner, _, _, _ = _golden_queue(tmp_path, monkeypatch, delay=0.3)
+    started_on: list[str] = []
+
+    class Collector(FakeTopologyCollector):
+        def start(self) -> None:
+            started_on.append(threading.current_thread().name)
+            super().start()
+
+    queue.topology_collector_factory = lambda bundle_dir: Collector(bundle_dir)
+    await queue.start()
+
+    state, beats = await _count_beats_during(queue.tick())
+
+    assert state.phase == "cycle_normal"
+    assert beats >= 15, f"event loop was held during golden restore (beats={beats})"
+    # The collector's task belongs to the loop, so its start is handed back there.
+    assert started_on == [threading.main_thread().name]
+    assert queue._topology_collector is not None and queue._topology_collector.started
+
+
+@pytest.mark.asyncio
+async def test_cycle_buffer_preflight_gate_runs_off_the_event_loop(tmp_path: Path) -> None:
+    import time
+
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    await queue.start()
+    state = await queue.tick()  # -> cycle_normal
+    clock.value = state_expected(state)
+    state = await queue.tick()  # -> cycle_buffer
+    clock.value = state_expected(state)
+
+    def slow_preflight(now, waited_sec, **_gate):
+        time.sleep(0.4)
+        return SimpleNamespace(is_clean=True, verdict="clean", checks=[])
+
+    queue.preflight_probe = object()  # type: ignore[assignment]
+    queue._evaluate_preflight = slow_preflight  # type: ignore[method-assign]
+    queue._write_preflight = lambda run_id, verdict: None  # type: ignore[method-assign]
+
+    state, beats = await _count_beats_during(queue.tick())
+
+    assert state.phase == "running"
+    assert beats >= 10, f"event loop was held during the preflight gate (beats={beats})"
+
+
+@pytest.mark.asyncio
+async def test_api_answers_while_a_cycle_tick_holds_a_blocking_call(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+    import time
+
+    from httpx import ASGITransport, AsyncClient
+
+    from app import main
+
+    queue, runner, _, _, _ = _golden_queue(tmp_path, monkeypatch, delay=0.6)
+    await queue.start()
+    monkeypatch.setattr(main, "get_live_queue", lambda: queue)
+
+    async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://t") as client:
+        began = time.monotonic()
+        tick = asyncio.create_task(queue.tick())  # restore + thaw: about 1.2s
+        await asyncio.sleep(0.1)
+        health = await client.get("/healthz")
+        live = await client.get("/api/live-queue")
+        elapsed = time.monotonic() - began
+        answered_mid_tick = not tick.done()
+        state = await tick
+
+    assert (health.status_code, live.status_code) == (200, 200)
+    assert answered_mid_tick and elapsed < 0.5, (
+        f"API waited {elapsed:.2f}s behind the cycle tick"
+    )
+    assert state.phase == "cycle_normal"
+
+
+# --- U2: a restarted cycle waits out the previous run's effect ---------------
+
+
+def _write_run_timeline(runner, run_id: str, *, applied_at: str, effect_ended_at: str | None) -> None:
+    run_dir = runner.artifact_store.root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "timeline.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "level_changes": [
+                    {"applied_at": applied_at, "effect_ended_at": effect_ended_at}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_after_an_injected_run_holds_the_normal_window_until_effect_end_plus_cooldown(
+    tmp_path: Path,
+) -> None:
+    """U2: a cycle restart used to begin the next 2h normal window at once, with
+    the abandoned run's recovery still echoing (F50-R dump discarded 2026-10-13).
+    The window now starts no earlier than effect end + CYCLE_COOLDOWN (30m), the
+    same settle a successful cycle gets after t2."""
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+    _write_run_timeline(
+        runner, run_id, applied_at="2026-07-16T10:10:30Z", effect_ended_at="2026-07-16T10:20:00Z"
+    )
+    runner.current = runner.current.model_copy(update={"status": "failed", "dirty": False})
+    clock.value = datetime(2026, 7, 16, 10, 21, tzinfo=timezone.utc)
+
+    state = await queue.tick()
+    assert state.phase == "cycle_reset"
+    assert state.expected_transition_at == "2026-07-16T10:50:00Z"
+    assert "held until 2026-07-16T10:50:00Z" in state.reason
+
+    clock.value = datetime(2026, 7, 16, 10, 49, 59, tzinfo=timezone.utc)
+    state = await queue.tick()
+    assert state.phase == "cycle_reset"  # still settling: no golden reset, no normal window
+
+    clock.value = datetime(2026, 7, 16, 10, 50, tzinfo=timezone.utc)
+    state = await queue.tick()
+    assert state.phase == "cycle_normal"
+    assert state.cycle_started_at == "2026-07-16T10:50:00Z"
+    assert state.expected_transition_at == "2026-07-16T12:50:00Z"
+
+
+@pytest.mark.asyncio
+async def test_restart_of_a_run_that_applied_nothing_resets_at_once(tmp_path: Path) -> None:
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_dir = runner.artifact_store.root / state.current_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.json").write_text(json.dumps({"level_changes": []}), encoding="utf-8")
+    runner.current = runner.current.model_copy(update={"status": "failed", "dirty": False})
+
+    state = await queue.tick()
+    assert state.phase == "cycle_reset"
+    assert state.expected_transition_at == queue._format(clock.now())
+    assert (await queue.tick()).phase == "cycle_normal"
+
+
+@pytest.mark.asyncio
+async def test_effect_still_open_at_restart_counts_from_the_restart(tmp_path: Path) -> None:
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    _write_run_timeline(
+        runner, state.current_run_id, applied_at="2026-07-16T10:10:30Z", effect_ended_at=None
+    )
+    runner.current = runner.current.model_copy(update={"status": "failed", "dirty": False})
+    clock.value = datetime(2026, 7, 16, 10, 30, tzinfo=timezone.utc)
+
+    state = await queue.tick()
+    assert state.expected_transition_at == "2026-07-16T11:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_resume_after_a_cleaned_dirty_run_waits_out_the_cooldown(tmp_path: Path) -> None:
+    """U2: F63-R 2026-10-26. A watchdog left the run DIRTY, a manual cleanup
+    ended its effect at 06:44:09, resume at 06:49:28 started the baseline inside
+    the tail. Resume now holds cycle_reset until effect end + 30m."""
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+    _write_run_timeline(runner, run_id, applied_at="2026-07-16T10:10:30Z", effect_ended_at=None)
+    runner.current = runner.current.model_copy(update={"status": "failed", "dirty": True})
+    state = await queue.tick()
+    assert state.phase == "paused"
+
+    (runner.artifact_store.root / run_id / "cleanup.json").write_text(
+        json.dumps({"succeeded": True, "effect_ended_at": "2026-07-16T10:20:00+00:00"}),
+        encoding="utf-8",
+    )
+    clock.value = datetime(2026, 7, 16, 10, 25, tzinfo=timezone.utc)
+    state = await queue.resume()
+    assert state.phase == "cycle_reset"
+    assert state.expected_transition_at == "2026-07-16T10:50:00Z"
+    assert "held until 2026-07-16T10:50:00Z" in state.reason
+
+    clock.value = datetime(2026, 7, 16, 10, 40, tzinfo=timezone.utc)
+    assert (await queue.tick()).phase == "cycle_reset"
+    clock.value = datetime(2026, 7, 16, 10, 50, tzinfo=timezone.utc)
+    state = await queue.tick()
+    assert state.phase == "cycle_normal"
+    assert state.cycle_started_at == "2026-07-16T10:50:00Z"
+
+
+# --- U3: why a run failed reaches the API and the log ------------------------
+
+
+@pytest.mark.asyncio
+async def test_restart_reason_carries_the_run_failure_text_into_api_and_log(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """U3: 2026-10-22 F35-P restarted on a preflight refusal whose text never
+    reached the queue: the reason named only the run, and cycle_reset cleared
+    even that. The run's own reason (with the executor's stderr) now rides in
+    the restart reason, stays through the normal window and is logged."""
+    import logging
+
+    from httpx import ASGITransport, AsyncClient
+
+    from app import main
+
+    detail = (
+        "profile_apply_failed:CalledProcessError:profile control refused: profile preflight "
+        "failed: tablespace of BANKING.ACCOUNTS has 267MB free, preflight needs at least 1024MB"
+    )
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    queue._controller_retry_reason = lambda run_id: detail  # type: ignore[method-assign]
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+    runner.current = runner.current.model_copy(update={"status": "failed", "dirty": False})
+
+    with caplog.at_level(logging.WARNING, logger="scenario_runner.live_queue"):
+        state = await queue.tick()
+    assert state.phase == "cycle_reset"
+    assert run_id in state.reason and detail in state.reason
+    assert any(detail in record.getMessage() for record in caplog.records)
+
+    state = await queue.tick()  # nothing was applied: reset at once
+    assert state.phase == "cycle_normal"
+    assert detail in state.reason
+
+    monkeypatch.setattr(main, "get_live_queue", lambda: queue)
+    async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://t") as client:
+        body = (await client.get("/api/live-queue")).json()
+    assert detail in body["reason"]
