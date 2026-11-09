@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -54,6 +55,8 @@ LIVE_SCENARIO_ORDER = (
     "F08-H",
 )
 QUEUE_POLL_INTERVAL_SEC = 5
+# restore-golden-state.sh result golden_sha256: sha256 of the restored golden dump.
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # Daily normal-segment protection (spec §2.1): the 00:00-02:00 KST window is
 # the shared clean prefix for every case captured that day, and the host cron
 # dumps it at 02:20 KST. Injections must neither run inside the window nor
@@ -1269,9 +1272,11 @@ class LiveScenarioQueue:
     ) -> dict[str, str | None] | None:
         """Best-effort golden identity from the restore script's JSON stdout.
 
-        The script emits golden_dir but not the dump sha256, so golden_sha256 is
-        left null. TODO(spec §2.2): thread the golden meta pg_ai_state.sha256
-        through the restore output so phases.json can carry it.
+        restore-golden-state.sh emits golden_dir and golden_sha256 (the sha256 of
+        the dump it restored, spec §2.2). phases.json trainer_reset carries both
+        and the capture copies them into the recording meta. A restore script
+        that predates the digest, or a value that is not a 64-char lowercase hex
+        digest, leaves golden_sha256 null rather than failing the cycle.
         """
         if result is None:
             return None
@@ -1279,10 +1284,13 @@ class LiveScenarioQueue:
             payload = json.loads((result.stdout or "").strip() or "{}")
         except Exception:
             return None
+        if not isinstance(payload, dict):
+            return None
         golden_dir = payload.get("golden_dir")
+        sha256 = payload.get("golden_sha256")
         return {
             "id": Path(golden_dir).name if isinstance(golden_dir, str) and golden_dir else None,
-            "sha256": None,
+            "sha256": sha256 if isinstance(sha256, str) and _SHA256_HEX.fullmatch(sha256) else None,
         }
 
     def _write_cycle_phases(self, state: LiveQueueState) -> None:

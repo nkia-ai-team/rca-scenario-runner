@@ -351,12 +351,17 @@ async def test_cycle_restart_budget_exhaustion_pauses(tmp_path: Path) -> None:
 
 
 class FakeRestoreRunner:
-    def __init__(self) -> None:
+    def __init__(self, restore_stdout: str = "") -> None:
         self.remotes: list[str] = []
+        self.restore_stdout = restore_stdout
 
     def __call__(self, cmd, **kwargs):
         self.remotes.append(cmd[-1])
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+        stdout = self.restore_stdout if "--golden-root" in cmd[-1] else ""
+        return subprocess.CompletedProcess(cmd, 0, stdout, "")
+
+
+GOLDEN_SHA = "0123456789abcdef" * 4
 
 
 @pytest.mark.asyncio
@@ -397,6 +402,75 @@ async def test_trainer_reset_thaw_freeze_thaw_ordering_when_golden_enabled(
     # reset restores golden then thaws for the 2h lead-in; buffer freezes;
     # capture-complete thaws again.
     assert kinds[:4] == ["restore", "thaw", "freeze", "thaw"]
+
+
+@pytest.mark.asyncio
+async def test_phases_json_carries_golden_sha256_from_restore_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R2: the restore result's golden_sha256 reaches phases.json trainer_reset,
+    which the capture copies verbatim into the recording meta."""
+    monkeypatch.setenv("MODEL_SNAPSHOT_SSH_TARGET", "ydkim@192.168.230.119")
+    queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
+    restore = FakeRestoreRunner(
+        json.dumps(
+            {
+                "action": "restore-golden",
+                "status": "ok",
+                "golden_dir": "/data/eval-cases/goldens/golden-0900",
+                "golden_sha256": GOLDEN_SHA,
+            }
+        )
+    )
+    ssh_key = queue.state_path.parent / "ssh_key"
+    ssh_key.write_text("key", encoding="utf-8")
+    queue.golden_reset_enabled = True
+    queue.restore_retry_delay_sec = 0
+    queue._restore_runner = restore  # type: ignore[assignment]
+    queue.required_paths["ssh_key"] = ssh_key
+
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    assert state.cycle_golden_id == "golden-0900"
+    assert state.cycle_golden_sha256 == GOLDEN_SHA
+    run_id = state.current_run_id
+    _complete_injection(runner, scheduler, clock, run_id,
+                        t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    state = await queue.tick()  # -> cooldown, writes phases.json
+
+    doc = json.loads((runner.artifact_store.root / run_id / "phases.json").read_text())
+    reset = next(p for p in doc["phases"] if p["phase"] == "trainer_reset")
+    assert reset == {
+        "phase": "trainer_reset",
+        "at": "2026-07-16T08:00:00Z",
+        "golden_id": "golden-0900",
+        "golden_sha256": GOLDEN_SHA,
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"golden_dir": "/g/golden-0900", "golden_sha256": GOLDEN_SHA},
+         {"id": "golden-0900", "sha256": GOLDEN_SHA}),
+        # restore script that predates the digest
+        ({"golden_dir": "/g/golden-0900"}, {"id": "golden-0900", "sha256": None}),
+        # not a sha256 hex digest
+        ({"golden_dir": "/g/golden-0900", "golden_sha256": "abc"},
+         {"id": "golden-0900", "sha256": None}),
+        ({"golden_dir": "/g/golden-0900", "golden_sha256": GOLDEN_SHA.upper()},
+         {"id": "golden-0900", "sha256": None}),
+        ({"golden_dir": "/g/golden-0900", "golden_sha256": 123},
+         {"id": "golden-0900", "sha256": None}),
+    ],
+)
+def test_parse_golden_result_reads_golden_sha256(payload, expected) -> None:
+    result = subprocess.CompletedProcess(["ssh"], 0, json.dumps(payload), "")
+    assert LiveScenarioQueue._parse_golden_result(result) == expected
+
+
+def test_parse_golden_result_tolerates_non_object_stdout() -> None:
+    result = subprocess.CompletedProcess(["ssh"], 0, "[]", "")
+    assert LiveScenarioQueue._parse_golden_result(result) is None
 
 
 @pytest.mark.asyncio
