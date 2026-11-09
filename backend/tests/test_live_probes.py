@@ -11,6 +11,7 @@ import pytest
 
 from app.adaptive_runtime import EligibilityRequest
 from app.live_probes import (
+    DB_PROBE_PYTHON,
     DEPLOYMENT_REPLICAS_CONTRACT,
     LiveProbeError,
     LOADGEN_FIELDS,
@@ -71,6 +72,17 @@ class Fakes:
     def process(self, argv, **kwargs):
         argv = list(argv)
         self.process_calls.append((argv, kwargs))
+        # v4 C6b: the banking probes are network sessions from the runner (listener address
+        # and account read with kubectl get), never an exec into testbed-oracle-0.
+        if argv[0] == DB_PROBE_PYTHON and "banking.transfers" in kwargs["env"]["DBP_SQL"]:
+            return subprocess.CompletedProcess(argv, 0, "2\n", "")
+        if argv[3:6] == ["get", "pod", "testbed-oracle-0"]:
+            return subprocess.CompletedProcess(argv, 0, "192.168.122.11", "")
+        if argv[3:6] == ["get", "service", "testbed-oracle-external"]:
+            return subprocess.CompletedProcess(argv, 0, "30308", "")
+        if argv[3:6] == ["get", "secret", "oracle-secret"]:
+            data = {"APP_USER": "YmFua2luZw==", "APP_USER_PASSWORD": "YXBwLXB3"}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"data": data}), "")
         if argv[-2:] == ["config", "current-context"]:
             return subprocess.CompletedProcess(argv, 0, EXPECTED_KUBE_CONTEXT + "\n", "")
         if argv[-4:] == ["get", "nodes", "-o", "json"]:
@@ -180,8 +192,6 @@ class Fakes:
                 "shipping-service shipping-events 1 20 23 3 consumer-2\n",
                 "",
             )
-        if "testbed-oracle-0" in argv and any("banking.transfers" in item for item in argv):
-            return subprocess.CompletedProcess(argv, 0, "2\n", "")
         if argv[0] == "ssh":
             if argv[-2:] == ["--", "/tmp/rca-scenario-F07-H-live.json"]:
                 return subprocess.CompletedProcess(
@@ -619,8 +629,10 @@ def test_f17p_integrity_violation_probe_requires_a_valid_since_timestamp(tmp_pat
         registry.bind({"query_id": "database.integrity_violation_count", "parameters": {"since": "2026-07-24 09:00:00"}})
     )
     assert observed["quality"] == "good" and observed["value"] == 2
-    exec_argv = fakes.process_calls[-1][0]
-    assert "testbed-oracle-0" in exec_argv and "--namespace" in exec_argv and "rca-testbed-banking" in exec_argv
+    client_argv, client_kwargs = fakes.process_calls[-1]
+    assert client_argv[0] == DB_PROBE_PYTHON
+    assert client_kwargs["env"]["DBP_HOST"] == "192.168.122.11" and client_kwargs["env"]["DBP_USER"] == "banking"
+    assert all("exec" not in argv for argv, _ in fakes.process_calls)
 
     rejected = probes.observe(
         registry.bind(

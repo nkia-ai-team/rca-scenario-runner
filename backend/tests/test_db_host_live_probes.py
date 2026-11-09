@@ -1,47 +1,47 @@
 from __future__ import annotations
 
+import base64
 import json
+import re
 import subprocess
 from datetime import datetime, timezone
 
-from app.live_probes import APPROVED_ORACLE_TAGS, HOST_PROBE_CONTRACTS, LiveProbeSet
+from app.live_probes import (
+    APPROVED_ORACLE_TAGS,
+    DB_PROBE_CLIENT,
+    DB_PROBE_PYTHON,
+    HOST_PROBE_CONTRACTS,
+    MYSQL_INDEX_CONTRACT,
+    LiveProbeSet,
+)
 from app.observations import ApprovedQueryRegistry
 
 NOW = datetime(2026, 7, 17, 3, 0, tzinfo=timezone.utc)
 
 
-def fake_sqlplus(script: str) -> str:
-    """Emulate sqlplus closely enough to catch preamble-ordering mistakes.
-
-    Real sqlplus acknowledges the container switch with "Session altered." and
-    indents the value. Returning a bare number instead is what let all four Oracle
-    probes ship with the display settings applied *after* the switch: the digits-only
-    check rejected every real reading while these tests stayed green (2026-07-30).
-    """
-    printed: list[str] = []
-    silenced = False
-    for statement in script.split("\\n"):
-        # The first statement still carries the shell wrapper: printf '<statement>
-        statement = statement.strip().removeprefix("printf '").strip()
-        if statement.startswith("set pages"):
-            silenced = True
-        elif statement.startswith("alter session") and not silenced:
-            printed += ["", "Session altered.", ""]
-        elif statement.startswith("select"):
-            # A '' pair inside the shell's single-quoted printf closes and reopens
-            # the string, so it reaches Oracle as nothing at all: ''COMPLETED''
-            # arrives bare and ''YYYY-MM-DD HH24:MI:SS'' turns :MI into a bind
-            # variable. Two probes shipped that way (2026-07-30) — string literals
-            # have to go through _oracle_string_literal to survive the transport.
-            if "''" in statement:
-                return 'ORA-00904: "SECOND": invalid identifier\n'
-            printed.append("\t 1")
-    return "\n".join(printed) + "\n"
+SECRETS = {
+    "oracle-secret": {
+        "ORACLE_PASSWORD": "sys-pw-not-for-probes", "APP_USER": "banking", "APP_USER_PASSWORD": "app-pw-1",
+        "MON_USER": "LUCIDA_MON", "MON_PASSWORD": "mon-pw-2",
+    },
+    "mysql-secret": {
+        "MYSQL_ROOT_PASSWORD": "root-pw-not-for-probes", "MYSQL_USER": "fooddelivery", "MYSQL_PASSWORD": "food-pw-3",
+    },
+}
+PASSWORDS = [v for data in SECRETS.values() for k, v in data.items() if "PASSWORD" in k]
 
 
 class FakeProcess:
-    def __init__(self) -> None:
+    """kubectl answers reads only; the database probe client answers from DBP_* env.
+
+    Any `kubectl exec` fails the test: the probes must not run inside a database pod
+    (v4 C6b; the old sqlplus / mysql exec left a runc exec, a client process and a SYS
+    session from the DB host in what 119 records)."""
+
+    def __init__(self, answers: dict[str, str] | None = None, fail_client: bool = False) -> None:
         self.calls: list[tuple[list[str], dict]] = []
+        self.answers = answers or {"oracle": "1", "mysql": "0"}
+        self.fail_client = fail_client
 
     def __call__(self, argv, **kwargs):
         argv = list(argv)
@@ -52,11 +52,29 @@ class FakeProcess:
                 json.dumps({"active": True, "clean": False, "filesystem_used_percent": 87}).encode(),
                 b"",
             )
-        if "testbed-oracle-0" in argv:
-            return subprocess.CompletedProcess(argv, 0, fake_sqlplus(argv[-1]), "")
-        if "testbed-mysql-0" in argv:
-            return subprocess.CompletedProcess(argv, 0, "0\n", "")
+        if argv[0] == DB_PROBE_PYTHON:
+            if self.fail_client:
+                raise subprocess.CalledProcessError(
+                    1, argv, "", "OperationalError: (1045, \"Access denied for user 'fooddelivery'\")\n"
+                )
+            return subprocess.CompletedProcess(argv, 0, self.answers[kwargs["env"]["DBP_ENGINE"]] + "\n", "")
+        assert argv[0:2] == ["kubectl", "--kubeconfig"], argv
+        assert "exec" not in argv, argv
+        verb, kind, name = argv[3], argv[4], argv[5]
+        assert verb == "get", argv
+        if kind == "pod":
+            host = {"testbed-oracle-0": "192.168.122.11", "testbed-mysql-0": "192.168.122.14"}[name]
+            return subprocess.CompletedProcess(argv, 0, host, "")
+        if kind == "service":
+            port = {"testbed-oracle-external": "30308", "testbed-mysql-external": "30236"}[name]
+            return subprocess.CompletedProcess(argv, 0, port, "")
+        if kind == "secret":
+            data = {k: base64.b64encode(v.encode()).decode() for k, v in SECRETS[name].items()}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"data": data}), "")
         raise AssertionError(argv)
+
+    def client_calls(self) -> list[dict]:
+        return [kwargs["env"] for argv, kwargs in self.calls if argv[0] == DB_PROBE_PYTHON]
 
 
 def probes(fake: FakeProcess) -> LiveProbeSet:
@@ -69,41 +87,81 @@ def probes(fake: FakeProcess) -> LiveProbeSet:
     )
 
 
-def observe(fake: FakeProcess, query_id: str, parameters: dict):
+def observe(fake: FakeProcess, query_id: str, parameters: dict, probe_set: LiveProbeSet | None = None):
     query = ApprovedQueryRegistry.from_path().bind(
         {"query_id": query_id, "parameters": parameters}
     )
-    return probes(fake).observe(query)
+    return (probe_set or probes(fake)).observe(query)
 
 
-def test_oracle_and_mysql_queries_are_fixed_kubectl_reads() -> None:
-    fake = FakeProcess()
-    oracle = observe(fake, "database.oracle_tagged_session_count", {
-        "client_identifier": "dba-maintenance"
-    })
-    mysql = observe(fake, "database.mysql_index_present", {
-        "database": "fooddelivery", "table": "menus", "index": "idx_menus_category"
-    })
-    assert oracle["quality"] == "good" and oracle["value"] == 1
-    assert mysql["quality"] == "good" and mysql["value"] is False
-    rendered = json.dumps([argv for argv, _ in fake.calls])
-    assert "v$session" in rendered and "information_schema.statistics" in rendered
-    assert all(call[0][0:2] == ["kubectl", "--kubeconfig"] for call in fake.calls)
+ORACLE_PROBES = {
+    "database.oracle_tagged_session_count": {"client_identifier": "dba-maintenance"},
+    "database.outbox_unpublished_count": {"namespace": "rca-testbed-banking"},
+    "database.integrity_violation_count": {"since": "2026-07-30 05:00:00"},
+    "database.ledger_unmatched_transfer_count": {"window_minutes": 5, "grace_seconds": 60},
+}
+# Least privilege per probe: v$session needs the read-only DPM account (the application
+# schema account gets ORA-00942, Oracle Free 23 measured 2026-11-10); the banking tables
+# are the application schema's own; the index probe reads the application's own database.
+EXPECTED_USER = {
+    "database.oracle_tagged_session_count": "LUCIDA_MON",
+    "database.outbox_unpublished_count": "banking",
+    "database.integrity_violation_count": "banking",
+    "database.ledger_unmatched_transfer_count": "banking",
+    "database.mysql_index_present": "fooddelivery",
+}
+
+
+def test_database_probes_are_network_sessions_with_least_privilege_accounts() -> None:
+    cases = dict(ORACLE_PROBES)
+    cases["database.mysql_index_present"] = MYSQL_INDEX_CONTRACT
+    for query_id, parameters in cases.items():
+        fake = FakeProcess()
+        result = observe(fake, query_id, parameters)
+        assert result["quality"] == "good", (query_id, result)
+        if query_id == "database.mysql_index_present":
+            assert result["value"] is False
+        else:
+            assert result["value"] == 1, (query_id, result)
+        (env,) = fake.client_calls()
+        engine = "mysql" if query_id == "database.mysql_index_present" else "oracle"
+        assert env["DBP_ENGINE"] == engine
+        assert env["DBP_USER"] == EXPECTED_USER[query_id], query_id
+        assert env["DBP_HOST"] == ("192.168.122.14" if engine == "mysql" else "192.168.122.11")
+        assert env["DBP_PORT"] == ("30236" if engine == "mysql" else "30308")
+        # Never the administrator passwords; the account's own one only in the child's env.
+        assert env["DBP_PASSWORD"] not in {"sys-pw-not-for-probes", "root-pw-not-for-probes"}
+        for argv, _ in fake.calls:
+            assert "exec" not in argv
+            for password in PASSWORDS:
+                assert all(password not in item for item in argv), (query_id, argv)
+        client_argv = [argv for argv, _ in fake.calls if argv[0] == DB_PROBE_PYTHON]
+        assert client_argv == [[DB_PROBE_PYTHON, "-c", DB_PROBE_CLIENT]]
+
+
+def test_probe_client_carries_the_operator_tool_identity_and_no_value() -> None:
+    # Same identity as the testbed-services injectors (oracle_lock_remote.py constants,
+    # db_operator_session.MYSQL_CONNECT_ATTRS); nothing that names a scenario.
+    for fragment in ('program="SQLcl"', 'machine="ops-bastion"', 'osuser="dba"',
+                     'driver_name="jdbcthin : 23.7.0.25.1"', 'terminal="unknown"', 'conn.module = "SQLcl"',
+                     '"_client_name": "libmysql"', '"program_name": "mysql"', "defer_connect=True"):
+        assert fragment in DB_PROBE_CLIENT, fragment
+    assert not re.search(r"(?i)rca|F\d\d-|scenario|sysdba|as sysdba", DB_PROBE_CLIENT)
 
 
 def test_oracle_probe_reads_every_approved_lock_tag_not_just_f01p() -> None:
-    # The tag used to be frozen into one contract dict and hand-encoded as
-    # chr() codes in the SQL, so F08-G and F15-G had no observable Oracle lock.
+    # The tag used to be frozen into one contract dict and hand-encoded as chr() codes in
+    # the SQL (it rode a shell pipeline into sqlplus). It is now a bind variable.
     for tag in sorted(APPROVED_ORACLE_TAGS):
         fake = FakeProcess()
         result = observe(fake, "database.oracle_tagged_session_count", {
             "client_identifier": tag
         })
         assert result["quality"] == "good"
-        rendered = json.dumps([argv for argv, _ in fake.calls])
-        # The tag reaches the query as chr()-joined codes, never as a raw quote.
-        assert "||".join(f"chr({ord(ch)})" for ch in tag) in rendered
-        assert f"'{tag}'" not in rendered
+        (env,) = fake.client_calls()
+        assert json.loads(env["DBP_BINDS"]) == {"tag": tag}
+        assert ":tag" in env["DBP_SQL"] and tag not in env["DBP_SQL"]
+        assert "v$session" in env["DBP_SQL"]
 
 
 def test_oracle_probe_rejects_a_tag_outside_the_approved_set() -> None:
@@ -112,6 +170,48 @@ def test_oracle_probe_rejects_a_tag_outside_the_approved_set() -> None:
         "client_identifier": "rca-F99-Z-oracle-lock"
     })
     assert result["quality"] == "error"
+    assert fake.calls == []
+
+
+def test_probe_values_bind_rather_than_splice() -> None:
+    fake = FakeProcess()
+    observe(fake, "database.integrity_violation_count", {"since": "2026-07-30 05:00:00"})
+    observe(fake, "database.ledger_unmatched_transfer_count", {"window_minutes": 5, "grace_seconds": 60})
+    observe(fake, "database.mysql_index_present", MYSQL_INDEX_CONTRACT)
+    integrity, ledger, mysql = fake.client_calls()
+    assert json.loads(integrity["DBP_BINDS"]) == {"since": "2026-07-30 05:00:00"}
+    assert "2026-07-30" not in integrity["DBP_SQL"] and ":since" in integrity["DBP_SQL"]
+    assert json.loads(ledger["DBP_BINDS"]) == {"window": 5, "grace": 60}
+    assert ":window" in ledger["DBP_SQL"] and ":grace" in ledger["DBP_SQL"]
+    assert json.loads(mysql["DBP_BINDS"]) == MYSQL_INDEX_CONTRACT
+    assert "idx_menus_category" not in mysql["DBP_SQL"]
+
+
+def test_listener_and_secret_are_read_once_per_probe_set_and_again_after_a_failure() -> None:
+    fake = FakeProcess()
+    probe_set = probes(fake)
+    for _ in range(3):
+        result = observe(fake, "database.oracle_tagged_session_count",
+                         {"client_identifier": "dba-maintenance"}, probe_set)
+        assert result["value"] == 1
+    kubectl = [argv for argv, _ in fake.calls if argv[0] == "kubectl"]
+    assert len(kubectl) == 3  # pod hostIP, service nodePort, secret: once
+    fake.fail_client = True
+    failed = observe(fake, "database.oracle_tagged_session_count",
+                     {"client_identifier": "dba-maintenance"}, probe_set)
+    assert failed["quality"] == "error"
+    for password in PASSWORDS:
+        assert password not in json.dumps(failed, default=str)
+    fake.fail_client = False
+    observe(fake, "database.oracle_tagged_session_count", {"client_identifier": "dba-maintenance"}, probe_set)
+    assert len([argv for argv, _ in fake.calls if argv[0] == "kubectl"]) == 6
+
+
+def test_unparsable_probe_output_is_an_error_not_a_value() -> None:
+    fake = FakeProcess(answers={"oracle": "Session altered.", "mysql": "2"})
+    assert observe(fake, "database.oracle_tagged_session_count",
+                   {"client_identifier": "dba-maintenance"})["quality"] == "error"
+    assert observe(fake, "database.mysql_index_present", MYSQL_INDEX_CONTRACT)["quality"] == "error"
 
 
 def test_host_queries_use_only_measured_worker_and_fixed_probe_script() -> None:
@@ -125,27 +225,6 @@ def test_host_queries_use_only_measured_worker_and_fixed_probe_script() -> None:
             assert argv[-3:] == [scenario_id, mode, target]
             assert kwargs["input"].startswith(b"#!/usr/bin/env bash")
             assert "StrictHostKeyChecking=yes" in argv
-
-
-ORACLE_PROBES = {
-    "database.oracle_tagged_session_count": {"client_identifier": "dba-maintenance"},
-    "database.outbox_unpublished_count": {"namespace": "rca-testbed-banking"},
-    "database.integrity_violation_count": {"since": "2026-07-30 05:00:00"},
-    "database.ledger_unmatched_transfer_count": {"window_minutes": 5, "grace_seconds": 60},
-}
-
-
-def test_every_oracle_probe_silences_sqlplus_before_switching_container() -> None:
-    """All four shipped with the two preamble lines reversed and so had never
-    returned a value. Assert the invariant for every probe, not just the one that
-    happened to be exercised."""
-    for query_id, parameters in ORACLE_PROBES.items():
-        fake = FakeProcess()
-        result = observe(fake, query_id, parameters)
-        assert result["quality"] == "good", (query_id, result)
-        assert result["value"] == 1, (query_id, result)
-        script = fake.calls[0][0][-1]
-        assert script.index("set pages") < script.index("alter session"), query_id
 
 
 def test_filesystem_query_rejects_non_storage_target_and_unknown_scenario() -> None:

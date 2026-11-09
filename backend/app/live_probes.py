@@ -7,6 +7,7 @@ keeps unit tests side-effect free.
 """
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -572,30 +573,75 @@ APPROVED_ORACLE_TAGS = frozenset({
 })
 
 
-def _oracle_string_literal(value: str) -> str:
-    """Render a string as chr()||chr() so it can ride inside the nested
-    printf/sqlplus shell pipeline without a single quote of its own."""
-    if not value or not all(32 <= ord(ch) < 127 for ch in value):
-        raise LiveProbeError("Oracle tag is not printable ASCII")
-    return "||".join(f"chr({ord(ch)})" for ch in value)
+# v4 C6b: the database probes no longer exec into the database pod. They used to run
+# `sqlplus -s / as sysdba` (and `mysql -uroot`) inside testbed-oracle-0 / testbed-mysql-0
+# every 15 to 30 seconds, which left on the DB node a runc exec, a sqlplus process and,
+# in the session list 119 records, a short SYS session from machine testbed-oracle-0 --
+# the very shape the C6 lock injector stopped producing. Now each probe is one network
+# session from this container through the database's NodePort listener, with the same
+# operator-tool identity the testbed-services injectors use (oracle_lock_remote.py,
+# db_operator_session.py) and the least privileged account that can answer:
+#   - the tagged-session count reads v$session, which the application schema account
+#     cannot (ORA-00942, Oracle Free 23 measured 2026-11-10), so it uses the existing
+#     read-only DPM account (MON_USER: SELECT_CATALOG_ROLE, SELECT ANY DICTIONARY);
+#   - the banking table counts read the application schema's own tables (APP_USER);
+#   - the MySQL index probe reads information_schema.statistics of the application's own
+#     database (MYSQL_USER).
+# The client runs in the image's system python (oracledb, PyMySQL), not the app venv.
+# Passwords travel only in the child's environment; values are bind variables.
+DB_PROBE_PYTHON = "/usr/local/bin/python3"
+ORACLE_PROBE_ENDPOINT = {
+    "namespace": "rca-testbed-banking", "pod": "testbed-oracle-0",
+    "service": "testbed-oracle-external", "port": 1521, "secret": "oracle-secret",
+}
+ORACLE_PROBE_SERVICE_NAME = "FREEPDB1"
+MYSQL_PROBE_ENDPOINT = {
+    "namespace": "rca-testbed-food", "pod": "testbed-mysql-0",
+    "service": "testbed-mysql-external", "port": 3306, "secret": "mysql-secret",
+}
+# role -> (user key, password key) in the engine's Secret.
+ORACLE_PROBE_ACCOUNTS = {"mon": ("MON_USER", "MON_PASSWORD"), "app": ("APP_USER", "APP_USER_PASSWORD")}
+MYSQL_PROBE_ACCOUNTS = {"app": ("MYSQL_USER", "MYSQL_PASSWORD")}
+# The probe client. Kept free of any value: everything arrives in DBP_* variables.
+DB_PROBE_CLIENT = r"""
+import json, os, sys
+e = os.environ
+binds = json.loads(e.get("DBP_BINDS") or "{}")
+try:
+    if e["DBP_ENGINE"] == "oracle":
+        import oracledb
+        conn = oracledb.connect(
+            user=e["DBP_USER"], password=e["DBP_PASSWORD"],
+            dsn=e["DBP_HOST"] + ":" + e["DBP_PORT"] + "/" + e["DBP_SERVICE"],
+            program="SQLcl", machine="ops-bastion", osuser="dba",
+            driver_name="jdbcthin : 23.7.0.25.1", terminal="unknown", expire_time=1,
+        )
+        conn.module = "SQLcl"
+        cur = conn.cursor()
+        cur.execute(e["DBP_SQL"], binds)
+    else:
+        import pymysql
+        conn = pymysql.connect(
+            host=e["DBP_HOST"], port=int(e["DBP_PORT"]), user=e["DBP_USER"],
+            password=e["DBP_PASSWORD"], database=e["DBP_DATABASE"], charset="utf8mb4",
+            autocommit=True, connect_timeout=10, defer_connect=True,
+        )
+        conn._connect_attrs = {
+            "_client_name": "libmysql", "_client_version": "8.0.40", "_os": "Linux",
+            "_platform": "x86_64", "program_name": "mysql", "_pid": str(os.getpid()),
+        }
+        conn.connect()
+        cur = conn.cursor()
+        cur.execute(e["DBP_SQL"], binds)
+    row = cur.fetchone()
+    conn.close()
+except Exception as exc:
+    print(type(exc).__name__ + ": " + (str(exc).splitlines() or [""])[0], file=sys.stderr)
+    sys.exit(1)
+print("" if row is None or row[0] is None else row[0])
+"""
 
 
-def _oracle_sqlplus(query: str) -> str:
-    """Build the sh -lc argument for a single-value Oracle probe.
-
-    The container switch prints "Session altered.", so the display settings must
-    already be in force when it runs. All four Oracle probes had the two lines the
-    other way round, which put that sentence ahead of the digits and made the
-    fullmatch check reject every reading — measured 2026-07-30: the probes had never
-    once returned a value. Emitting the order from one place keeps the next probe
-    from reintroducing it.
-    """
-    return (
-        "printf 'set pages 0 feedback off heading off\\n"
-        "alter session set container=FREEPDB1;\\n"
-        f"{query}\\n"
-        "exit;\\n' | sqlplus -s / as sysdba"
-    )
 MYSQL_INDEX_CONTRACT = {
     "database": "fooddelivery", "table": "menus", "index": "idx_menus_category"
 }
@@ -1002,6 +1048,8 @@ class LiveProbeSet:
         self.scenario_id = scenario_id
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.paths = paths
+        # Listener address and account per database, read once from the API (C6b).
+        self._database_endpoints: dict[str, dict[str, str]] = {}
 
     def inspect(self, request: EligibilityRequest) -> EligibilityEvidence:
         unknown = set(request.checks) - APPROVED_CHECK_IDS
@@ -1098,6 +1146,81 @@ class LiveProbeSet:
             env=_read_only_environment(),
             timeout=15,
         )
+
+    def _database_endpoint(self, engine: str) -> dict[str, str]:
+        """Node address, NodePort and Secret of one testbed database, read with
+        kubectl get only and kept for this probe set. A failed query drops it so
+        the next tick reads it again (the pod may have moved)."""
+        cached = self._database_endpoints.get(engine)
+        if cached is not None:
+            return cached
+        target = ORACLE_PROBE_ENDPOINT if engine == "oracle" else MYSQL_PROBE_ENDPOINT
+        namespace = target["namespace"]
+        host = self._kubectl(
+            "get", "pod", target["pod"], "--namespace", namespace,
+            "-o", "jsonpath={.status.hostIP}",
+        ).stdout.strip()
+        port = self._kubectl(
+            "get", "service", target["service"], "--namespace", namespace,
+            "-o", f"jsonpath={{.spec.ports[?(@.port=={target['port']})].nodePort}}",
+        ).stdout.strip()
+        if not re.fullmatch(r"[0-9.]+", host) or not re.fullmatch(r"[0-9]+", port):
+            raise LiveProbeError(f"{engine} listener endpoint is unavailable")
+        secret = json.loads(
+            self._kubectl(
+                "get", "secret", target["secret"], "--namespace", namespace, "-o", "json",
+            ).stdout
+        ).get("data") or {}
+        decoded: dict[str, str] = {"host": host, "port": port}
+        for key, value in secret.items():
+            try:
+                decoded[f"secret:{key}"] = base64.b64decode(value).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                continue
+        self._database_endpoints[engine] = decoded
+        return decoded
+
+    def _database_query(
+        self, engine: str, role: str, sql: str, binds: Mapping[str, Any] | None = None,
+    ) -> str:
+        """One single-value query as a network session from this container."""
+        accounts = ORACLE_PROBE_ACCOUNTS if engine == "oracle" else MYSQL_PROBE_ACCOUNTS
+        if role not in accounts:
+            raise LiveProbeError(f"{engine} probe account role is not approved")
+        endpoint = self._database_endpoint(engine)
+        user_key, password_key = accounts[role]
+        user = endpoint.get(f"secret:{user_key}", "")
+        password = endpoint.get(f"secret:{password_key}", "")
+        if not user or not password:
+            raise LiveProbeError(f"{engine} probe account is missing from the secret")
+        environment = _read_only_environment()
+        environment.update({
+            "DBP_ENGINE": engine,
+            "DBP_HOST": endpoint["host"],
+            "DBP_PORT": endpoint["port"],
+            "DBP_SERVICE": ORACLE_PROBE_SERVICE_NAME,
+            "DBP_DATABASE": str(MYSQL_INDEX_CONTRACT["database"]),
+            "DBP_USER": user,
+            "DBP_PASSWORD": password,
+            "DBP_SQL": sql,
+            "DBP_BINDS": json.dumps(dict(binds or {})),
+        })
+        try:
+            result = self.process_runner(
+                [DB_PROBE_PYTHON, "-c", DB_PROBE_CLIENT],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=15,
+            )
+        except subprocess.CalledProcessError as error:
+            self._database_endpoints.pop(engine, None)
+            detail = (error.stderr or "").strip().splitlines()
+            raise LiveProbeError(
+                f"{engine} probe query failed: {detail[0] if detail else 'no detail'}"
+            ) from None
+        return result.stdout.strip()
 
     def _kube_context_ok(self) -> bool:
         result = self._kubectl("config", "current-context")
@@ -1872,27 +1995,23 @@ class LiveProbeSet:
             tag = query.parameters["client_identifier"]
             if tag not in APPROVED_ORACLE_TAGS:
                 raise LiveProbeError("Oracle session tag is not allowlisted")
-            result = self._kubectl(
-                "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
-                "sh", "-lc",
-                _oracle_sqlplus(
-                    "select count(*) from v$session where client_identifier="
-                    f"{_oracle_string_literal(tag)};"
-                ),
+            raw = self._database_query(
+                "oracle", "mon",
+                "select count(*) from v$session where client_identifier = :tag",
+                {"tag": tag},
             )
-            raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
                 raise LiveProbeError("Oracle tagged session count is invalid")
             return int(raw), _aware(self.clock()), "database:oracle-tagged-session-count"
         if query.query_id == "database.mysql_index_present":
             if dict(query.parameters) != MYSQL_INDEX_CONTRACT:
                 raise LiveProbeError("MySQL index target is not allowlisted")
-            result = self._kubectl(
-                "exec", "testbed-mysql-0", "--namespace", "rca-testbed-food", "--",
-                "sh", "-lc",
-                "mysql -N -uroot -p\"$MYSQL_ROOT_PASSWORD\" fooddelivery -e \"SELECT count(*) FROM information_schema.statistics WHERE table_schema='fooddelivery' AND table_name='menus' AND index_name='idx_menus_category';\" 2>/dev/null",
+            raw = self._database_query(
+                "mysql", "app",
+                "SELECT count(*) FROM information_schema.statistics "
+                "WHERE table_schema = %(database)s AND table_name = %(table)s AND index_name = %(index)s",
+                dict(query.parameters),
             )
-            raw = result.stdout.strip()
             if raw not in {"0", "1"}:
                 raise LiveProbeError("MySQL index presence is invalid")
             return raw == "1", _aware(self.clock()), "database:mysql-index-present"
@@ -1901,14 +2020,10 @@ class LiveProbeSet:
             # relay has not published (published_at IS NULL, init.sql:60-70).
             if dict(query.parameters) != OUTBOX_UNPUBLISHED_CONTRACT:
                 raise LiveProbeError("outbox count target is not allowlisted")
-            result = self._kubectl(
-                "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
-                "sh", "-lc",
-                _oracle_sqlplus(
-                    "select count(*) from banking.outbox_events where published_at is null;"
-                ),
+            raw = self._database_query(
+                "oracle", "app",
+                "select count(*) from banking.outbox_events where published_at is null",
             )
-            raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
                 raise LiveProbeError("outbox unpublished count is invalid")
             return int(raw), _aware(self.clock()), "database:outbox-unpublished-count"
@@ -1997,20 +2112,15 @@ class LiveProbeSet:
                 r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", since
             ):
                 raise LiveProbeError("integrity violation query requires a valid 'since' timestamp")
-            result = self._kubectl(
-                "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
-                "sh", "-lc",
-                _oracle_sqlplus(
-                    "select count(*) from banking.transfers t join banking.accounts a "
-                    "on a.id in (t.from_account, t.to_account) "
-                    f"where a.status in ({_oracle_string_literal('FROZEN')},"
-                    f"{_oracle_string_literal('CLOSED')}) "
-                    f"and t.status={_oracle_string_literal('COMPLETED')} "
-                    f"and t.created_at >= to_timestamp({_oracle_string_literal(since)}, "
-                    f"{_oracle_string_literal('YYYY-MM-DD HH24:MI:SS')});"
-                ),
+            raw = self._database_query(
+                "oracle", "app",
+                "select count(*) from banking.transfers t join banking.accounts a "
+                "on a.id in (t.from_account, t.to_account) "
+                "where a.status in ('FROZEN', 'CLOSED') "
+                "and t.status = 'COMPLETED' "
+                "and t.created_at >= to_timestamp(:since, 'YYYY-MM-DD HH24:MI:SS')",
+                {"since": since},
             )
-            raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
                 raise LiveProbeError("integrity violation count is invalid")
             return int(raw), _aware(self.clock()), "database:integrity-violation-count"
@@ -2033,24 +2143,19 @@ class LiveProbeSet:
                 raise LiveProbeError("ledger reconciliation window is not allowlisted")
             window = int(parameters["window_minutes"])
             grace = int(parameters["grace_seconds"])
-            result = self._kubectl(
-                "exec", "testbed-oracle-0", "--namespace", "rca-testbed-banking", "--",
-                "sh", "-lc",
-                _oracle_sqlplus(
-                    "select count(*) from banking.transfers t "
-                    f"where t.status={_oracle_string_literal('COMPLETED')} "
-                    # sys_extract_utc: created_at is stored UTC-naive, so comparing it
-                    # against a plain systimestamp would shift the window by the DB
-                    # host's offset.
-                    f"and t.created_at >= sys_extract_utc(systimestamp) - "
-                    f"numtodsinterval({window}, {_oracle_string_literal('MINUTE')}) "
-                    f"and t.created_at < sys_extract_utc(systimestamp) - "
-                    f"numtodsinterval({grace}, {_oracle_string_literal('SECOND')}) "
-                    "and not exists (select 1 from banking.ledger_entries le "
-                    "where le.transfer_ref = t.transfer_ref);"
-                ),
+            raw = self._database_query(
+                "oracle", "app",
+                "select count(*) from banking.transfers t "
+                "where t.status = 'COMPLETED' "
+                # sys_extract_utc: created_at is stored UTC-naive, so comparing it
+                # against a plain systimestamp would shift the window by the DB
+                # host's offset.
+                "and t.created_at >= sys_extract_utc(systimestamp) - numtodsinterval(:window, 'MINUTE') "
+                "and t.created_at < sys_extract_utc(systimestamp) - numtodsinterval(:grace, 'SECOND') "
+                "and not exists (select 1 from banking.ledger_entries le "
+                "where le.transfer_ref = t.transfer_ref)",
+                {"window": window, "grace": grace},
             )
-            raw = result.stdout.strip()
             if not re.fullmatch(r"[0-9]+", raw):
                 raise LiveProbeError("ledger unmatched transfer count is invalid")
             return int(raw), _aware(self.clock()), "database:ledger-unmatched-transfer-count"
