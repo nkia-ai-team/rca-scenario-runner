@@ -276,27 +276,117 @@ _KOREAN_NAMES: dict[str, tuple[str, ...]] = {"gateway": ("게이트웨이",)}
 SCORED_FIELDS = frozenset({"root_cause", "scoring", "must_support", "must_rule_out"})
 
 
+# Words that name a domain without naming one of its apps (the domain key from
+# the policy always counts too). Used only to decide whether a short word such
+# as ``api`` or ``order`` may point into another domain (U7b). Over-wide is the
+# safe side: a word here only keeps more targets excluded.
+_DOMAIN_WORDS: dict[str, tuple[str, ...]] = {
+    "commerce": ("커머스", "checkout", "체크아웃"),
+    "core-banking": ("banking", "은행"),
+    "food-delivery": ("food", "배달", "음식"),
+}
+# An HTTP route: a URL with a host, or a path that starts a token ("/api/...",
+# "(/api/...)"). File paths inside source trees ("src/main/java/...") do not
+# start a token and are not routes.
+_ROUTE = re.compile(
+    r"https?://[^\s/]+(?P<url>/[^\s)'\"`,]*)?|(?<![\w./-])(?P<path>/[A-Za-z{*][^\s)'\"`,]*)"
+)
+
+
+def _word_spans(text: str, word: str) -> list[tuple[int, int]]:
+    return [
+        match.span()
+        for match in re.finditer(rf"(?<![A-Za-z0-9-]){re.escape(word)}(?![A-Za-z0-9-])", text)
+    ]
+
+
 def _word(text: str, word: str) -> bool:
-    return re.search(rf"(?<![A-Za-z0-9-]){re.escape(word)}(?![A-Za-z0-9-])", text) is not None
+    return bool(_word_spans(text, word))
 
 
-def mentioned_targets(policy: DecoyPolicy, text: str) -> set[str]:
+def _route_prefixes(text: str) -> set[tuple[int, int]]:
+    """Spans of the first segment of every HTTP route in ``text``.
+
+    That segment (``api`` in ``/api/orders``, ``actuator`` in
+    ``/actuator/health``) is the server's URL prefix, not the app the route
+    belongs to, so it never names an app of another domain (D1 review N2: a
+    commerce ``/api/orders`` read as banking ``testbed-api``). Later segments
+    (``/api/inventory/reserve``) still count: they name the resource."""
+    spans: set[tuple[int, int]] = set()
+    for match in _ROUTE.finditer(text):
+        group = "url" if match.group("url") else "path"
+        if match.group(group) is None:
+            continue
+        start = match.start(group) + 1
+        segment = re.match(r"[^/?#\s)'\"`,]*", text[start:])
+        spans.add((start, start + len(segment.group(0)) if segment else start))
+    return spans
+
+
+def named_namespaces(policy: DecoyPolicy, scenario: Mapping[str, Any]) -> set[str]:
+    """Namespaces the answer key names by something stronger than a short word:
+    the namespace itself, a full app name (service name, alias, target id,
+    Deployment, container) of any app in it, or a word for its domain.
+
+    A short word of another domain only counts as a mention when its domain is
+    named here (U7b). A container shared by two domains (``order-service``)
+    names both; too many is safe."""
+    text = "\n".join(value for _, value in _answer_key_texts(scenario))
+    lowered = text.lower()
+    named: set[str] = set()
+    for domain, namespace in policy.domain_namespaces.items():
+        words = (domain, *_DOMAIN_WORDS.get(domain, ()))
+        if namespace in text or any(word.lower() in lowered for word in words):
+            named.add(namespace)
+    for target in policy.targets:
+        if target.namespace in named:
+            continue
+        if any(name in text for name in target.names()) or any(
+            _word(text, word) for word in (target.deployment, target.container)
+        ):
+            named.add(target.namespace)
+    return named
+
+
+def mentioned_targets(
+    policy: DecoyPolicy,
+    text: str,
+    *,
+    home: str | None = None,
+    named: set[str] | None = None,
+) -> set[str]:
     """Policy target keys a piece of answer-key text names.
 
     Every way an answer key names an app counts, in every namespace (review2
     B3): service name, alias, target id, Deployment, container, the short word
     (``order``), its Korean name, or the whole namespace. A short word shared by
-    two domains (``order``, ``payment``) excludes both; too many is safe."""
+    two domains (``order``, ``payment``) excludes both; too many is safe.
+
+    With ``home`` (the scenario's namespace) and ``named`` (from
+    ``named_namespaces``) the short word and the Korean name are held to the
+    domain boundary (U7b): for an app outside ``home`` they count only when the
+    answer key names that app's domain somewhere, and never as the first
+    segment of an HTTP route. Inside ``home`` they always count. Without
+    ``home`` the reading stays blunt (every short word everywhere), which is
+    what the no-change reading uses."""
     hits: set[str] = set()
+    prefixes = _route_prefixes(text) if home is not None else set()
     for target in policy.targets:
         if target.namespace in text or any(name in text for name in target.names()):
             hits.add(target.key)
             continue
+        if any(_word(text, word) for word in (target.deployment, target.container)):
+            hits.add(target.key)
+            continue
         short = target.deployment.removeprefix("testbed-")
-        words = (target.deployment, target.container, short)
-        if any(_word(text, word) for word in words) or any(
-            korean in text for korean in _KOREAN_NAMES.get(short, ())
-        ):
+        spans = _word_spans(text, short)
+        for korean in _KOREAN_NAMES.get(short, ()):
+            spans += [match.span() for match in re.finditer(re.escape(korean), text)]
+        if home is not None and target.namespace != home:
+            if named is None or target.namespace not in named:
+                continue
+            spans = [span for span in spans if span not in prefixes]
+        if spans:
             hits.add(target.key)
     return hits
 
@@ -314,15 +404,22 @@ def stated_unchanged(
     recording, so these are never decoy targets (user decision 2026-11-09).
     The extraction is mechanical; it errs toward excluding."""
     namespace = scenario_namespace(policy, scenario)
+    named = named_namespaces(policy, scenario)
     found: dict[str, list[tuple[str, str]]] = {}
     for field, text in _answer_key_texts(scenario):
         for sentence in _SENTENCE_SPLIT.split(text):
             sentence = sentence.strip()
             if not sentence or not says_no_change(sentence):
                 continue
+            # Blunt on purpose: every short word in every namespace stays out
+            # (a no-change sentence wrongly read costs a false recording). The
+            # "nothing else changed" fallback is decided on the bounded
+            # reading, so a URL prefix or another domain's short word no longer
+            # switches it off (U7 review3 M3).
             keys = mentioned_targets(policy, sentence)
-            if not keys and namespace and not _NON_TARGET_WORDS.search(sentence):
-                keys = {t.key for t in policy.targets if t.namespace == namespace}
+            bounded = mentioned_targets(policy, sentence, home=namespace, named=named)
+            if not bounded and namespace and not _NON_TARGET_WORDS.search(sentence):
+                keys |= {t.key for t in policy.targets if t.namespace == namespace}
             for key in keys:
                 found.setdefault(key, []).append((field, sentence))
     return found
@@ -336,7 +433,9 @@ def excluded_targets(
     In order: scored names (always the fault path), targets the answer key says
     did not change, any target the scored items (root cause, scoring,
     must_support, must_rule_out) name, then (``path_scope="mentioned"``) any
-    other target the answer key names, then the policy's own per-scenario list."""
+    other target the answer key names, then the policy's own per-scenario list.
+    The path readings hold short words to the domain boundary
+    (``mentioned_targets`` with ``home``); the no-change reading does not."""
     names = _scenario_names(scenario)
     reasons: dict[str, str] = {}
     for target in policy.targets:
@@ -344,15 +443,17 @@ def excluded_targets(
             reasons[target.key] = "scored"
     for key in stated_unchanged(policy, scenario):
         reasons.setdefault(key, "stated_unchanged")
+    home = scenario_namespace(policy, scenario)
+    named = named_namespaces(policy, scenario)
     scored_text = "\n".join(
         value for field, value in _answer_key_texts(scenario)
         if field.split(".", 1)[0].split("[", 1)[0] in SCORED_FIELDS
     )
-    for key in mentioned_targets(policy, scored_text):
+    for key in mentioned_targets(policy, scored_text, home=home, named=named):
         reasons.setdefault(key, "scored_item")
     if policy.path_scope == "mentioned":
         text = "\n".join(value for _, value in _answer_key_texts(scenario))
-        for key in mentioned_targets(policy, text):
+        for key in mentioned_targets(policy, text, home=home, named=named):
             reasons.setdefault(key, "mentioned")
     for key in policy.scenario_exclusions.get(scenario_id, []):
         reasons.setdefault(key, "policy")
@@ -710,15 +811,19 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"policy_sha256": digest, "rows": rows}, ensure_ascii=False, indent=1))
         return 0
     print(f"policy_sha256 {digest}\n")
-    print("| 시나리오 | 도메인 | 후보 계 | 같은 도메인 | 다른 도메인 | 제외(채점, 언급, 변경 없음 문장) |")
+    print(
+        "| 시나리오 | 도메인 | 후보 계 | 같은 도메인 | 다른 도메인 "
+        "| 제외(채점 이름, 채점 문항, 언급, 변경 없음 문장, 정책) |"
+    )
     print("|---|---|---|---|---|---|")
     for row in rows:
         counts = {kind: sum(1 for why in row["excluded"].values() if why == kind)
-                  for kind in ("scored", "mentioned", "stated_unchanged", "policy")}
+                  for kind in ("scored", "scored_item", "mentioned", "stated_unchanged", "policy")}
         total = len(row["same_domain"]) + len(row["off_domain"])
         print(
             f"| {row['scenario_id']} | {row['domain']} | {total} | {len(row['same_domain'])} | "
-            f"{len(row['off_domain'])} | {counts['scored']}, {counts['mentioned']}, {counts['stated_unchanged']} |"
+            f"{len(row['off_domain'])} | {counts['scored']}, {counts['scored_item']}, "
+            f"{counts['mentioned']}, {counts['stated_unchanged']}, {counts['policy']} |"
         )
     return 0
 

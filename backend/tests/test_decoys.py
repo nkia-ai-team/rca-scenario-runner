@@ -446,6 +446,108 @@ def test_scored_items_exclude_every_target_they_name_and_no_change_lists_are_rea
     assert "rca-testbed-commerce/testbed-order" not in keys
 
 
+# --- U7b: short words held to the domain and the app-name boundary ---------
+def _three_domains() -> DecoyPolicy:
+    return policy(
+        domain_namespaces={
+            "commerce": "rca-testbed-commerce",
+            "core-banking": "rca-testbed-banking",
+            "food-delivery": "rca-testbed-food",
+        },
+        targets=[
+            _target("rca-testbed-commerce", "testbed-order", "commerce-order", "uuid-c-order"),
+            _target("rca-testbed-commerce", "testbed-payment", "commerce-payment", "uuid-c-pay"),
+            {**_target("rca-testbed-commerce", "testbed-gateway", "commerce-gateway", "uuid-gw"),
+             "container": "api-gateway"},
+            _target("rca-testbed-banking", "testbed-api", "core-banking-api", "uuid-api", aliases=["banking-api"]),
+            _target("rca-testbed-banking", "testbed-ledger", "core-banking-ledger", "uuid-led",
+                    aliases=["banking-ledger"]),
+            _target("rca-testbed-food", "testbed-order", "food-delivery-order", "uuid-f-order",
+                    aliases=["food-order"]),
+            _target("rca-testbed-food", "testbed-payment", "food-delivery-payment", "uuid-f-pay",
+                    aliases=["food-payment"]),
+        ],
+    )
+
+
+def test_a_url_prefix_does_not_name_another_domains_api() -> None:
+    """D1 review N2: a commerce answer key citing ``/api/orders`` excluded
+    banking ``testbed-api``. The first segment of a route is the URL prefix;
+    later segments and the app's own domain still count."""
+    active = _three_domains()
+    api = "rca-testbed-banking/testbed-api"
+    commerce = {
+        "domain": "commerce",
+        "scoring": {"accept": ["commerce-order"]},
+        "must_support": ["게이트웨이 POST /api/orders/** 서버 스팬 5xx 0.05 이상, core-banking 이체는 정상"],
+        "description": "payment calls http://testbed-transfer:8082/api/transfers for the settlement.",
+    }
+    assert api not in excluded_targets(active, "X", commerce)
+    named = {**commerce, "must_rule_out": ["banking api 의 이체 스팬은 평시와 같다"]}
+    assert excluded_targets(active, "X", named)[api] == "scored_item"
+    banking = {"domain": "core-banking", "scoring": {"accept": ["core-banking-ledger"]},
+               "must_support": ["POST /api/transfers 5xx"]}
+    assert excluded_targets(active, "X", banking)[api] == "scored_item"
+    # A later segment names the resource, so the app behind it stays out.
+    resource = {**banking, "description": "commerce checkout calls /api/payment/settle and fails"}
+    assert excluded_targets(active, "X", resource)["rca-testbed-commerce/testbed-payment"] == "mentioned"
+
+
+def test_a_short_word_names_another_domain_only_when_that_domain_is_named() -> None:
+    """``order`` in a commerce answer key is commerce order; food order stays a
+    candidate unless the answer key names the food domain. A banking key that
+    names commerce (``commerce payment``) keeps commerce's short words out, and
+    the Korean 게이트웨이 follows the same rule."""
+    active = _three_domains()
+    commerce = {
+        "domain": "commerce",
+        "scoring": {"accept": ["commerce-postgres"]},
+        "must_support": ["order 의 Hikari 대기가 늘고 payment 가 실패한다"],
+    }
+    reasons = excluded_targets(active, "X", commerce)
+    assert {"rca-testbed-commerce/testbed-order", "rca-testbed-commerce/testbed-payment"} <= set(reasons)
+    assert "rca-testbed-food/testbed-order" not in reasons
+    assert "rca-testbed-food/testbed-payment" not in reasons
+    with_food = {**commerce, "description": "food delivery stays healthy"}
+    assert "rca-testbed-food/testbed-order" in excluded_targets(active, "X", with_food)
+
+    banking = {
+        "domain": "core-banking",
+        "scoring": {"accept": ["core-banking-ledger"]},
+        "must_support": ["api 'Account service call failed for order null: 400' 이 늘어난다"],
+        "description": "commerce payment also calls transfer directly.",
+        "must_rule_out": ["게이트웨이와 각 서비스 서버 스팬에 429 가 없다"],
+    }
+    reasons = excluded_targets(active, "X", banking)
+    assert reasons["rca-testbed-commerce/testbed-payment"] == "mentioned"
+    # Ambiguous (commerce is named, "order" could be its app): stays out.
+    assert reasons["rca-testbed-commerce/testbed-order"] == "scored_item"
+    assert reasons["rca-testbed-commerce/testbed-gateway"] == "scored_item"
+    assert "rca-testbed-food/testbed-order" not in reasons
+    assert "rca-testbed-food/testbed-payment" not in reasons
+    unnamed = {**banking, "description": "the load generator calls transfer directly."}
+    assert "rca-testbed-commerce/testbed-gateway" not in excluded_targets(active, "X", unnamed)
+    checkout = {**unnamed, "user_impact": "체크아웃이 게이트웨이에서 502 로 끝난다"}
+    assert "rca-testbed-commerce/testbed-gateway" in excluded_targets(active, "X", checkout)
+
+
+def test_no_change_sentences_stay_blunt_across_domains() -> None:
+    """The domain boundary is for the path reading only. A no-change sentence
+    still takes every short word in every namespace (review2 B4 side), and a
+    URL prefix or another domain's word no longer switches off the "nothing
+    else changed" fallback (U7 review3 M3)."""
+    active = _three_domains()
+    banking = {"domain": "core-banking", "must_rule_out": ["order 롤아웃이 없다"]}
+    unchanged = set(stated_unchanged(active, banking))
+    assert {"rca-testbed-commerce/testbed-order", "rca-testbed-food/testbed-order"} <= unchanged
+    for key in ("rca-testbed-commerce/testbed-order", "rca-testbed-food/testbed-order"):
+        assert excluded_targets(active, "X", banking)[key] == "stated_unchanged"
+    generic = {"domain": "commerce", "description": "Nothing else changes: no rollout and no restart behind /api/checkout."}
+    unchanged = set(stated_unchanged(active, generic))
+    assert {t.key for t in active.targets if t.namespace == "rca-testbed-commerce"} <= unchanged
+    assert "rca-testbed-banking/testbed-api" in unchanged
+
+
 def test_a_scenario_without_a_domain_gets_no_decoy() -> None:
     """review2 M3: without a domain the bare words and the namespace fallback
     cannot be read, so no schedule is drawn rather than a wrong one."""
@@ -479,6 +581,36 @@ def test_review2_reproductions_on_the_real_answer_keys(scenario_id, scope, key) 
     assert key not in _candidate_keys(active, scenario_id, scenarios[scenario_id], scope)
 
 
+# D1 review N2 / review2 R3: answer-key wording D1 introduced excluded these
+# for a name the key never meant ("/api/orders" read as banking api, "for
+# order null" read as food order). They are candidates again (U7b).
+D1_FALSE_EXCLUSIONS = [
+    *[(sid, "rca-testbed-banking/testbed-api") for sid in (
+        "F01-R", "F01-H", "F08-H", "F11-R", "F05-R", "F05-H", "F06-H", "F05-P", "F15-T1",
+        "F15-R", "F25-H", "F23-R", "F30-R", "F66-R", "F60-H", "F67-R", "F53-H", "F69-R",
+    )],
+    ("F17-P", "rca-testbed-food/testbed-order"),
+]
+# Kept out on purpose: F17-R names the commerce gateway's spans as evidence, and
+# F17-P names commerce ("commerce payment"), so its "order" stays ambiguous.
+D1_KEPT_EXCLUSIONS = [
+    ("F17-R", "rca-testbed-commerce/testbed-gateway"),
+    ("F17-P", "rca-testbed-commerce/testbed-order"),
+]
+
+
+@pytest.mark.parametrize("scope", ["mentioned", "scored"])
+def test_d1_wording_no_longer_excludes_other_domains_by_a_stray_word(scope) -> None:
+    active, scenarios = _real()
+    returned = [
+        (sid, key) for sid, key in D1_FALSE_EXCLUSIONS
+        if key in _candidate_keys(active, sid, scenarios[sid], scope)
+    ]
+    assert returned == D1_FALSE_EXCLUSIONS
+    for sid, key in D1_KEPT_EXCLUSIONS:
+        assert key not in _candidate_keys(active, sid, scenarios[sid], scope), (sid, key)
+
+
 # Independent, deliberately blunt oracle for the exhaustive check below: it does
 # not reuse the module's matching, so a gap in one is not hidden by the other.
 _CHANGE = re.compile(
@@ -493,13 +625,50 @@ def _oracle_names(target):
     return [target.service_name, target.target_id, *target.aliases, target.deployment, target.container, short]
 
 
+def _oracle_word(name, text):
+    return re.search(rf"(?<![A-Za-z0-9-]){re.escape(name)}(?![A-Za-z0-9-])", text) is not None
+
+
 def _oracle_hits(active, text):
     hits = set()
     for target in active.targets:
-        if target.namespace in text or any(
-            re.search(rf"(?<![A-Za-z0-9-]){re.escape(name)}(?![A-Za-z0-9-])", text)
-            for name in _oracle_names(target)
-        ):
+        if target.namespace in text or any(_oracle_word(name, text) for name in _oracle_names(target)):
+            hits.add(target.key)
+    return hits
+
+
+# U7b: on the path reading a short word of another domain is a name only when
+# the answer key names that domain. The oracle says "named" on a wider
+# vocabulary than the module (more words make it stricter), and it drops only
+# the literal URL prefix "/api/", not every route's first segment.
+_ORACLE_DOMAIN = {
+    "rca-testbed-commerce": re.compile(r"commerce|커머스|checkout|체크아웃|상품|장바구니", re.IGNORECASE),
+    "rca-testbed-banking": re.compile(r"banking|은행|뱅킹|oracle|이체|계좌", re.IGNORECASE),
+    "rca-testbed-food": re.compile(r"food|배달|음식|restaurant|식당|배차|mysql", re.IGNORECASE),
+}
+
+
+def _oracle_named(active, whole):
+    named = {ns for ns, words in _ORACLE_DOMAIN.items() if ns in whole or words.search(whole)}
+    for target in active.targets:
+        strong = [target.service_name, target.target_id, *target.aliases, target.deployment, target.container]
+        if any(_oracle_word(name, whole) for name in strong):
+            named.add(target.namespace)
+    return named
+
+
+def _oracle_path_hits(active, text, home, named):
+    hits = set()
+    unprefixed = text.replace("/api/", "/~/")
+    for target in active.targets:
+        short = target.deployment.removeprefix("testbed-")
+        strong = [n for n in _oracle_names(target) if n != short]
+        if target.namespace in text or any(_oracle_word(name, text) for name in strong):
+            hits.add(target.key)
+        elif target.namespace == home or home is None:
+            if _oracle_word(short, text):
+                hits.add(target.key)
+        elif target.namespace in named and _oracle_word(short, unprefixed):
             hits.add(target.key)
     return hits
 
@@ -518,10 +687,16 @@ def _oracle_forbidden(active, scenario, scope):
 
     forbidden = set()
     namespace = active.domain_namespaces.get(scenario.get("domain"))
+    named = _oracle_named(active, "\n".join(text for _, text in texts(scenario)))
     for top, text in texts(scenario):
         if scope == "mentioned" or top in {"root_cause", "scoring", "must_support", "must_rule_out"}:
-            forbidden |= _oracle_hits(active, text)
-        for sentence in re.split(r"(?<=[.!?。])\s+|\n+|;\s", text):
+            forbidden |= _oracle_path_hits(active, text, namespace, named)
+        # Circled numbers enumerate separate facts ("③ ... POST /api/orders 만
+        # 500 ④ rca-testbed-food 에 롤아웃이 없고"); without this split a
+        # route in one fact and a no-change word in the next read as one
+        # sentence about banking api (U7b, after the path reading stopped
+        # masking it).
+        for sentence in re.split(r"(?<=[.!?。])\s+|\n+|;\s|[\u2460-\u2473]", text):
             if _CHANGE.search(sentence) and _NEG.search(sentence):
                 hits = _oracle_hits(active, sentence)
                 forbidden |= hits
@@ -531,7 +706,9 @@ def _oracle_forbidden(active, scenario, scope):
 @pytest.mark.parametrize("scope", ["mentioned", "scored"])
 def test_no_real_scenario_offers_a_path_or_unchanged_target(scope) -> None:
     """Every real answer key (135), both scopes: no candidate is on the fault
-    path or stated unchanged, as judged by the blunt oracle above."""
+    path or stated unchanged, as judged by the blunt oracle above (no-change
+    sentences: every short word in every namespace; path: short words held to
+    the domain boundary on the oracle's own wider vocabulary, U7b)."""
     active, scenarios = _real()
     leaks = []
     for scenario_id, scenario in scenarios.items():
