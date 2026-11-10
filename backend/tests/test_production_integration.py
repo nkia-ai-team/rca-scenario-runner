@@ -1092,6 +1092,82 @@ async def test_capture_off_skips_the_export_but_still_publishes_the_result(
     assert "case_id" not in result
 
 
+@pytest.mark.parametrize(
+    ("cycle_mode", "env_cycle", "marker"),
+    [(True, None, "-v4-"), (False, "true", "-v4-"), (False, None, "-")],
+)
+async def test_cycle_mode_case_id_carries_the_v4_recording_marker(
+    tmp_path, monkeypatch, cycle_mode, env_cycle, marker
+) -> None:
+    """Cycle-mode recordings are named case-<scenario>-v4-<run tail> (testbed v4 R1).
+
+    The generation shows in the folder name so v3 and v4 recordings in the same
+    eval set are told apart without opening meta.json; already-recorded v3
+    folders keep their names. Non-cycle (v2) recordings stay unmarked.
+    """
+    monkeypatch.delenv("SCENARIO_PASS", raising=False)
+    if env_cycle is None:
+        monkeypatch.delenv("CYCLE_MODE", raising=False)
+    else:
+        monkeypatch.setenv("CYCLE_MODE", env_cycle)
+
+    class Invoker:
+        def snapshot_model(self, job, *, idempotency_key):
+            return None
+
+        def dump_stores(self, job, *, idempotency_key):
+            return None
+
+    metadata_path = tmp_path / "scenario-metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "scenarios": {"F07-E": scenario_metadata().model_dump(mode="json")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    scheduler = CaptureScheduler(tmp_path / "capture.json", clock=Clock(), invoker=Invoker())
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir = store.create("run-20261110-abcdef12", {"controller": {}})
+    runner = ScenarioRunner(
+        tmp_path,
+        tmp_path / "logs",
+        artifact_store=store,
+        capture_scheduler=scheduler,
+        scenario_metadata_path=metadata_path,
+    )
+    session = SimpleNamespace(
+        run_id="run-20261110-abcdef12",
+        scenario_id="F07-E",
+        profile_id="load.north_south",
+        approved_profile_id="load.north_south",
+        t1=datetime(2026, 7, 16, 10, 0, tzinfo=timezone.utc),
+        t2=datetime(2026, 7, 16, 10, 20, tzinfo=timezone.utc),
+        controller_state=SimpleNamespace(phase=ControllerPhase.SUCCEEDED),
+        spec=SimpleNamespace(
+            cycle_mode=cycle_mode,
+            capture=SimpleNamespace(enabled=True),
+            adaptive=SimpleNamespace(mode=SimpleNamespace(value="calibration")),
+        ),
+        trusted_evidence=lambda: {
+            "mode": "calibration",
+            "outcome": "succeeded",
+            "dirty": False,
+            "t1": "2026-07-16T10:00:00Z",
+            "t2": "2026-07-16T10:20:00Z",
+        },
+    )
+    runner._schedule_capture(session, run_dir)
+    await runner.stop_capture_worker()
+
+    case_id = json.loads((run_dir / "result.json").read_text())["case_id"]
+    assert case_id == f"case-f07-e{marker}abcdef12"
+    assert "-v3-" not in case_id
+    assert [job.case_id for job in scheduler.snapshot().jobs.values()] == [case_id]
+
+
 def test_append_tick_writes_jsonl_inside_trusted_root(tmp_path) -> None:
     store = RunArtifactStore(tmp_path / "runs")
     run_dir = tmp_path / "runs" / "run-1"

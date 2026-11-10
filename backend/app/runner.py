@@ -1066,12 +1066,13 @@ class ScenarioRunner:
             self.artifact_store.write_result(run_dir, session.trusted_evidence())
             return
         case_token = re.sub(r"[^a-z0-9]+", "-", session.scenario_id.lower()).strip("-")
-        # v3 marker distinguishes continuous-cycle (schema 2.0) cases from the
-        # legacy v2 library that shares /data/eval-cases (2026-07-25, A-plan
-        # coexistence — consumers must tell case-f01-r-v3-<h> from the old
-        # case-f01-r-<h> at a glance). Only emitted in cycle mode; v2 keeps its
-        # name so already-delivered references stay valid.
-        marker = "v3-" if getattr(session.spec, "cycle_mode", False) or os.environ.get("CYCLE_MODE", "").lower() in {"1", "true", "yes", "on"} else ""
+        # The marker names the recording generation. v3 (2026-07-25, A-plan
+        # coexistence) told continuous-cycle cases from the legacy v2 library
+        # that shares /data/eval-cases. v4 (2026-11-10, testbed v4 R1) is the
+        # same continuous cycle recorded with table discovery and the product
+        # version in meta.json; already-recorded case-*-v3-* keep their names.
+        # Only emitted in cycle mode; v2 keeps its unmarked name.
+        marker = "v4-" if getattr(session.spec, "cycle_mode", False) or os.environ.get("CYCLE_MODE", "").lower() in {"1", "true", "yes", "on"} else ""
         case_id = f"case-{case_token}-{marker}{session.run_id[-8:].lower()}"
         evidence = None
         if mode == "evaluation":
