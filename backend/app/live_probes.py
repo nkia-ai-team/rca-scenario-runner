@@ -1323,8 +1323,29 @@ class LiveProbeSet:
             raise LiveProbeError("database pod node is invalid")
         # v4 C6b review: this read was `kubectl exec <mysql pod> cat /sys/fs/cgroup/memory.stat`, a runc exec and a
         # process in the database container every time F42-P starts. The kubelet's summary API carries the same
-        # number without entering the pod: on cgroup v2 cAdvisor reports the container's memory.stat `anon` as
-        # rssBytes (66 tb-w3 2026-11-10: rssBytes 663,441,408 next to workingSetBytes 954,052,608).
+        # number without entering the pod (_kubelet_container_memory).
+        memory, _ = self._kubelet_container_memory(namespace, pod, node, container)
+        anon = memory.get("rssBytes")
+        if isinstance(anon, bool) or not isinstance(anon, int) or anon < 0:
+            raise LiveProbeError("database cgroup anon memory is unavailable")
+        if anon > target["max_anon_bytes"]:
+            raise LiveProbeError(
+                f"database anon memory {anon} is above {target['max_anon_bytes']}"
+            )
+        return True
+
+    def _kubelet_container_memory(
+        self, namespace: str, pod: str, node: str, container: str,
+    ) -> tuple[dict[str, Any], datetime]:
+        """The container's memory block from the kubelet summary API of its node, and when the kubelet sampled it.
+
+        On cgroup v2 cAdvisor fills it from the container's own cgroup files (v4 C6b, 66 2026-11-10 11:10 KST,
+        read side by side with the node's cgroup files, result document C6b 수정 1회차):
+          usageBytes       = memory.current (page cache, shmem and kernel memory included)
+          rssBytes         = memory.stat anon (shmem such as PostgreSQL shared_buffers is not in it)
+          workingSetBytes  = memory.current - memory.stat inactive_file
+          availableBytes   = memory.max - workingSetBytes (present only when the container has a limit)
+        A sample older than DB_MEMORY_SAMPLE_MAX_AGE_SEC is refused: it is not the current value."""
         summary = json.loads(
             self._kubectl("get", "--raw", f"/api/v1/nodes/{node}/proxy/stats/summary").stdout
         )
@@ -1338,19 +1359,13 @@ class LiveProbeSet:
         ]
         if len(memories) != 1:
             raise LiveProbeError("database container memory is missing from the kubelet summary")
-        anon = memories[0].get("rssBytes")
-        if isinstance(anon, bool) or not isinstance(anon, int) or anon < 0:
-            raise LiveProbeError("database cgroup anon memory is unavailable")
         sampled = memories[0].get("time")
-        if not isinstance(sampled, str) or (
-            _aware(self.clock()) - _parse_time(sampled)
-        ).total_seconds() > DB_MEMORY_SAMPLE_MAX_AGE_SEC:
+        if not isinstance(sampled, str):
+            raise LiveProbeError("database memory sample from the kubelet has no time")
+        sampled_at = _aware(_parse_time(sampled))
+        if (_aware(self.clock()) - sampled_at).total_seconds() > DB_MEMORY_SAMPLE_MAX_AGE_SEC:
             raise LiveProbeError("database memory sample from the kubelet is stale")
-        if anon > target["max_anon_bytes"]:
-            raise LiveProbeError(
-                f"database anon memory {anon} is above {target['max_anon_bytes']}"
-            )
-        return True
+        return memories[0], sampled_at
 
     def _baseline_active(self) -> bool:
         if self.paths.baseline_status.is_file():
@@ -1799,6 +1814,25 @@ class LiveProbeSet:
             pod = active[0].get("metadata", {}).get("name")
             if not isinstance(pod, str) or not pod:
                 raise LiveProbeError("payment pod name is invalid")
+            if target in (F25_H_POSTGRES_TARGET, F42_P_FOOD_MYSQL_TARGET):
+                # v4 C6b 수정 1회차: a database container is not entered for its memory (the exec was a runc exec
+                # and a cat in the database container on the node's process snapshot). The kubelet summary API
+                # carries the same two numbers: usageBytes is memory.current, availableBytes + workingSetBytes is
+                # memory.max (see _kubelet_container_memory). The value is stamped with the kubelet's sample time.
+                node = active[0].get("spec", {}).get("nodeName")
+                if not isinstance(node, str) or not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", node):
+                    raise LiveProbeError("database pod node is invalid")
+                memory, sampled_at = self._kubelet_container_memory(namespace, pod, node, container)
+                usage = memory.get("usageBytes")
+                working = memory.get("workingSetBytes")
+                available = memory.get("availableBytes")
+                if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in (usage, working)):
+                    raise LiveProbeError("database container memory usage is unavailable")
+                if query.query_id == "kubernetes.container_memory_current_bytes":
+                    return usage, sampled_at, f"{source}:{query.query_id}"
+                if isinstance(available, bool) or not isinstance(available, int) or available < 0:
+                    raise LiveProbeError("database container has no memory limit in the kubelet summary")
+                return available + working, sampled_at, f"{source}:{query.query_id}"
             result = self._kubectl(
                 "exec", pod, "--namespace", namespace, "-c", container, "--",
                 "cat", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max",

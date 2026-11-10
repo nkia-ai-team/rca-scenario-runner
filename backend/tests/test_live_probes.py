@@ -1795,14 +1795,80 @@ def _mysql_pod_process(fakes: Fakes, *, started_at: str, anon: int, sampled_at: 
             pod = {"podRef": {"name": "testbed-mysql-0", "namespace": "rca-testbed-food"},
                    "containers": [{"name": "mysql", "memory": {
                        "time": sampled_at or NOW.isoformat(), "rssBytes": anon,
-                       "workingSetBytes": anon + 100000000, "usageBytes": anon + 700000000}}]}
+                       "workingSetBytes": 954052608, "usageBytes": 1073078272,
+                       "availableBytes": 1073741824 - 954052608}}]}
             other = {"podRef": {"name": "testbed-order-1", "namespace": "rca-testbed-food"},
                      "containers": [{"name": "mysql", "memory": {"time": NOW.isoformat(), "rssBytes": 1}}]}
             return subprocess.CompletedProcess(argv, 0, json.dumps({"pods": [other, pod]}), "")
-        if "/sys/fs/cgroup/memory.current" in argv:
-            return subprocess.CompletedProcess(argv, 0, "1073078272\n1073741824\n", "")
+        if "exec" in argv:
+            # v4 C6b 수정 1회차: nothing enters the database pod.
+            return subprocess.CompletedProcess(argv, 1, "", "exec refused in this fake")
         return fakes.process(argv, **kwargs)
     return process
+
+
+def test_database_container_memory_is_read_from_the_kubelet_summary_not_the_pod(tmp_path) -> None:
+    # v4 C6b 수정 1회차: F42-P (MySQL) and F25-H (PostgreSQL) memory observations read the kubelet summary API of the
+    # database pod's node instead of exec-ing cat memory.current, memory.max in the database container. usageBytes is
+    # memory.current; availableBytes + workingSetBytes is memory.max (66 2026-11-10 side by side with the cgroup
+    # files: tb-w3 MySQL 1,610,612,736 = 655,130,624 + 955,482,112). The value carries the kubelet's sample time and
+    # an old sample is refused.
+    registry = ApprovedQueryRegistry.from_path()
+    target = {"namespace": "rca-testbed-food", "deployment": "testbed-mysql", "container": "mysql"}
+    sampled = NOW - timedelta(seconds=17)
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes, scenario_id="F42-P")
+    probes.process_runner = _mysql_pod_process(
+        fakes, started_at=(NOW - timedelta(hours=35)).isoformat(), anon=663855104, sampled_at=sampled.isoformat()
+    )
+    current = probes.observe(registry.bind({"query_id": "kubernetes.container_memory_current_bytes",
+                                            "parameters": target}))
+    limit = probes.observe(registry.bind({"query_id": "kubernetes.container_memory_limit_bytes",
+                                          "parameters": target}))
+    assert current["quality"] == "good" and current["value"] == 1073078272
+    assert limit["quality"] == "good" and limit["value"] == 1073741824
+    calls = [argv for argv, _ in fakes.process_calls]
+    assert not any("exec" in argv for argv in calls)
+    assert any("/api/v1/nodes/tb-w3/proxy/stats/summary" in argv for argv in calls)
+
+    stale = Fakes()
+    probes = _probes(tmp_path, stale, scenario_id="F42-P")
+    probes.process_runner = _mysql_pod_process(
+        stale, started_at=(NOW - timedelta(hours=35)).isoformat(), anon=663855104,
+        sampled_at=(NOW - timedelta(seconds=90)).isoformat(),
+    )
+    refused = probes.observe(registry.bind({"query_id": "kubernetes.container_memory_current_bytes",
+                                            "parameters": target}))
+    assert refused["quality"] == "error" and refused["value"] is None
+
+    # F25-H's PostgreSQL target takes the same path (StatefulSet pod on tb-w1).
+    pg = {"namespace": "rca-testbed-commerce", "deployment": "testbed-postgres", "container": "postgres"}
+    calls_pg: list[list[str]] = []
+
+    def pg_process(argv, **kwargs):
+        argv = list(argv)
+        calls_pg.append(argv)
+        if "pods" in argv and "app=testbed-postgres" in argv:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"items": [{
+                "metadata": {"name": "testbed-postgres-0"}, "spec": {"nodeName": "tb-w1"},
+                "status": {"containerStatuses": [{"name": "postgres", "restartCount": 0,
+                                                  "state": {"running": {"startedAt": NOW.isoformat()}}}]}}]}), "")
+        if "/api/v1/nodes/tb-w1/proxy/stats/summary" in argv:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"pods": [{
+                "podRef": {"name": "testbed-postgres-0", "namespace": "rca-testbed-commerce"},
+                "containers": [{"name": "postgres", "memory": {
+                    "time": NOW.isoformat(), "usageBytes": 528293888, "workingSetBytes": 417439744,
+                    "availableBytes": 119431168, "rssBytes": 90189824}}]}]}), "")
+        return subprocess.CompletedProcess(argv, 1, "", "unexpected call in this fake")
+
+    pg_fakes = Fakes()
+    probes = _probes(tmp_path, pg_fakes, scenario_id="F25-H")
+    probes.process_runner = pg_process
+    assert probes.observe(registry.bind({"query_id": "kubernetes.container_memory_current_bytes",
+                                         "parameters": pg}))["value"] == 528293888
+    assert probes.observe(registry.bind({"query_id": "kubernetes.container_memory_limit_bytes",
+                                         "parameters": pg}))["value"] == 536870912
+    assert not any("exec" in argv for argv in calls_pg)
 
 
 def test_f42p_food_mysql_restart_is_read_as_uptime(tmp_path) -> None:
@@ -1829,6 +1895,7 @@ def test_f42p_food_mysql_restart_is_read_as_uptime(tmp_path) -> None:
     assert values["kubernetes.container_restart_count"]["value"] == 44
     assert values["kubernetes.container_last_termination_reason"]["value"] == "OOMKilled"
     assert values["kubernetes.container_memory_current_bytes"]["value"] == 1073078272
+    assert not any("exec" in argv for argv, _ in fakes.process_calls)
 
     probes.process_runner = _mysql_pod_process(
         fakes, started_at=(NOW - timedelta(seconds=40)).isoformat(), anon=500000000
