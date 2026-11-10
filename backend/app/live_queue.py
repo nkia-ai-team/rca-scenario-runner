@@ -112,16 +112,24 @@ READINESS_PROBE_GRACE = timedelta(minutes=3)
 # exports nothing, so the capture chain is not a dependency it can fail on.
 TRANSIENT_READINESS_CHECKS = frozenset({"preflight_signals", "capture_self_check"})
 # Banking Oracle housekeeping (testbed-services scripts/oracle-maintenance.sh check, tb-ops
-# root crontab every 6 hours). It writes last.json on every successful run and ALERT (one
+# root crontab). It writes last.json on every successful run and ALERT (one
 # line per reason) while something needs a person: user data near the 12GB cap, a transfer
 # pool or seed account below its floor. A queue must not start or continue past that, and a
 # check that stopped succeeding is the same blind spot. A failed check (query error, Oracle down
-# during an injection) leaves last.json as it was, so the limit is the cron period twice plus an
-# hour: the crontab line in oracle-maintenance.sh is `7 */6 * * *` (6h), so 6 x 2 + 1 = 13h.
-# One failed run does not block for hours; two in a row do.
+# during an injection) leaves last.json as it was, so the limit is the check period twice plus an
+# hour: one failed run does not block for hours, two in a row do. The period has one definition,
+# the script's CHECK_PERIOD_HOURS: `oracle-maintenance.sh crontab` prints the cron line from it and
+# check writes it into last.json as check_period_hours, which is read here. A last.json without
+# the field (older script) gets the script's default, 6h, so 13h.
 ORACLE_CHECK_NAME = "oracle_maintenance_check"
-ORACLE_CHECK_CRON_PERIOD = timedelta(hours=6)
-ORACLE_CHECK_MAX_AGE = ORACLE_CHECK_CRON_PERIOD * 2 + timedelta(hours=1)
+ORACLE_CHECK_DEFAULT_PERIOD = timedelta(hours=6)
+
+
+def oracle_check_max_age(period: timedelta) -> timedelta:
+    return period * 2 + timedelta(hours=1)
+
+
+ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 
 
 def _tail(text: str, limit: int = 200) -> str:
@@ -355,7 +363,7 @@ class LiveScenarioQueue:
         decoy_executor: object | None = None,
         decoy_seed_base: str = "testbed-v4-decoy",
         oracle_check_state_dir: Path | None = None,
-        oracle_check_max_age: timedelta = ORACLE_CHECK_MAX_AGE,
+        oracle_check_max_age: timedelta | None = None,
     ) -> None:
         self.runner = runner
         # Where oracle-maintenance.sh check leaves last.json and ALERT (mounted read-only).
@@ -473,7 +481,8 @@ class LiveScenarioQueue:
 
         Not a probe: the file is the check's own verdict, written by cron on tb-ops.
         ALERT present -> blocked with its reasons. No last.json, or one older than
-        ``oracle_check_max_age`` (two failed or missed runs) -> blocked as stale. Never
+        the limit (check period from last.json x 2 + 1h, or ``oracle_check_max_age`` when
+        set; two failed or missed runs) -> blocked as stale. Never
         transient: these need a person (seed-restore, capacity, crontab). Checked where
         readiness is: start, resume, and a non-cycle queue's tick between scenarios.
         """
@@ -493,14 +502,25 @@ class LiveScenarioQueue:
                 return {name: False}, {name: f"ALERT {text}"[:600]}
             if not last.is_file():
                 return {name: False}, {name: f"no check result at {last} (check not installed or never ran)"}
-            measured_at = json.loads(last.read_text(encoding="utf-8"))["measured_at"]
+            result = json.loads(last.read_text(encoding="utf-8"))
+            measured_at = result["measured_at"]
             measured = datetime.fromisoformat(str(measured_at).replace("Z", "+00:00"))
+            limit = self.oracle_check_max_age
+            if limit is None:
+                hours = result.get("check_period_hours", None)
+                if hours is None:
+                    period = ORACLE_CHECK_DEFAULT_PERIOD
+                elif isinstance(hours, int) and not isinstance(hours, bool) and 1 <= hours <= 24:
+                    period = timedelta(hours=hours)
+                else:
+                    raise ValueError(f"check_period_hours is not 1~24: {hours!r}")
+                limit = oracle_check_max_age(period)
             age = self.clock.now() - measured
-            if age > self.oracle_check_max_age:
+            if age > limit:
                 return {name: False}, {
                     name: f"check result is stale: last successful check at {measured_at}, "
                     f"{int(age.total_seconds() // 3600)}h ago, limit "
-                    f"{int(self.oracle_check_max_age.total_seconds() // 3600)}h (the check failed "
+                    f"{int(limit.total_seconds() // 3600)}h (the check failed "
                     "twice in a row or is not running; see /var/log/oracle-maintenance.log on tb-ops)"
                 }
             return {name: True}, {}
@@ -2635,12 +2655,11 @@ def get_live_queue() -> LiveScenarioQueue:
                 if os.environ.get("ORACLE_CHECK_STATE_DIR", "").strip()
                 else None
             ),
-            oracle_check_max_age=timedelta(
-                seconds=int(
-                    os.environ.get(
-                        "ORACLE_CHECK_MAX_AGE_SEC", str(int(ORACLE_CHECK_MAX_AGE.total_seconds()))
-                    )
-                )
+            # Normally derived from last.json (check_period_hours); the variable is an override.
+            oracle_check_max_age=(
+                timedelta(seconds=int(os.environ["ORACLE_CHECK_MAX_AGE_SEC"]))
+                if os.environ.get("ORACLE_CHECK_MAX_AGE_SEC", "").strip()
+                else None
             ),
         )
     return _queue

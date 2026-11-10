@@ -730,18 +730,20 @@ async def test_readiness_pauses_at_once_when_a_non_transient_check_fails(
     assert runner.started == []
 
 
-def _oracle_check_dir(tmp_path: Path, measured_at: datetime, alert: str | None = None) -> Path:
+def _oracle_check_dir(
+    tmp_path: Path, measured_at: datetime, alert: str | None = None, period_hours: object = 6
+) -> Path:
     """What oracle-maintenance.sh check leaves on tb-ops: last.json always, ALERT on a reason."""
     state = tmp_path / "oracle-capacity"
     state.mkdir(exist_ok=True)
-    (state / "last.json").write_text(
-        json.dumps({
-            "measured_at": measured_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "user_data_bytes": 6602620928,
-            "seed_min_balance": 450000,
-        }),
-        encoding="utf-8",
-    )
+    result = {
+        "measured_at": measured_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "user_data_bytes": 6602620928,
+        "seed_min_balance": 450000,
+    }
+    if period_hours is not None:
+        result["check_period_hours"] = period_hours
+    (state / "last.json").write_text(json.dumps(result), encoding="utf-8")
     if alert is None:
         (state / "ALERT").unlink(missing_ok=True)
     else:
@@ -794,6 +796,31 @@ def test_oracle_check_result_gates_readiness(tmp_path: Path) -> None:
     assert readiness.checks[ORACLE_CHECK_NAME] is False
     detail = readiness.details[ORACLE_CHECK_NAME]
     assert "stale" in detail and "last successful check at" in detail and "limit 13h" in detail
+
+    # The limit follows the period the check itself recorded (one definition: the script's
+    # CHECK_PERIOD_HOURS, which also prints the cron line): 12h -> 25h.
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=24, minutes=59), period_hours=12)
+    assert queue.readiness().checks[ORACLE_CHECK_NAME] is True
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=25, minutes=1), period_hours=12)
+    readiness = queue.readiness()
+    assert readiness.checks[ORACLE_CHECK_NAME] is False
+    assert "limit 25h" in readiness.details[ORACLE_CHECK_NAME]
+    # A result from an older script without the field gets the script's default, 6h -> 13h.
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=12, minutes=59), period_hours=None)
+    assert queue.readiness().checks[ORACLE_CHECK_NAME] is True
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=13, minutes=1), period_hours=None)
+    assert queue.readiness().checks[ORACLE_CHECK_NAME] is False
+    # A nonsense period is not trusted.
+    for bad in (0, 25, "6", True):
+        _oracle_check_dir(tmp_path, clock.value - timedelta(hours=1), period_hours=bad)
+        readiness = queue.readiness()
+        assert readiness.checks[ORACLE_CHECK_NAME] is False
+        assert "check_period_hours" in readiness.details[ORACLE_CHECK_NAME]
+    # An explicit limit (ORACLE_CHECK_MAX_AGE_SEC) overrides the recorded period.
+    queue.oracle_check_max_age = timedelta(hours=2)
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=3), period_hours=12)
+    assert "limit 2h" in queue.readiness().details[ORACLE_CHECK_NAME]
+    queue.oracle_check_max_age = None
 
     (tmp_path / "oracle-capacity" / "last.json").write_text("{", encoding="utf-8")
     readiness = queue.readiness()
