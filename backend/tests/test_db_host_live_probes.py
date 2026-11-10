@@ -60,21 +60,41 @@ class FakeProcess:
             return subprocess.CompletedProcess(argv, 0, self.answers[kwargs["env"]["DBP_ENGINE"]] + "\n", "")
         assert argv[0:2] == ["kubectl", "--kubeconfig"], argv
         assert "exec" not in argv, argv
-        verb, kind, name = argv[3], argv[4], argv[5]
+        verb, kind = argv[3], argv[4]
         assert verb == "get", argv
+        if kind == "nodes":
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"items": NODES}), "")
+        name = argv[5]
         if kind == "pod":
-            host = {"testbed-oracle-0": "192.168.122.11", "testbed-mysql-0": "192.168.122.14"}[name]
-            return subprocess.CompletedProcess(argv, 0, host, "")
+            assert argv[-1] == "jsonpath={.spec.nodeName}", argv
+            node = {"testbed-oracle-0": "tb-w2", "testbed-mysql-0": "tb-w3"}[name]
+            return subprocess.CompletedProcess(argv, 0, node, "")
         if kind == "service":
             port = {"testbed-oracle-external": "30308", "testbed-mysql-external": "30236"}[name]
             return subprocess.CompletedProcess(argv, 0, port, "")
         if kind == "secret":
-            data = {k: base64.b64encode(v.encode()).decode() for k, v in SECRETS[name].items()}
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"data": data}), "")
+            # One key at a time: the probes read only their accounts' keys.
+            key = argv[-1].removeprefix("jsonpath={.data.").removesuffix("}")
+            assert argv[-1] == "jsonpath={.data." + key + "}", argv
+            return subprocess.CompletedProcess(argv, 0, base64.b64encode(SECRETS[name][key].encode()).decode(), "")
         raise AssertionError(argv)
 
     def client_calls(self) -> list[dict]:
         return [kwargs["env"] for argv, kwargs in self.calls if argv[0] == DB_PROBE_PYTHON]
+
+
+def _node(name: str, address: str, control_plane: bool = False, ready: bool = True) -> dict:
+    labels = {"kubernetes.io/hostname": name}
+    if control_plane:
+        labels["node-role.kubernetes.io/control-plane"] = ""
+    return {"metadata": {"name": name, "labels": labels},
+            "status": {"conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+                       "addresses": [{"type": "InternalIP", "address": address}]}}
+
+
+# 66 (z4-66-survey): tb-cp .77, tb-w1 .184, tb-w2 .11 (banking), tb-w3 .14 (food).
+NODES = [_node("tb-cp", "192.168.122.77", control_plane=True), _node("tb-w1", "192.168.122.184"),
+         _node("tb-w2", "192.168.122.11"), _node("tb-w3", "192.168.122.14")]
 
 
 def probes(fake: FakeProcess) -> LiveProbeSet:
@@ -127,7 +147,10 @@ def test_database_probes_are_network_sessions_with_least_privilege_accounts() ->
         engine = "mysql" if query_id == "database.mysql_index_present" else "oracle"
         assert env["DBP_ENGINE"] == engine
         assert env["DBP_USER"] == EXPECTED_USER[query_id], query_id
-        assert env["DBP_HOST"] == ("192.168.122.14" if engine == "mysql" else "192.168.122.11")
+        # Through a worker that runs neither database pod nor the control plane (user decision Q8): tb-w1 for both
+        # (the database nodes are tb-w2 and tb-w3), never the database node itself (the DPM collector's address)
+        # nor tb-cp (the runner load's).
+        assert env["DBP_HOST"] == "192.168.122.184"
         assert env["DBP_PORT"] == ("30236" if engine == "mysql" else "30308")
         # Never the administrator passwords; the account's own one only in the child's env.
         assert env["DBP_PASSWORD"] not in {"sys-pw-not-for-probes", "root-pw-not-for-probes"}
@@ -195,7 +218,11 @@ def test_listener_and_secret_are_read_once_per_probe_set_and_again_after_a_failu
                          {"client_identifier": "dba-maintenance"}, probe_set)
         assert result["value"] == 1
     kubectl = [argv for argv, _ in fake.calls if argv[0] == "kubectl"]
-    assert len(kubectl) == 3  # pod hostIP, service nodePort, secret: once
+    # pod node, node list, service nodePort and the keys of the two account roles, once. Never the
+    # administrator password (C6b review: the whole Secret used to be decoded).
+    keys = sorted(argv[-1].removeprefix("jsonpath={.data.").removesuffix("}") for argv in kubectl if argv[4] == "secret")
+    assert keys == ["APP_USER", "APP_USER_PASSWORD", "MON_PASSWORD", "MON_USER"], keys
+    assert len(kubectl) == 3 + len(keys), kubectl
     fake.fail_client = True
     failed = observe(fake, "database.oracle_tagged_session_count",
                      {"client_identifier": "dba-maintenance"}, probe_set)
@@ -204,7 +231,8 @@ def test_listener_and_secret_are_read_once_per_probe_set_and_again_after_a_failu
         assert password not in json.dumps(failed, default=str)
     fake.fail_client = False
     observe(fake, "database.oracle_tagged_session_count", {"client_identifier": "dba-maintenance"}, probe_set)
-    assert len([argv for argv, _ in fake.calls if argv[0] == "kubectl"]) == 6
+    # A failed query dropped the cache, so the next probe read everything again (twice the first reads).
+    assert len([argv for argv, _ in fake.calls if argv[0] == "kubectl"]) == 2 * len(kubectl)
 
 
 def test_unparsable_probe_output_is_an_error_not_a_value() -> None:

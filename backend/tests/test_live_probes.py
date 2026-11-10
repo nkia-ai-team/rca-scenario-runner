@@ -77,19 +77,23 @@ class Fakes:
         if argv[0] == DB_PROBE_PYTHON and "banking.transfers" in kwargs["env"]["DBP_SQL"]:
             return subprocess.CompletedProcess(argv, 0, "2\n", "")
         if argv[3:6] == ["get", "pod", "testbed-oracle-0"]:
-            return subprocess.CompletedProcess(argv, 0, "192.168.122.11", "")
+            return subprocess.CompletedProcess(argv, 0, "tb-w2", "")
         if argv[3:6] == ["get", "service", "testbed-oracle-external"]:
             return subprocess.CompletedProcess(argv, 0, "30308", "")
         if argv[3:6] == ["get", "secret", "oracle-secret"]:
-            data = {"APP_USER": "YmFua2luZw==", "APP_USER_PASSWORD": "YXBwLXB3"}
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"data": data}), "")
+            data = {"APP_USER": "YmFua2luZw==", "APP_USER_PASSWORD": "YXBwLXB3", "MON_USER": "bW9u", "MON_PASSWORD": "bW9uLXB3"}
+            return subprocess.CompletedProcess(argv, 0, data[argv[-1].removeprefix("jsonpath={.data.").removesuffix("}")], "")
         if argv[-2:] == ["config", "current-context"]:
             return subprocess.CompletedProcess(argv, 0, EXPECTED_KUBE_CONTEXT + "\n", "")
         if argv[-4:] == ["get", "nodes", "-o", "json"]:
             return subprocess.CompletedProcess(
                 argv,
                 0,
-                json.dumps({"items": [{"metadata": {"name": item}} for item in EXPECTED_KUBE_NODES]}),
+                json.dumps({"items": [
+                    {"metadata": {"name": item, "labels": {"node-role.kubernetes.io/control-plane": ""} if item == "tb-cp" else {}},
+                     "status": {"conditions": [{"type": "Ready", "status": "True"}],
+                                "addresses": [{"type": "InternalIP", "address": {"tb-cp": "192.168.122.77", "tb-w1": "192.168.122.184", "tb-w2": "192.168.122.11", "tb-w3": "192.168.122.14"}[item]}]}}
+                    for item in sorted(EXPECTED_KUBE_NODES)]}),
                 "",
             )
         if "pods" in argv:
@@ -631,7 +635,8 @@ def test_f17p_integrity_violation_probe_requires_a_valid_since_timestamp(tmp_pat
     assert observed["quality"] == "good" and observed["value"] == 2
     client_argv, client_kwargs = fakes.process_calls[-1]
     assert client_argv[0] == DB_PROBE_PYTHON
-    assert client_kwargs["env"]["DBP_HOST"] == "192.168.122.11" and client_kwargs["env"]["DBP_USER"] == "banking"
+    # Through tb-w1, a worker without the Oracle pod (tb-w2) that is not the control plane (user decision Q8).
+    assert client_kwargs["env"]["DBP_HOST"] == "192.168.122.184" and client_kwargs["env"]["DBP_USER"] == "banking"
     assert all("exec" not in argv for argv, _ in fakes.process_calls)
 
     rejected = probes.observe(

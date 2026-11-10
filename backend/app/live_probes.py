@@ -1158,29 +1158,59 @@ class LiveProbeSet:
             return cached
         target = ORACLE_PROBE_ENDPOINT if engine == "oracle" else MYSQL_PROBE_ENDPOINT
         namespace = target["namespace"]
-        host = self._kubectl(
-            "get", "pod", target["pod"], "--namespace", namespace,
-            "-o", "jsonpath={.status.hostIP}",
-        ).stdout.strip()
+        host = self._entry_node(namespace, target["pod"])
         port = self._kubectl(
             "get", "service", target["service"], "--namespace", namespace,
             "-o", f"jsonpath={{.spec.ports[?(@.port=={target['port']})].nodePort}}",
         ).stdout.strip()
         if not re.fullmatch(r"[0-9.]+", host) or not re.fullmatch(r"[0-9]+", port):
             raise LiveProbeError(f"{engine} listener endpoint is unavailable")
-        secret = json.loads(
-            self._kubectl(
-                "get", "secret", target["secret"], "--namespace", namespace, "-o", "json",
-            ).stdout
-        ).get("data") or {}
+        # Only the keys of the approved probe accounts (C6b review: the whole Secret, administrator
+        # passwords included, used to sit decoded in memory for the probe set's life).
+        accounts = ORACLE_PROBE_ACCOUNTS if engine == "oracle" else MYSQL_PROBE_ACCOUNTS
         decoded: dict[str, str] = {"host": host, "port": port}
-        for key, value in secret.items():
+        for key in sorted({key for pair in accounts.values() for key in pair}):
+            raw = self._kubectl(
+                "get", "secret", target["secret"], "--namespace", namespace,
+                "-o", f"jsonpath={{.data.{key}}}",
+            ).stdout.strip()
             try:
-                decoded[f"secret:{key}"] = base64.b64decode(value).decode("utf-8")
+                decoded[f"secret:{key}"] = base64.b64decode(raw).decode("utf-8")
             except (ValueError, UnicodeDecodeError):
                 continue
         self._database_endpoints[engine] = decoded
         return decoded
+
+    def _entry_node(self, namespace: str, pod: str) -> str:
+        """InternalIP of the node the probe enters through (v4 C6b 수정 1회차, user decision Q8): a Ready
+        worker that runs neither the database pod nor the control plane, first by name. Through NodePort
+        (externalTrafficPolicy Cluster) the database then sees that node's overlay address, not the DPM
+        collector's (the database node's cni0 address) nor the runner load's (through the control plane).
+        Same rule as testbed-services oracle_lock_remote.ENTRY_NODE_JQ."""
+        db_node = self._kubectl(
+            "get", "pod", pod, "--namespace", namespace, "-o", "jsonpath={.spec.nodeName}",
+        ).stdout.strip()
+        if not db_node:
+            raise LiveProbeError("database pod has no node")
+        nodes = json.loads(self._kubectl("get", "nodes", "-o", "json").stdout).get("items", [])
+        candidates = sorted(
+            (
+                item for item in nodes
+                if item.get("metadata", {}).get("name") != db_node
+                and "node-role.kubernetes.io/control-plane" not in (item.get("metadata", {}).get("labels") or {})
+                and not item.get("spec", {}).get("unschedulable", False)
+                and any(
+                    condition.get("type") == "Ready" and condition.get("status") == "True"
+                    for condition in item.get("status", {}).get("conditions", [])
+                )
+            ),
+            key=lambda item: item["metadata"]["name"],
+        )
+        for item in candidates[:1]:
+            for address in item.get("status", {}).get("addresses", []):
+                if address.get("type") == "InternalIP" and re.fullmatch(r"[0-9.]+", address.get("address", "")):
+                    return address["address"]
+        raise LiveProbeError(f"no worker node without {db_node} to enter through")
 
     def _database_query(
         self, engine: str, role: str, sql: str, binds: Mapping[str, Any] | None = None,
