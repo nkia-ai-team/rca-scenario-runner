@@ -1182,23 +1182,17 @@ class LiveProbeSet:
         return decoded
 
     def _entry_node(self, namespace: str, pod: str) -> str:
-        """InternalIP of the node the probe enters through (v4 C6b 수정 1회차, user decision Q8): a Ready
-        worker that runs neither the database pod nor the control plane, first by name. Through NodePort
-        (externalTrafficPolicy Cluster) the database then sees that node's overlay address, not the DPM
-        collector's (the database node's cni0 address) nor the runner load's (through the control plane).
-        Same rule as testbed-services oracle_lock_remote.ENTRY_NODE_JQ."""
-        db_node = self._kubectl(
-            "get", "pod", pod, "--namespace", namespace, "-o", "jsonpath={.spec.nodeName}",
-        ).stdout.strip()
-        if not db_node:
-            raise LiveProbeError("database pod has no node")
+        """InternalIP of the node the probe enters through (v4 C6b 수정 2회차): the control-plane node, the way the
+        runner's load enters (loadgen hits the control plane's NodePorts). Through NodePort (externalTrafficPolicy
+        Cluster) the database then sees the runner's own address (66: 10.244.0.0), never the DPM collector's (the
+        database node's cni0 address) and never the address the injections enter through (a worker that runs neither
+        the database nor a coupled domain, testbed-services oracle_lock_remote.ENTRY_NODE_JQ)."""
+        del namespace, pod
         nodes = json.loads(self._kubectl("get", "nodes", "-o", "json").stdout).get("items", [])
         candidates = sorted(
             (
                 item for item in nodes
-                if item.get("metadata", {}).get("name") != db_node
-                and "node-role.kubernetes.io/control-plane" not in (item.get("metadata", {}).get("labels") or {})
-                and not item.get("spec", {}).get("unschedulable", False)
+                if "node-role.kubernetes.io/control-plane" in (item.get("metadata", {}).get("labels") or {})
                 and any(
                     condition.get("type") == "Ready" and condition.get("status") == "True"
                     for condition in item.get("status", {}).get("conditions", [])
@@ -1210,7 +1204,7 @@ class LiveProbeSet:
             for address in item.get("status", {}).get("addresses", []):
                 if address.get("type") == "InternalIP" and re.fullmatch(r"[0-9.]+", address.get("address", "")):
                     return address["address"]
-        raise LiveProbeError(f"no worker node without {db_node} to enter through")
+        raise LiveProbeError("no ready control-plane node to enter through")
 
     def _database_query(
         self, engine: str, role: str, sql: str, binds: Mapping[str, Any] | None = None,

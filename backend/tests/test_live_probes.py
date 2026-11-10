@@ -635,8 +635,8 @@ def test_f17p_integrity_violation_probe_requires_a_valid_since_timestamp(tmp_pat
     assert observed["quality"] == "good" and observed["value"] == 2
     client_argv, client_kwargs = fakes.process_calls[-1]
     assert client_argv[0] == DB_PROBE_PYTHON
-    # Through tb-w1, a worker without the Oracle pod (tb-w2) that is not the control plane (user decision Q8).
-    assert client_kwargs["env"]["DBP_HOST"] == "192.168.122.184" and client_kwargs["env"]["DBP_USER"] == "banking"
+    # Through the control plane tb-cp, the runner's own entry (v4 C6b 수정 2회차), not the injections' worker.
+    assert client_kwargs["env"]["DBP_HOST"] == "192.168.122.77" and client_kwargs["env"]["DBP_USER"] == "banking"
     assert all("exec" not in argv for argv, _ in fakes.process_calls)
 
     rejected = probes.observe(

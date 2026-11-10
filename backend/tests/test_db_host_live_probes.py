@@ -147,10 +147,10 @@ def test_database_probes_are_network_sessions_with_least_privilege_accounts() ->
         engine = "mysql" if query_id == "database.mysql_index_present" else "oracle"
         assert env["DBP_ENGINE"] == engine
         assert env["DBP_USER"] == EXPECTED_USER[query_id], query_id
-        # Through a worker that runs neither database pod nor the control plane (user decision Q8): tb-w1 for both
-        # (the database nodes are tb-w2 and tb-w3), never the database node itself (the DPM collector's address)
-        # nor tb-cp (the runner load's).
-        assert env["DBP_HOST"] == "192.168.122.184"
+        # Through the control plane, the way the runner's load enters (v4 C6b 수정 2회차): the database sees the
+        # runner's own address, never the DPM collector's (the database node) nor the injections' (a worker that runs
+        # neither the database nor a coupled domain).
+        assert env["DBP_HOST"] == "192.168.122.77"
         assert env["DBP_PORT"] == ("30236" if engine == "mysql" else "30308")
         # Never the administrator passwords; the account's own one only in the child's env.
         assert env["DBP_PASSWORD"] not in {"sys-pw-not-for-probes", "root-pw-not-for-probes"}
@@ -218,11 +218,11 @@ def test_listener_and_secret_are_read_once_per_probe_set_and_again_after_a_failu
                          {"client_identifier": "dba-maintenance"}, probe_set)
         assert result["value"] == 1
     kubectl = [argv for argv, _ in fake.calls if argv[0] == "kubectl"]
-    # pod node, node list, service nodePort and the keys of the two account roles, once. Never the
-    # administrator password (C6b review: the whole Secret used to be decoded).
+    # node list, service nodePort and the keys of the two account roles, once. Never the administrator password
+    # (C6b review: the whole Secret used to be decoded).
     keys = sorted(argv[-1].removeprefix("jsonpath={.data.").removesuffix("}") for argv in kubectl if argv[4] == "secret")
     assert keys == ["APP_USER", "APP_USER_PASSWORD", "MON_PASSWORD", "MON_USER"], keys
-    assert len(kubectl) == 3 + len(keys), kubectl
+    assert len(kubectl) == 2 + len(keys), kubectl
     fake.fail_client = True
     failed = observe(fake, "database.oracle_tagged_session_count",
                      {"client_identifier": "dba-maintenance"}, probe_set)
