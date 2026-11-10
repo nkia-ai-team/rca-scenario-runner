@@ -53,6 +53,9 @@ services:
       - ${RUNS_HOST_PATH:-./runs}:/var/lib/lucida/scenario-runs:rw
       - ${PROFILE_STATE_HOST_PATH:-./profile-state}:/var/lib/lucida/scenario-profile-state:rw
       - ${EVAL_CASES_HOST_PATH:-./eval-cases}:/data/eval-cases:rw
+      # 은행 Oracle 점검(testbed-services scripts/oracle-maintenance.sh check, tb-ops root 크론)의
+      # last.json 과 ALERT. readiness 가 읽어 ALERT 나 오래된 결과면 큐를 막는다.
+      - ${ORACLE_CHECK_HOST_PATH:-/var/lib/lucida/oracle-capacity}:/var/lib/lucida/oracle-capacity:ro
 
       # 호스트 docker daemon socket. scenario-02 가 pg-mock 컨테이너를
       # start/stop 하는 데 사용. 보안: 컨테이너가 호스트의 모든 docker
@@ -77,6 +80,7 @@ services:
       - DECOY_DEPLOYS=${DECOY_DEPLOYS:-}
       - DECOY_SEED_BASE=${DECOY_SEED_BASE:-testbed-v4-decoy}
       - DECOY_POLICY_PATH=${DECOY_POLICY_PATH:-/opt/lucida/scenario-contracts/registry/decoy-deployments.json}
+      - ORACLE_CHECK_STATE_DIR=${ORACLE_CHECK_STATE_DIR:-/var/lib/lucida/oracle-capacity}
       # 모델 스냅샷 평면. 비우면 auto(워크로드 실재 여부로 판별).
       - MODEL_EXEC_MODE=${MODEL_EXEC_MODE:-}
       # 패스 종류. smoke면 케이스를 만들고 지키는 일(내보내기·간격·격리검사·야간창·

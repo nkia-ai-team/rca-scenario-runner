@@ -11,6 +11,8 @@ import pytest
 from app.live_queue import (
     LIVE_SCENARIO_ORDER,
     PREFLIGHT_MAX_ATTEMPTS,
+    ORACLE_CHECK_MAX_AGE,
+    ORACLE_CHECK_NAME,
     READINESS_PROBE_GRACE,
     LiveScenarioQueue,
 )
@@ -726,6 +728,114 @@ async def test_readiness_pauses_at_once_when_a_non_transient_check_fails(
     assert "lucida_incident_api" in (state.reason or "")
     assert "incident api down" in (state.reason or "")
     assert runner.started == []
+
+
+def _oracle_check_dir(tmp_path: Path, measured_at: datetime, alert: str | None = None) -> Path:
+    """What oracle-maintenance.sh check leaves on tb-ops: last.json always, ALERT on a reason."""
+    state = tmp_path / "oracle-capacity"
+    state.mkdir(exist_ok=True)
+    (state / "last.json").write_text(
+        json.dumps({
+            "measured_at": measured_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "user_data_bytes": 6602620928,
+            "seed_min_balance": 450000,
+        }),
+        encoding="utf-8",
+    )
+    if alert is None:
+        (state / "ALERT").unlink(missing_ok=True)
+    else:
+        (state / "ALERT").write_text(alert, encoding="utf-8")
+    return state
+
+
+def test_oracle_check_result_gates_readiness(tmp_path: Path) -> None:
+    """v4 E5b review 8: the check's ALERT must stop a recording, or nobody reads it.
+
+    A fresh clean result passes. ALERT blocks with its reason lines. No result, a stale
+    result (cron stopped) and an unreadable result block too: each is the same blind spot.
+    Without a configured directory the check is not part of readiness at all.
+    """
+    queue, _, _, _, clock = make_queue(tmp_path)
+    assert ORACLE_CHECK_NAME not in queue.readiness().checks
+
+    queue.oracle_check_state_dir = tmp_path / "oracle-capacity"
+    readiness = queue.readiness()
+    assert readiness.checks[ORACLE_CHECK_NAME] is False
+    assert "never ran" in readiness.details[ORACLE_CHECK_NAME]
+
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=1))
+    readiness = queue.readiness()
+    assert readiness.checks[ORACLE_CHECK_NAME] is True
+    assert readiness.ready
+
+    _oracle_check_dir(
+        tmp_path,
+        clock.value - timedelta(hours=1),
+        alert=(
+            "2026-11-10T05:56:29Z seed accounts: 2 below 150000, lowest ACC-1007 73898.69\n"
+            "2026-11-10T05:56:29Z banking Oracle user data 11274289153 bytes > 11274289152\n"
+        ),
+    )
+    readiness = queue.readiness()
+    assert not readiness.ready
+    assert readiness.missing == [ORACLE_CHECK_NAME]
+    detail = readiness.details[ORACLE_CHECK_NAME]
+    assert detail.startswith("ALERT ")
+    assert "lowest ACC-1007 73898.69" in detail and "user data 11274289153" in detail
+
+    # The limit is the check's cron period twice plus an hour (6h -> 13h): one failed run
+    # (last.json left as it was) still passes, two in a row block.
+    assert ORACLE_CHECK_MAX_AGE == timedelta(hours=13)
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=12, minutes=59))
+    assert queue.readiness().checks[ORACLE_CHECK_NAME] is True
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=13, minutes=1))
+    readiness = queue.readiness()
+    assert readiness.checks[ORACLE_CHECK_NAME] is False
+    detail = readiness.details[ORACLE_CHECK_NAME]
+    assert "stale" in detail and "last successful check at" in detail and "limit 13h" in detail
+
+    (tmp_path / "oracle-capacity" / "last.json").write_text("{", encoding="utf-8")
+    readiness = queue.readiness()
+    assert readiness.checks[ORACLE_CHECK_NAME] is False
+    assert "unreadable" in readiness.details[ORACLE_CHECK_NAME]
+
+
+@pytest.mark.asyncio
+async def test_oracle_check_alert_refuses_start_and_pauses_between_scenarios(tmp_path: Path) -> None:
+    """Not transient: an ALERT needs a person, so the batch stops at once with the reason."""
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.oracle_check_state_dir = _oracle_check_dir(
+        tmp_path, clock.value - timedelta(hours=1), alert="t seed accounts: 1 below 150000\n"
+    )
+    with pytest.raises(RuntimeError, match=ORACLE_CHECK_NAME):
+        await queue.start()
+    assert runner.started == []
+
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=1))
+    await queue.start()
+    _wait_in_clean_window(queue, clock)
+    _oracle_check_dir(
+        tmp_path, clock.value - timedelta(hours=1), alert="t transfer pool: 3 accounts below 500000\n"
+    )
+    state = await queue.tick()
+    assert state.phase == "paused"
+    assert ORACLE_CHECK_NAME in (state.reason or "")
+    assert "transfer pool: 3 accounts below 500000" in (state.reason or "")
+
+    # resume goes through the same gate: refused while the ALERT stays, allowed once it is gone.
+    with pytest.raises(RuntimeError, match=ORACLE_CHECK_NAME):
+        await queue.resume()
+    assert queue.snapshot().phase == "paused"
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=1))
+    resumed = await queue.resume()
+    assert resumed.phase != "paused"
+
+
+def test_compose_mounts_the_oracle_check_directory_read_only() -> None:
+    compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "- ${ORACLE_CHECK_HOST_PATH:-/var/lib/lucida/oracle-capacity}:/var/lib/lucida/oracle-capacity:ro" in compose
+    assert "- ORACLE_CHECK_STATE_DIR=${ORACLE_CHECK_STATE_DIR:-/var/lib/lucida/oracle-capacity}" in compose
 
 
 @pytest.mark.asyncio

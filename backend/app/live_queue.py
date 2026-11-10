@@ -111,6 +111,17 @@ READINESS_PROBE_GRACE = timedelta(minutes=3)
 # appears at all on a dataset pass (see _functional_readiness): a smoke pass
 # exports nothing, so the capture chain is not a dependency it can fail on.
 TRANSIENT_READINESS_CHECKS = frozenset({"preflight_signals", "capture_self_check"})
+# Banking Oracle housekeeping (testbed-services scripts/oracle-maintenance.sh check, tb-ops
+# root crontab every 6 hours). It writes last.json on every successful run and ALERT (one
+# line per reason) while something needs a person: user data near the 12GB cap, a transfer
+# pool or seed account below its floor. A queue must not start or continue past that, and a
+# check that stopped succeeding is the same blind spot. A failed check (query error, Oracle down
+# during an injection) leaves last.json as it was, so the limit is the cron period twice plus an
+# hour: the crontab line in oracle-maintenance.sh is `7 */6 * * *` (6h), so 6 x 2 + 1 = 13h.
+# One failed run does not block for hours; two in a row do.
+ORACLE_CHECK_NAME = "oracle_maintenance_check"
+ORACLE_CHECK_CRON_PERIOD = timedelta(hours=6)
+ORACLE_CHECK_MAX_AGE = ORACLE_CHECK_CRON_PERIOD * 2 + timedelta(hours=1)
 
 
 def _tail(text: str, limit: int = 200) -> str:
@@ -343,8 +354,14 @@ class LiveScenarioQueue:
         decoy_policy_path: Path | None = None,
         decoy_executor: object | None = None,
         decoy_seed_base: str = "testbed-v4-decoy",
+        oracle_check_state_dir: Path | None = None,
+        oracle_check_max_age: timedelta = ORACLE_CHECK_MAX_AGE,
     ) -> None:
         self.runner = runner
+        # Where oracle-maintenance.sh check leaves last.json and ALERT (mounted read-only).
+        # None leaves the check out of readiness (unit tests, older deployments).
+        self.oracle_check_state_dir = oracle_check_state_dir
+        self.oracle_check_max_age = oracle_check_max_age
         # v3 continuous-cycle mode (off by default; v2 behaviour preserved).
         self.cycle_mode = cycle_mode
         self.cycle_scenario_ids = cycle_scenario_ids
@@ -439,15 +456,56 @@ class LiveScenarioQueue:
         )
         checks["runner_idle"] = not self.runner.is_busy
         checks.update(self._functional_readiness())
+        oracle_checks, oracle_details = self._oracle_check_readiness()
+        checks.update(oracle_checks)
         missing = sorted(name for name, passed in checks.items() if not passed)
         details = {
             name: text
-            for name, text in self._functional_details.items()
+            for name, text in {**self._functional_details, **oracle_details}.items()
             if name in missing
         }
         return OperationalReadiness(
             ready=not missing, checks=checks, missing=missing, details=details
         )
+
+    def _oracle_check_readiness(self) -> tuple[dict[str, bool], dict[str, str]]:
+        """Read the banking Oracle check's last result; ALERT or a stale result blocks.
+
+        Not a probe: the file is the check's own verdict, written by cron on tb-ops.
+        ALERT present -> blocked with its reasons. No last.json, or one older than
+        ``oracle_check_max_age`` (two failed or missed runs) -> blocked as stale. Never
+        transient: these need a person (seed-restore, capacity, crontab). Checked where
+        readiness is: start, resume, and a non-cycle queue's tick between scenarios.
+        """
+        if self.oracle_check_state_dir is None:
+            return {}, {}
+        name = ORACLE_CHECK_NAME
+        alert = self.oracle_check_state_dir / "ALERT"
+        last = self.oracle_check_state_dir / "last.json"
+        try:
+            if alert.exists():
+                reasons = [
+                    line.strip()
+                    for line in alert.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if line.strip()
+                ]
+                text = " | ".join(reasons) or "empty ALERT file"
+                return {name: False}, {name: f"ALERT {text}"[:600]}
+            if not last.is_file():
+                return {name: False}, {name: f"no check result at {last} (check not installed or never ran)"}
+            measured_at = json.loads(last.read_text(encoding="utf-8"))["measured_at"]
+            measured = datetime.fromisoformat(str(measured_at).replace("Z", "+00:00"))
+            age = self.clock.now() - measured
+            if age > self.oracle_check_max_age:
+                return {name: False}, {
+                    name: f"check result is stale: last successful check at {measured_at}, "
+                    f"{int(age.total_seconds() // 3600)}h ago, limit "
+                    f"{int(self.oracle_check_max_age.total_seconds() // 3600)}h (the check failed "
+                    "twice in a row or is not running; see /var/log/oracle-maintenance.log on tb-ops)"
+                }
+            return {name: True}, {}
+        except Exception as error:
+            return {name: False}, {name: f"unreadable check result: {type(error).__name__}: {error}"}
 
     @staticmethod
     def _readiness_failure_reason(
@@ -2572,5 +2630,17 @@ def get_live_queue() -> LiveScenarioQueue:
             topology_collector_factory=topology_collector_factory,
             decoy_policy_path=decoy_policy_path,
             decoy_seed_base=os.environ.get("DECOY_SEED_BASE", "testbed-v4-decoy"),
+            oracle_check_state_dir=(
+                Path(os.environ["ORACLE_CHECK_STATE_DIR"])
+                if os.environ.get("ORACLE_CHECK_STATE_DIR", "").strip()
+                else None
+            ),
+            oracle_check_max_age=timedelta(
+                seconds=int(
+                    os.environ.get(
+                        "ORACLE_CHECK_MAX_AGE_SEC", str(int(ORACLE_CHECK_MAX_AGE.total_seconds()))
+                    )
+                )
+            ),
         )
     return _queue
