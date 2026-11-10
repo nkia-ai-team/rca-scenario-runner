@@ -1753,8 +1753,9 @@ def test_node_utilization_templates_read_the_system_series() -> None:
         assert ".system_" in promql, f"{template_id} 가 파드 회계 계열을 읽는다: {promql}"
 
 
-def _mysql_pod_process(fakes: Fakes, *, started_at: str, anon: int):
-    """Fake kubectl for the food MySQL StatefulSet pod (F42-P)."""
+def _mysql_pod_process(fakes: Fakes, *, started_at: str, anon: int, sampled_at: str | None = None):
+    """Fake kubectl for the food MySQL StatefulSet pod (F42-P). The container's anon memory comes from the
+    kubelet summary API (rssBytes), sampled at `sampled_at` (now by default)."""
     def process(argv, **kwargs):
         argv = list(argv)
         fakes.process_calls.append((argv, kwargs))
@@ -1767,6 +1768,7 @@ def _mysql_pod_process(fakes: Fakes, *, started_at: str, anon: int):
                         "items": [
                             {
                                 "metadata": {"name": "testbed-mysql-0"},
+                                "spec": {"nodeName": "tb-w3"},
                                 "status": {
                                     "conditions": [{"type": "Ready", "status": "True"}],
                                     "containerStatuses": [
@@ -1784,10 +1786,14 @@ def _mysql_pod_process(fakes: Fakes, *, started_at: str, anon: int):
                 ),
                 "",
             )
-        if "/sys/fs/cgroup/memory.stat" in argv:
-            return subprocess.CompletedProcess(
-                argv, 0, f"anon {anon}\nfile 137023488\nkernel 16384000\n", ""
-            )
+        if "/api/v1/nodes/tb-w3/proxy/stats/summary" in argv:
+            pod = {"podRef": {"name": "testbed-mysql-0", "namespace": "rca-testbed-food"},
+                   "containers": [{"name": "mysql", "memory": {
+                       "time": sampled_at or NOW.isoformat(), "rssBytes": anon,
+                       "workingSetBytes": anon + 100000000, "usageBytes": anon + 700000000}}]}
+            other = {"podRef": {"name": "testbed-order-1", "namespace": "rca-testbed-food"},
+                     "containers": [{"name": "mysql", "memory": {"time": NOW.isoformat(), "rssBytes": 1}}]}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"pods": [other, pod]}), "")
         if "/sys/fs/cgroup/memory.current" in argv:
             return subprocess.CompletedProcess(argv, 0, "1073078272\n1073741824\n", "")
         return fakes.process(argv, **kwargs)
@@ -1855,6 +1861,25 @@ def test_db_memory_headroom_needs_anon_room_and_uptime(tmp_path) -> None:
     other = _probes(tmp_path, fakes, scenario_id="F07-H")
     with pytest.raises(LiveProbeError):
         other._db_memory_has_headroom()
+
+
+def test_db_memory_headroom_reads_the_kubelet_not_the_database_pod(tmp_path) -> None:
+    # v4 C6b review: the check used to exec into the MySQL container (cat memory.stat), a runc exec and a
+    # process on the database node every F42-P start. It now reads the kubelet summary API and never execs.
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes, scenario_id="F42-P")
+    long_up = (NOW - timedelta(hours=35)).isoformat()
+    probes.process_runner = _mysql_pod_process(fakes, started_at=long_up, anon=919715840)
+    assert probes._db_memory_has_headroom() is True
+    calls = [argv for argv, _ in fakes.process_calls]
+    assert calls and all("exec" not in argv for argv in calls)
+    assert any("/api/v1/nodes/tb-w3/proxy/stats/summary" in argv for argv in calls)
+    # A sample older than a minute is not this start's headroom.
+    probes.process_runner = _mysql_pod_process(
+        fakes, started_at=long_up, anon=500000000, sampled_at=(NOW - timedelta(minutes=5)).isoformat()
+    )
+    with pytest.raises(LiveProbeError, match="stale"):
+        probes._db_memory_has_headroom()
 
 
 class RolloutFakes(Fakes):

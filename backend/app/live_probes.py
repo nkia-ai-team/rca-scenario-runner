@@ -495,6 +495,8 @@ DB_MEMORY_HEADROOM = {
         "min_uptime_sec": 1800,
     },
 }
+# The kubelet refreshes container stats every 10 to 15 s; an older sample is not this start's headroom.
+DB_MEMORY_SAMPLE_MAX_AGE_SEC = 60
 APPROVED_BUSINESS_KEYS = frozenset({"checkout", "order-1"})
 APPROVED_K8S_TARGETS = {
     ("rca-testbed-commerce", "api-gateway"): "app=testbed-gateway",
@@ -1286,17 +1288,34 @@ class LiveProbeSet:
         pod = active[0].get("metadata", {}).get("name")
         if not isinstance(pod, str) or not pod:
             raise LiveProbeError("database pod name is invalid")
-        stat = self._kubectl(
-            "exec", pod, "--namespace", namespace, "-c", container, "--",
-            "cat", "/sys/fs/cgroup/memory.stat",
+        node = active[0].get("spec", {}).get("nodeName")
+        if not isinstance(node, str) or not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", node):
+            raise LiveProbeError("database pod node is invalid")
+        # v4 C6b review: this read was `kubectl exec <mysql pod> cat /sys/fs/cgroup/memory.stat`, a runc exec and a
+        # process in the database container every time F42-P starts. The kubelet's summary API carries the same
+        # number without entering the pod: on cgroup v2 cAdvisor reports the container's memory.stat `anon` as
+        # rssBytes (66 tb-w3 2026-11-10: rssBytes 663,441,408 next to workingSetBytes 954,052,608).
+        summary = json.loads(
+            self._kubectl("get", "--raw", f"/api/v1/nodes/{node}/proxy/stats/summary").stdout
         )
-        anon = None
-        for line in stat.stdout.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[0] == "anon" and parts[1].isdigit():
-                anon = int(parts[1])
-        if anon is None:
+        memories = [
+            item.get("memory", {})
+            for entry in summary.get("pods", [])
+            if entry.get("podRef", {}).get("name") == pod
+            and entry.get("podRef", {}).get("namespace") == namespace
+            for item in entry.get("containers", [])
+            if item.get("name") == container
+        ]
+        if len(memories) != 1:
+            raise LiveProbeError("database container memory is missing from the kubelet summary")
+        anon = memories[0].get("rssBytes")
+        if isinstance(anon, bool) or not isinstance(anon, int) or anon < 0:
             raise LiveProbeError("database cgroup anon memory is unavailable")
+        sampled = memories[0].get("time")
+        if not isinstance(sampled, str) or (
+            _aware(self.clock()) - _parse_time(sampled)
+        ).total_seconds() > DB_MEMORY_SAMPLE_MAX_AGE_SEC:
+            raise LiveProbeError("database memory sample from the kubelet is stale")
         if anon > target["max_anon_bytes"]:
             raise LiveProbeError(
                 f"database anon memory {anon} is above {target['max_anon_bytes']}"
