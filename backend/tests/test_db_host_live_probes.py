@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import subprocess
+import sys
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 
 from app.live_probes import (
     APPROVED_ORACLE_TAGS,
@@ -31,8 +35,57 @@ SECRETS = {
 PASSWORDS = [v for data in SECRETS.values() for k, v in data.items() if "PASSWORD" in k]
 
 
+# Stand-ins for the database drivers the real probe client imports (python-oracledb, PyMySQL). The fake process runs
+# DB_PROBE_CLIENT itself with these on its path, so every probe test goes through the client's own connect, execute,
+# fetch and print (C6b test audit 다2: the old fake_sqlplus imitated the real tool's output; a fake that returns bare
+# values once hid four probes that read nothing, 2026-07-30). Each call is logged as one JSON line in FAKE_DB_LOG.
+_FAKE_DRIVER = """
+import json, os
+
+class OperationalError(Exception):
+    pass
+
+class DatabaseError(Exception):
+    pass
+
+def _log(entry):
+    with open(os.environ["FAKE_DB_LOG"], "a") as fh:
+        fh.write(json.dumps(entry) + "\\n")
+
+class _Cursor:
+    def execute(self, sql, binds=None):
+        _log({"kind": "execute", "sql": sql, "binds": binds})
+    def fetchone(self):
+        answer = os.environ["FAKE_DB_ANSWER"]
+        return (int(answer) if answer.lstrip("-").isdigit() else answer,)
+
+class _Connection:
+    module = None
+    def __init__(self, **kwargs):
+        if os.environ.get("FAKE_DB_FAIL"):
+            raise OperationalError(os.environ["FAKE_DB_FAIL"] + "\\nsecond line that must not be reported")
+        self.kwargs = kwargs
+    def connect(self):
+        _log({"kind": "connect", "attrs": getattr(self, "_connect_attrs", None)})
+    def cursor(self):
+        _log({"kind": "connect-kwargs", "kwargs": {k: v for k, v in self.kwargs.items() if k != "password"},
+              "module": self.module})
+        return _Cursor()
+    def close(self):
+        pass
+
+def connect(**kwargs):
+    return _Connection(**kwargs)
+"""
+_FAKE_DRIVER_DIR = tempfile.mkdtemp(prefix="fake-db-drivers-")
+Path(_FAKE_DRIVER_DIR, "oracledb.py").write_text(_FAKE_DRIVER)
+Path(_FAKE_DRIVER_DIR, "pymysql").mkdir()
+Path(_FAKE_DRIVER_DIR, "pymysql", "__init__.py").write_text(_FAKE_DRIVER)
+
+
 class FakeProcess:
-    """kubectl answers reads only; the database probe client answers from DBP_* env.
+    """kubectl answers reads only; the database probe client really runs, against fake drivers that answer from the
+    engine's entry in ANSWERS.
 
     Any `kubectl exec` fails the test: the probes must not run inside a database pod
     (v4 C6b; the old sqlplus / mysql exec left a runc exec, a client process and a SYS
@@ -42,6 +95,10 @@ class FakeProcess:
         self.calls: list[tuple[list[str], dict]] = []
         self.answers = answers or {"oracle": "1", "mysql": "0"}
         self.fail_client = fail_client
+        self.db_log = Path(tempfile.mkstemp(prefix="fake-db-log-")[1])
+
+    def db_calls(self) -> list[dict]:
+        return [json.loads(line) for line in self.db_log.read_text().splitlines()]
 
     def __call__(self, argv, **kwargs):
         argv = list(argv)
@@ -53,11 +110,16 @@ class FakeProcess:
                 b"",
             )
         if argv[0] == DB_PROBE_PYTHON:
+            assert argv[1:] == ["-c", DB_PROBE_CLIENT], argv
+            env = dict(kwargs["env"], PYTHONPATH=_FAKE_DRIVER_DIR, FAKE_DB_LOG=str(self.db_log),
+                       FAKE_DB_ANSWER=self.answers[kwargs["env"]["DBP_ENGINE"]])
             if self.fail_client:
-                raise subprocess.CalledProcessError(
-                    1, argv, "", "OperationalError: (1045, \"Access denied for user 'fooddelivery'\")\n"
-                )
-            return subprocess.CompletedProcess(argv, 0, self.answers[kwargs["env"]["DBP_ENGINE"]] + "\n", "")
+                env["FAKE_DB_FAIL"] = "(1045, \"Access denied for user 'fooddelivery'\")"
+            done = subprocess.run([sys.executable, "-c", argv[2]], env=env, capture_output=True,
+                                  text=True, timeout=kwargs.get("timeout", 15))
+            if kwargs.get("check") and done.returncode != 0:
+                raise subprocess.CalledProcessError(done.returncode, argv, done.stdout, done.stderr)
+            return subprocess.CompletedProcess(argv, done.returncode, done.stdout, done.stderr)
         assert argv[0:2] == ["kubectl", "--kubeconfig"], argv
         assert "exec" not in argv, argv
         verb, kind = argv[3], argv[4]
@@ -160,6 +222,52 @@ def test_database_probes_are_network_sessions_with_least_privilege_accounts() ->
                 assert all(password not in item for item in argv), (query_id, argv)
         client_argv = [argv for argv, _ in fake.calls if argv[0] == DB_PROBE_PYTHON]
         assert client_argv == [[DB_PROBE_PYTHON, "-c", DB_PROBE_CLIENT]]
+
+
+def test_probe_client_really_connects_executes_once_and_prints_the_value() -> None:
+    # C6b test audit 다2: the fake drivers stand where python-oracledb and PyMySQL are; the client itself runs. One
+    # connect with the operator tool's identity, one execute with exactly the probe's SQL and binds, the first
+    # column of the one row printed; a driver error is one line on stderr without the password.
+    cases = dict(ORACLE_PROBES)
+    cases["database.mysql_index_present"] = MYSQL_INDEX_CONTRACT
+    for query_id, parameters in cases.items():
+        fake = FakeProcess()
+        result = observe(fake, query_id, parameters)
+        assert result["quality"] == "good", (query_id, result)
+        (env,) = fake.client_calls()
+        calls = fake.db_calls()
+        executes = [c for c in calls if c["kind"] == "execute"]
+        assert len(executes) == 1, (query_id, calls)
+        assert executes[0]["sql"] == env["DBP_SQL"]
+        assert executes[0]["binds"] == json.loads(env["DBP_BINDS"])
+        (connected,) = [c for c in calls if c["kind"] == "connect-kwargs"]
+        if env["DBP_ENGINE"] == "oracle":
+            assert {k: connected["kwargs"][k] for k in ("program", "machine", "osuser", "driver_name")} == {
+                "program": "SQLcl", "machine": "ops-bastion", "osuser": "dba", "driver_name": "jdbcthin : 23.7.0.25.1"}
+            assert connected["kwargs"]["dsn"] == f"{env['DBP_HOST']}:{env['DBP_PORT']}/{env['DBP_SERVICE']}"
+            assert connected["module"] == "SQLcl"
+        else:
+            (attrs,) = [c["attrs"] for c in calls if c["kind"] == "connect"]
+            assert attrs["program_name"] == "mysql" and attrs["_client_name"] == "libmysql"
+            assert connected["kwargs"]["database"] == "fooddelivery"
+        assert "password" not in json.dumps(calls)
+    fake = FakeProcess(fail_client=True)
+    failed = observe(fake, "database.mysql_index_present", MYSQL_INDEX_CONTRACT)
+    assert failed["quality"] == "error"
+    assert "OperationalError: (1045" in json.dumps(failed, default=str)
+    assert "second line" not in json.dumps(failed, default=str)
+    for password in PASSWORDS:
+        assert password not in json.dumps(failed, default=str)
+
+
+def test_mysql_index_probe_reads_the_index_catalogue() -> None:
+    # C6b test audit 다1: the index probe reads information_schema.statistics (a fixed SELECT count(*)), the old
+    # kubectl-read test's second half.
+    fake = FakeProcess()
+    observe(fake, "database.mysql_index_present", MYSQL_INDEX_CONTRACT)
+    (env,) = fake.client_calls()
+    assert "information_schema.statistics" in env["DBP_SQL"]
+    assert re.fullmatch(r"(?is)\s*select count\(\*\) from [^;]+", env["DBP_SQL"]), env["DBP_SQL"]
 
 
 def test_probe_client_carries_the_operator_tool_identity_and_no_value() -> None:
