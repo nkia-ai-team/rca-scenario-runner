@@ -383,6 +383,35 @@ def _ambiguous_short(policy: DecoyPolicy, short: str) -> bool:
     return len({t.namespace for t in policy.targets if _short(t) == short}) > 1
 
 
+def _scoped_names(policy: DecoyPolicy, text: str) -> tuple[set[str], str]:
+    """Read product target names ``<namespace>/<object>`` as that one object.
+
+    The product names a Kubernetes object it monitors by its namespace and
+    name (``rca-testbed-food/testbed-external-pg-mock``), and the answer keys
+    score by that name. Such a name points at one object, not at the whole
+    namespace: it is a hit for the policy target whose Deployment it names in
+    that namespace (``<namespace>/<deployment>`` or
+    ``<namespace>/deployment/<deployment>``) and for nothing else (an external
+    mock, a Job, a quota). The names are cut out of the text so that the
+    namespace and Deployment readings below do not see them again (TRIG review
+    2026-11-12: the namespace substring took every app of the domain off the
+    decoy list)."""
+    namespaces = sorted({target.namespace for target in policy.targets}, key=len, reverse=True)
+    if not namespaces:
+        return set(), text
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_.-])(" + "|".join(re.escape(ns) for ns in namespaces) + r")/([A-Za-z0-9_.:/-]+)"
+    )
+    hits: set[str] = set()
+    for match in pattern.finditer(text):
+        namespace, obj = match.group(1), match.group(2).split(":", 1)[0].rstrip("./")
+        obj = obj.removeprefix("deployment/")
+        for target in policy.targets:
+            if target.namespace == namespace and obj == target.deployment:
+                hits.add(target.key)
+    return hits, pattern.sub(" ", text)
+
+
 def mentioned_targets(
     policy: DecoyPolicy,
     text: str,
@@ -407,7 +436,7 @@ def mentioned_targets(
     answer key is still the fault path). Without
     ``home`` the reading stays blunt (every short word everywhere), which is
     what the no-change reading uses."""
-    hits: set[str] = set()
+    hits, text = _scoped_names(policy, text)
     prefixes = _route_prefixes(text) if home is not None else set()
     for target in policy.targets:
         if target.namespace in text or any(name in text for name in target.names()):

@@ -19,6 +19,7 @@ from app.decoys import (
     decoy_candidates,
     excluded_targets,
     load_decoy_policy,
+    mentioned_targets,
     partition_decoy_alarms,
     stated_unchanged,
 )
@@ -669,8 +670,28 @@ def _oracle_word(name, text):
     return re.search(rf"(?<![A-Za-z0-9-]){re.escape(name)}(?![A-Za-z0-9-])", text) is not None
 
 
+def _oracle_scoped(active, text):
+    """Product target names ``<namespace>/<object>``: the object they name
+    (an app only when the object is its Deployment) and the text without them.
+    Token based on purpose, unlike the module's regex (TRIG 2026-11-12)."""
+    hits, kept = set(), []
+    namespaces = {target.namespace for target in active.targets}
+    for token in re.split(r"(\s+)", text):
+        bare = token.strip("()[]{}'\"`,;")
+        namespace, slash, obj = bare.partition("/")
+        if slash and namespace in namespaces:
+            obj = obj.split(":", 1)[0]
+            if obj.startswith("deployment/"):
+                obj = obj[len("deployment/"):]
+            hits |= {t.key for t in active.targets if t.namespace == namespace and t.deployment == obj}
+            kept.append(" ")
+        else:
+            kept.append(token)
+    return hits, "".join(kept)
+
+
 def _oracle_hits(active, text):
-    hits = set()
+    hits, text = _oracle_scoped(active, text)
     for target in active.targets:
         if target.namespace in text or any(_oracle_word(name, text) for name in _oracle_names(target)):
             hits.add(target.key)
@@ -715,7 +736,7 @@ def _oracle_named(active, whole):
 
 
 def _oracle_path_hits(active, text, home, named):
-    hits = set()
+    hits, text = _oracle_scoped(active, text)
     unprefixed = text.replace("/api/", "/~/")
     for target in active.targets:
         short = target.deployment.removeprefix("testbed-")
@@ -777,3 +798,45 @@ def test_no_real_scenario_offers_a_path_or_unchanged_target(scope) -> None:
         if leaked:
             leaks.append((scenario_id, sorted(leaked)))
     assert leaks == [], leaks[:10]
+
+
+# --- TRIG 2026-11-12: product target names `<namespace>/<object>` ----------
+def test_a_product_target_name_names_that_one_object_not_its_namespace() -> None:
+    """The answer keys score external mocks by the product's target name
+    (``rca-testbed-food/testbed-external-pg-mock``). Read as a namespace
+    substring it took every app of the domain off the decoy list (TRIG review
+    2026-11-12). It names that one object: an app Deployment when it is one,
+    nothing in the policy otherwise. A bare namespace still names them all."""
+    active = _three_domains()
+    food = {t.key for t in active.targets if t.namespace == "rca-testbed-food"}
+    assert mentioned_targets(active, "rca-testbed-food/testbed-external-pg-mock") == set()
+    assert mentioned_targets(active, "rca-testbed-food/job/notify-delivery-backfill") == set()
+    assert mentioned_targets(active, "rca-testbed-food/testbed-payment") == {"rca-testbed-food/testbed-payment"}
+    assert mentioned_targets(active, "rca-testbed-commerce/deployment/testbed-order") == {
+        "rca-testbed-commerce/testbed-order"
+    }
+    assert mentioned_targets(active, "every app in rca-testbed-food restarted") == food
+    scenario = {
+        "domain": "food-delivery",
+        "root_cause": {"target_id": "rca-testbed-food/testbed-external-pg-mock"},
+        "scoring": {"accept": ["rca-testbed-food/testbed-external-pg-mock"], "partial": ["food-delivery-order"]},
+    }
+    same = {t.key for t in decoy_candidates(active, "X", scenario)["same_domain"]}
+    assert same == {"rca-testbed-food/testbed-payment"}
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "same_domain"),
+    [
+        ("F06-P", {"rca-testbed-food/testbed-dispatch", "rca-testbed-food/testbed-notify"}),
+        ("F19-P", {"rca-testbed-food/testbed-notify"}),
+        ("F19-S", {"rca-testbed-food/testbed-notify", "rca-testbed-food/testbed-restaurant"}),
+    ],
+)
+def test_real_mock_scenarios_keep_their_same_domain_decoys(scenario_id, same_domain) -> None:
+    """The food mock scenarios had these same-domain candidates while the
+    answer key used the shared short mock name; renaming the mock to its
+    product target name must not take them away."""
+    active, scenarios = _real()
+    groups = decoy_candidates(active, scenario_id, scenarios[scenario_id])
+    assert {t.key for t in groups["same_domain"]} == same_domain
