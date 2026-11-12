@@ -523,7 +523,9 @@ APPROVED_K8S_TARGETS = {
     # F19-P/S watch the food order pod while its Hikari pool saturates.
     ("rca-testbed-food", "testbed-order"): "app=testbed-order",
     # F16-H watches the user pod dropping NotReady under its readinessProbe
-    # fault while the gateway fail-closes every write route with 401.
+    # fault while the gateway answers login with 502 (user circuit open) and
+    # every token-bearing write with 500 (the self-invoked token check skips
+    # the circuit breaker and its 401 fallback).
     ("rca-testbed-commerce", "testbed-user"): "app=testbed-user",
     # F21-P watches the banking api pod while its Tomcat 200 thread pool
     # saturates (109 kubectl-verified 2026-07-24: app=testbed-api).
