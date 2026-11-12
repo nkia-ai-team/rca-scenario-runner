@@ -1241,6 +1241,19 @@ def _write_baseline(probes, domain: str, *, claims: str | None = None, **overrid
     _write(probes.paths.baseline_summary_dir / f"baseline-{domain}-live.json", document)
 
 
+def test_resident_baseline_document_is_read_from_the_neutral_k6_path(tmp_path) -> None:
+    """Without the shared local copy the probe reads tb-runner's document over ssh. The publisher names it
+    like a load host's own k6 output, /tmp/k6-<domain>-live.json, because its k6 prints that path into the
+    syslog 119 records (design principle 8; until 2026-11-12 /tmp/rca-baseline-<domain>-live.json)."""
+    fakes = Fakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    probes.observe(registry.bind({"query_id": "loadgen.checkout_5xx_rate", "parameters": {"domain": "food-delivery"}}))
+    ssh_calls = [argv for argv, _ in fakes.process_calls if argv[0] == "ssh"]
+    assert ssh_calls and all(argv[-3:] == ["cat", "--", "/tmp/k6-food-delivery-live.json"] for argv in ssh_calls)
+    assert not any("rca-" in item for argv in ssh_calls for item in argv)
+
+
 def test_loadgen_domain_parameter_reads_the_resident_baseline_document(tmp_path) -> None:
     """Observation must not require the scenario to flood that domain itself.
 

@@ -774,9 +774,14 @@ def host_probe_stdin(mode: str, target: str) -> bytes:
     return ("set -- " + " ".join(shlex.quote(arg) for arg in (mode, target)) + "\n").encode() + HOST_PROBE_SCRIPT
 
 
+# The SQL below runs on the observed databases, whose statement statistics (DPM top SQL) and logs are
+# recorded. Parameters ride as session settings under the `app.` prefix, the one applications use for
+# their own settings (row-level security, tenant ids), so the text names neither the runner nor a
+# scenario (design principle 8). Until 2026-11-12 the prefix was `lucida.` and one setting was
+# `scenario_tag`.
 TAGGED_SESSION_SQL = (
     "SELECT count(*) AS tagged_count FROM pg_stat_activity "
-    "WHERE application_name = current_setting('lucida.scenario_tag')"
+    "WHERE application_name = current_setting('app.client_tag')"
 )
 # Successor to TAGGED_SESSION_SQL for the PostgreSQL lock scenarios (F01-R,
 # F06-H). Those injectors no longer wear a scenario-encoded application_name —
@@ -795,7 +800,7 @@ BLOCKED_SESSION_SQL = (
     "SELECT count(*) AS blocked_count FROM pg_stat_activity a "
     "WHERE cardinality(pg_blocking_pids(a.pid)) > 0 "
     "AND EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid "
-    "AND l.relation = to_regclass(current_setting('lucida.lock_relation')))"
+    "AND l.relation = to_regclass(current_setting('app.lock_relation')))"
 )
 # Only relations an approved db.lock level actually targets may be probed.
 BLOCKED_SESSION_RELATIONS = frozenset(
@@ -806,14 +811,14 @@ BLOCKED_SESSION_RELATIONS = frozenset(
 LEDGER_UNMATCHED_CONTRACT = {"window_minutes": 5, "grace_seconds": 60}
 INDEX_PRESENT_SQL = (
     "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_indexes "
-    "WHERE schemaname = current_setting('lucida.index_schema') "
-    "AND tablename = current_setting('lucida.index_table') "
-    "AND indexname = current_setting('lucida.index_name')) THEN 1 ELSE 0 END"
+    "WHERE schemaname = current_setting('app.index_schema') "
+    "AND tablename = current_setting('app.index_table') "
+    "AND indexname = current_setting('app.index_name')) THEN 1 ELSE 0 END"
 )
 PAYMENT_DUPLICATE_SINCE_T1_SQL = (
     "SELECT count(*) AS duplicate_count FROM (SELECT order_id "
     "FROM payment_schema.payments WHERE created_at >= "
-    "(current_setting('lucida.payment_t1')::timestamptz AT TIME ZONE 'UTC') "
+    "(current_setting('app.since')::timestamptz AT TIME ZONE 'UTC') "
     "GROUP BY order_id HAVING count(*) > 1) AS duplicates"
 )
 # F20-R decisive evidence: count of backends actively running a query for
@@ -2472,7 +2477,9 @@ class LiveProbeSet:
                     "-o", "StrictHostKeyChecking=yes",
                     "-o", "ConnectTimeout=10",
                     f"{LOADGEN_USER}@{LOADGEN_HOST}",
-                    "cat", "--", f"/tmp/rca-baseline-{domain}-live.json",
+                    # tb-runner's resident publisher (testbed-services scripts/loadgen/baseline-publish.sh)
+                    # names its files like a load host's own k6 output (until 2026-11-12: rca-baseline-*).
+                    "cat", "--", f"/tmp/k6-{domain}-live.json",
                 ],
                 check=True,
                 capture_output=True,

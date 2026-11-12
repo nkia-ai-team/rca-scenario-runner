@@ -128,10 +128,34 @@ def test_production_index_probe_executes_only_fixed_parameterized_contract(monke
     assert kwargs["env"]["PGHOST"] == "192.168.122.77"
     assert kwargs["env"]["PGPORT"] == "30432"
     assert kwargs["env"]["PGOPTIONS"] == (
-        "-c lucida.index_schema=product_schema "
-        "-c lucida.index_table=products "
-        "-c lucida.index_name=idx_products_name"
+        "-c app.index_schema=product_schema "
+        "-c app.index_table=products "
+        "-c app.index_name=idx_products_name"
     )
+
+
+def test_probe_sql_on_observed_databases_names_neither_runner_nor_scenario() -> None:
+    """The probe SQL runs on the observed databases; their top SQL (DPM) and logs are recorded, so the
+    text may not name the runner, the testbed or a scenario (design principle 8). Parameters ride as
+    session settings under `app.` like an application's own (until 2026-11-12: `lucida.`, with a
+    setting called `scenario_tag`)."""
+    import re as regex
+
+    statements = {name: value for name, value in vars(live_probes).items()
+                  if name.endswith("_SQL") and isinstance(value, str)}
+    # Oracle and MySQL probes pass their SQL inline to _database_query.
+    probe_source = Path(live_probes.__file__).read_text(encoding="utf-8")
+    for index, call in enumerate(regex.findall(r'_database_query\(\s*"(?:oracle|mysql)",\s*"[a-z]+",((?:\s*"[^"]*")+)', probe_source)):
+        statements[f"inline-{index}"] = "".join(regex.findall(r'"([^"]*)"', call))
+    assert len(statements) > 10
+    tool_word = regex.compile(r"(?i)lucida|scenario|rca[-_.]|inject|testbed")
+    for name, sql in statements.items():
+        assert not tool_word.search(sql), (name, tool_word.search(sql).group(0))
+        for setting in regex.findall(r"current_setting\('([^']+)'\)", sql):
+            assert setting.startswith("app."), (name, setting)
+    source = Path(live_probes.__file__).with_name("production_runtime.py").read_text(encoding="utf-8")
+    options = regex.findall(r"-c ([A-Za-z_]+)\.[a-z_]+=", source)
+    assert options and set(options) == {"app"}, options
 
 
 def test_every_probe_sql_live_probes_issues_is_approved_by_the_dispatch() -> None:

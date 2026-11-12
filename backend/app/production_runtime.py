@@ -663,20 +663,20 @@ def _configured_live_probes(
 
     def database_client(sql, parameters, *, credentials):
         if sql == TAGGED_SESSION_SQL and len(parameters) == 1:
-            pgoptions = f"-c lucida.scenario_tag={parameters[0]}"
+            pgoptions = f"-c app.client_tag={parameters[0]}"
             result_field = "tagged_count"
         elif sql == BLOCKED_SESSION_SQL and parameters in (
             ("inventory_schema.inventory",), ("payment_schema.payments",)
         ):
-            pgoptions = f"-c lucida.lock_relation={parameters[0]}"
+            pgoptions = f"-c app.lock_relation={parameters[0]}"
             result_field = "blocked_count"
         elif sql == INDEX_PRESENT_SQL and parameters == (
             "product_schema", "products", "idx_products_name"
         ):
             pgoptions = (
-                "-c lucida.index_schema=product_schema "
-                "-c lucida.index_table=products "
-                "-c lucida.index_name=idx_products_name"
+                "-c app.index_schema=product_schema "
+                "-c app.index_table=products "
+                "-c app.index_name=idx_products_name"
             )
             result_field = "index_present"
         elif sql == PAYMENT_DUPLICATE_SINCE_T1_SQL and len(parameters) == 1:
@@ -684,7 +684,7 @@ def _configured_live_probes(
                 datetime.fromisoformat(parameters[0].replace("Z", "+00:00"))
             except ValueError as error:
                 raise RuntimeError("payment duplicate probe t1 is invalid") from error
-            pgoptions = f"-c lucida.payment_t1={parameters[0]}"
+            pgoptions = f"-c app.since={parameters[0]}"
             result_field = "duplicate_count"
         elif sql in PARAMETERLESS_DATABASE_PROBES and not parameters:
             pgoptions = ""
