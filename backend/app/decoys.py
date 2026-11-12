@@ -388,14 +388,16 @@ def _scoped_names(policy: DecoyPolicy, text: str) -> tuple[set[str], str]:
 
     The product names a Kubernetes object it monitors by its namespace and
     name (``rca-testbed-food/testbed-external-pg-mock``), and the answer keys
-    score by that name. Such a name points at one object, not at the whole
-    namespace: it is a hit for the policy target whose Deployment it names in
-    that namespace (``<namespace>/<deployment>`` or
-    ``<namespace>/deployment/<deployment>``) and for nothing else (an external
-    mock, a Job, a quota). The names are cut out of the text so that the
-    namespace and Deployment readings below do not see them again (TRIG review
-    2026-11-12: the namespace substring took every app of the domain off the
-    decoy list)."""
+    score external mocks by that name. Such a name points at one object, not at
+    the whole namespace (TRIG review 2026-11-12: the namespace substring took
+    every app of the domain off the decoy list). It is a hit for the policy
+    target it belongs to in that namespace: the Deployment itself
+    (``<ns>/<deployment>``, ``<ns>/deployment/<deployment>``), one of its pods
+    or ReplicaSets (``<ns>/<deployment>-<hash>...``) or a container in such a
+    pod (``<ns>/<pod>/<container>``). Any other object (an external mock, a
+    Job, a quota) is not a policy target and hits nothing. The names are cut
+    out of the text so that the namespace and Deployment readings below do not
+    see them again."""
     namespaces = sorted({target.namespace for target in policy.targets}, key=len, reverse=True)
     if not namespaces:
         return set(), text
@@ -404,11 +406,15 @@ def _scoped_names(policy: DecoyPolicy, text: str) -> tuple[set[str], str]:
     )
     hits: set[str] = set()
     for match in pattern.finditer(text):
-        namespace, obj = match.group(1), match.group(2).split(":", 1)[0].rstrip("./")
-        obj = obj.removeprefix("deployment/")
-        for target in policy.targets:
-            if target.namespace == namespace and obj == target.deployment:
-                hits.add(target.key)
+        namespace = match.group(1)
+        obj = match.group(2).split(":", 1)[0].rstrip("./").removeprefix("deployment/").split("/", 1)[0]
+        owners = [
+            target for target in policy.targets
+            if target.namespace == namespace
+            and (obj == target.deployment or obj.startswith(target.deployment + "-"))
+        ]
+        if owners:
+            hits.add(max(owners, key=lambda target: len(target.deployment)).key)
     return hits, pattern.sub(" ", text)
 
 

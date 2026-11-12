@@ -683,7 +683,11 @@ def _oracle_scoped(active, text):
             obj = obj.split(":", 1)[0]
             if obj.startswith("deployment/"):
                 obj = obj[len("deployment/"):]
-            hits |= {t.key for t in active.targets if t.namespace == namespace and t.deployment == obj}
+            head = obj.split("/")[0]
+            hits |= {
+                t.key for t in active.targets
+                if t.namespace == namespace and re.fullmatch(re.escape(t.deployment) + r"(-[a-z0-9]+)*", head)
+            }
             kept.append(" ")
         else:
             kept.append(token)
@@ -840,3 +844,51 @@ def test_real_mock_scenarios_keep_their_same_domain_decoys(scenario_id, same_dom
     active, scenarios = _real()
     groups = decoy_candidates(active, scenario_id, scenarios[scenario_id])
     assert {t.key for t in groups["same_domain"]} == same_domain
+
+
+# Hand-written expectations (rv-trig 4th review): the oracle reads product
+# target names with the same rule as the module, so the exhaustive check cannot
+# catch a gap shared by both. These values are written out by hand.
+FOOD_APPS = {
+    "rca-testbed-food/testbed-order",
+    "rca-testbed-food/testbed-restaurant",
+    "rca-testbed-food/testbed-dispatch",
+    "rca-testbed-food/testbed-payment",
+    "rca-testbed-food/testbed-notify",
+}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "rca-testbed-food/testbed-payment",
+        "rca-testbed-food/deployment/testbed-payment",
+        "rca-testbed-food/testbed-payment-78b789d675",
+        "rca-testbed-food/testbed-payment-78b789d675-22rrw",
+        "rca-testbed-food/testbed-payment-78b789d675-22rrw/payment-service",
+    ],
+)
+def test_a_pod_replicaset_or_container_target_name_names_its_app(name) -> None:
+    """A pod, ReplicaSet or container is a product target too. Its app is on
+    the fault path: the old reading took all five food apps off (namespace
+    substring), the first object reading took none; it is exactly one."""
+    active, _ = _real()
+    assert {t.key for t in active.targets if t.namespace == "rca-testbed-food"} == FOOD_APPS
+    assert mentioned_targets(active, name) == {"rca-testbed-food/testbed-payment"}
+    scenario = {"domain": "food-delivery", "scoring": {"accept": ["food-delivery-dispatch"], "partial": [name]}}
+    excluded = excluded_targets(active, "X", scenario)
+    assert "rca-testbed-food/testbed-payment" in excluded
+    same = {t.key for t in decoy_candidates(active, "X", scenario)["same_domain"]}
+    assert same == FOOD_APPS - {"rca-testbed-food/testbed-payment", "rca-testbed-food/testbed-dispatch"}
+
+
+def test_a_non_app_target_name_names_no_app_and_a_bare_namespace_names_all() -> None:
+    active, _ = _real()
+    for name in (
+        "rca-testbed-food/testbed-external-pg-mock",
+        "rca-testbed-food/job/notify-delivery-backfill",
+        "rca-testbed-food/payment-audit-export",
+        "rca-testbed-food/testbed-mysql-0",
+    ):
+        assert mentioned_targets(active, name) == set(), name
+    assert mentioned_targets(active, "rca-testbed-food 의 앱이 모두 재시작") == FOOD_APPS
