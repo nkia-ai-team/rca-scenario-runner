@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -700,18 +701,28 @@ HOST_PROBE_CONTRACTS = {
     "F10-P": ("192.168.122.11", "fio", "/opt/local-path-provisioner/pvc-2c369013-b180-417a-9eda-da922c78b6ee_rca-testbed-banking_oracledata-testbed-oracle-0"),
     "F15-P": ("192.168.122.11", "pressure", ""),
 }
+# The worker's sudo logs its whole command line to the auth log, which reaches 119's syslog and so the
+# recording; every process cmdline there is collected too. So the probe sends nothing that names the
+# scenario (design principle 8): `sudo bash -s` alone on the command line, the mode and target on a
+# `set --` line of stdin (host_probe_stdin), and the job's files by the plain names host.stress gives
+# them (testbed-services profiles/host_stress_executor.py: /var/lib/opsjobs/<job>.pid, the fio file
+# <target>/.<job>.dat, the watermark file <target>/.<job>.part). Until 2026-11-12 it sent
+# `sudo bash -s -- <scenario id> <mode> <target>` every tick and looked for the per-scenario names
+# host.stress stopped using on 2026-10-16.
+HOST_PROBE_JOBS = {"fio": "iobench", "watermark": "bulkcopy", "pressure": "soak"}
 HOST_PROBE_SCRIPT = br'''#!/usr/bin/env bash
 set -euo pipefail
-scenario="$1"; mode="$2"; target="$3"
-state_root=/var/lib/lucida/scenario-profile-state
-pidfile="$state_root/${scenario}.pid"
+mode="$1"; target="$2"
+# Moved only for the sandboxed tests: sudo resets the environment on the worker.
+state_root="${OPSJOB_STATE_ROOT:-/var/lib/opsjobs}"
+case "$mode" in fio) job=iobench ;; watermark) job=bulkcopy ;; pressure) job=soak ;; *) exit 2 ;; esac
+pidfile="$state_root/$job.pid"
 active=false; artifact=false; used=0; io_util=0
 if [[ -s "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then active=true; fi
 case "$mode" in
- fio) [[ -e "$target/.lucida-${scenario}-fio" ]] && artifact=true ;;
- watermark) [[ -e "$target/.lucida-${scenario}-watermark" ]] && artifact=true; $artifact && active=true ;;
+ fio) [[ -e "$target/.$job.dat" ]] && artifact=true ;;
+ watermark) [[ -e "$target/.$job.part" ]] && artifact=true; $artifact && active=true ;;
  pressure) ;;
- *) exit 2 ;;
 esac
 if [[ -n "$target" ]]; then used=$(df -P "$target" | awk 'NR==2{gsub(/%/,"",$5); print $5}'); fi
 # Disk busy percentage for the device backing $target, from /proc/diskstats
@@ -719,15 +730,15 @@ if [[ -n "$target" ]]; then used=$(df -P "$target" | awk 'NR==2{gsub(/%/,"",$5);
 # unreliably, so resolve the parent disk first.
 # Averaged since the previous probe call (state file below): a 1s spot sample
 # swung 41..98 tick-to-tick under constant-rate fio and broke every
-# 3-consecutive-tick judgment while the device stayed saturated (batch #25,
-# F10-P). The interval average measures what the judgment actually asks --
+# 3-consecutive-tick judgment while the device stayed saturated (batch #25, fio on
+# the banking volume). The interval average measures what the judgment actually asks --
 # "was the device busy over this tick" -- with no added probe latency. First
 # call, device change, or a stale (>120s) interval falls back to a 1s sample.
 if [[ -n "$target" ]]; then
   src=$(df -P "$target" | awk 'NR==2{print $1}')
   dev=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)
   [[ -z "$dev" ]] && dev=$(basename "$src")
-  iostate="$state_root/${scenario}.iosample"
+  iostate="$state_root/$job.iosample"
   now_ms=$(date +%s%3N)
   t1=$(awk -v d="$dev" '$3==d{print $13}' /proc/diskstats)
   pdev=""; pticks=""; pms=""
@@ -755,6 +766,14 @@ clean=true; $active && clean=false; $artifact && clean=false
 printf '{"active":%s,"clean":%s,"filesystem_used_percent":%s,"disk_io_utilization":%s}\n' \
   "$active" "$clean" "$used" "$io_util"
 '''
+
+
+def host_probe_stdin(mode: str, target: str) -> bytes:
+    """The probe body with its arguments on a leading `set --` line, so the worker's sudo command line
+    is `bash -s` alone. Shell-quoted: bash parses the line like any other."""
+    return ("set -- " + " ".join(shlex.quote(arg) for arg in (mode, target)) + "\n").encode() + HOST_PROBE_SCRIPT
+
+
 TAGGED_SESSION_SQL = (
     "SELECT count(*) AS tagged_count FROM pg_stat_activity "
     "WHERE application_name = current_setting('lucida.scenario_tag')"
@@ -2304,10 +2323,9 @@ class LiveProbeSet:
             [
                 "ssh", "-i", LOADGEN_KEY, "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
-                f"nkia@{host}", "sudo", "bash", "-s", "--",
-                str(scenario_id), mode, target,
+                f"nkia@{host}", "sudo", "bash", "-s",
             ],
-            input=HOST_PROBE_SCRIPT,
+            input=host_probe_stdin(mode, target),
             check=True,
             capture_output=True,
             text=False,

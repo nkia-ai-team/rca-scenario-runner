@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,8 @@ from app.live_probes import (
     DB_PROBE_CLIENT,
     DB_PROBE_PYTHON,
     HOST_PROBE_CONTRACTS,
+    HOST_PROBE_JOBS,
+    HOST_PROBE_SCRIPT,
     MYSQL_INDEX_CONTRACT,
     LiveProbeSet,
 )
@@ -358,9 +361,62 @@ def test_host_queries_use_only_measured_worker_and_fixed_probe_script() -> None:
         assert active["value"] is True and clean["value"] is False
         for argv, kwargs in fake.calls:
             assert f"nkia@{host}" in argv
-            assert argv[-3:] == [scenario_id, mode, target]
-            assert kwargs["input"].startswith(b"#!/usr/bin/env bash")
+            # sudo logs exactly what follows it to the worker's auth log (119 syslog, the recording):
+            # nothing may follow `bash -s` (design principle 8). Until 2026-11-12 the scenario id,
+            # mode and target did.
+            assert argv[-3:] == ["sudo", "bash", "-s"]
             assert "StrictHostKeyChecking=yes" in argv
+            assert scenario_id not in " ".join(argv)
+            stdin = kwargs["input"]
+            assert scenario_id.encode() not in stdin and scenario_id.lower().encode() not in stdin
+            preamble, body = stdin.split(b"\n", 1)
+            assert body == HOST_PROBE_SCRIPT and body.startswith(b"#!/usr/bin/env bash")
+            # The worker's bash reads mode and target from the preamble, quoted as given.
+            received = subprocess.run(["bash", "-s"], input=preamble + b'\nprintf "%s\\n" "$@"\n',
+                                      capture_output=True, timeout=30).stdout.decode().split("\n")
+            assert received[:2] == [mode, target]
+
+
+def _host_probe(state_root: Path, mode: str, target: str) -> dict:
+    preamble = ("set -- " + " ".join(shlex.quote(arg) for arg in (mode, target)) + "\n").encode()
+    done = subprocess.run(["bash", "-s"], input=preamble + HOST_PROBE_SCRIPT, capture_output=True, timeout=60,
+                          env={**os.environ, "OPSJOB_STATE_ROOT": str(state_root)})
+    assert done.returncode == 0, done.stderr.decode()
+    return json.loads(done.stdout.decode())
+
+
+def test_host_probe_finds_the_job_by_the_names_host_stress_gives_it() -> None:
+    """The probe reads the pid and artifact files host.stress leaves (testbed-services
+    profiles/host_stress_executor.py, mode -> job name since 2026-10-16), not per-scenario names, so
+    the worker needs no scenario id to answer and its files name nothing."""
+    assert HOST_PROBE_JOBS == {"fio": "iobench", "watermark": "bulkcopy", "pressure": "soak"}
+    for mode, job in HOST_PROBE_JOBS.items():
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state, target = root / "opsjobs", root / "volume"
+            state.mkdir(); target.mkdir()
+            probe_target = "" if mode == "pressure" else str(target)
+            idle = _host_probe(state, mode, probe_target)
+            assert (idle["active"], idle["clean"]) == (False, True), (mode, idle)
+            sleeper = subprocess.Popen(["sleep", "30"])
+            try:
+                (state / f"{job}.pid").write_text(f"{sleeper.pid}\n")
+                if mode == "fio":
+                    (target / f".{job}.dat").write_bytes(b"x")
+                if mode == "watermark":
+                    (target / f".{job}.part").write_bytes(b"x")
+                busy = _host_probe(state, mode, probe_target)
+            finally:
+                sleeper.kill(); sleeper.wait()
+            assert (busy["active"], busy["clean"]) == (True, False), (mode, busy)
+            # The pre-2026-10-16 per-scenario names mean nothing to the probe any more.
+            for leftover in state.iterdir():
+                leftover.unlink()
+            for leftover in target.iterdir():
+                leftover.unlink()
+            (state / "F10-H.pid").write_text(f"{os.getpid()}\n")
+            (target / ".lucida-F10-H-fio").write_bytes(b"x")
+            assert _host_probe(state, mode, probe_target)["clean"] is True
 
 
 def test_filesystem_query_rejects_non_storage_target_and_unknown_scenario() -> None:
