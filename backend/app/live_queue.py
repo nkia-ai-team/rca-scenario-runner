@@ -1738,6 +1738,35 @@ class LiveScenarioQueue:
             "restored_at": seasonal_window.fmt(restored),
         }
 
+    @staticmethod
+    def _parse_golden_observer(
+        result: "subprocess.CompletedProcess[str] | None",
+    ) -> dict[str, Any]:
+        """What the rebooted observer's weekly baseline rests on (Q19 덧붙임 2).
+
+        restore-golden-state.sh reads, before the observer boots, the golden active
+        generation's periodic profile count (golden_stream_periodic_count) and the
+        band strategy sources (observer_band_sources: detection_policy,
+        model_version, active_model_bindings, coverage_overrides). Malformed or
+        missing values are None; the band decision is app.seasonal_window.band_strategy."""
+        empty: dict[str, Any] = {"periodic_count": None, "band_sources": None}
+        if result is None:
+            return empty
+        try:
+            payload = json.loads((result.stdout or "").strip() or "{}")
+        except Exception:
+            return empty
+        if not isinstance(payload, dict):
+            return empty
+        count = payload.get("golden_stream_periodic_count")
+        sources = payload.get("observer_band_sources")
+        return {
+            "periodic_count": count
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0
+            else None,
+            "band_sources": sources if isinstance(sources, dict) else None,
+        }
+
     def _cycle_restore_records(
         self, golden: dict[str, Any] | None, now: datetime
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -1749,15 +1778,28 @@ class LiveScenarioQueue:
         if not self.golden_reset_enabled:
             return None, None
         stream = dict((golden or {}).get("stream") or {})
+        observer = dict((golden or {}).get("observer") or {})
         restored_at = seasonal_window.parse_utc(stream.get("restored_at")) or now
         until = seasonal_window.parse_utc(stream.get("boot_load_until"))
+        if until is not None:
+            # The observer boot-loads the golden generation only while every artifact
+            # of it is unexpired (valid_until_ms <= now is refused); past
+            # boot_load_until it waits for the trainer's next generation.
+            valid = restored_at < until
+        elif stream.get("generation") is not None:
+            # Generation read but no positive valid_until: nothing of it expires.
+            valid = True
+        else:
+            valid = None
+        band = seasonal_window.band_strategy(observer.get("band_sources"))
+        periodic_count = observer.get("periodic_count")
         golden_stream = {
             "generation": stream.get("generation"),
             "boot_load_until": seasonal_window.fmt(until),
             "restored_at": seasonal_window.fmt(restored_at),
-            # The observer boot-loads the golden generation only while every artifact
-            # of it is unexpired; past boot_load_until it waits for the trainer.
-            "valid": (restored_at < until) if until is not None else None,
+            "valid": valid,
+            "periodic_count": periodic_count,
+            "band_strategy": {**band, "sources": observer.get("band_sources")},
         }
         try:
             seasonal = seasonal_window.compute(
@@ -1768,6 +1810,8 @@ class LiveScenarioQueue:
             )
         except Exception as error:  # recording only; never block the cycle
             seasonal = {"status": "error", "error": f"{type(error).__name__}: {error}"}
+        # Whether these cells can reach judgement at all (auto_single + no periodic profiles).
+        seasonal["judgement"] = seasonal_window.judgement(band, periodic_count)
         return golden_stream, seasonal
 
     def _write_cycle_phases(self, state: LiveQueueState) -> None:
@@ -1808,6 +1852,8 @@ class LiveScenarioQueue:
                     "golden_stream_generation": golden_stream.get("generation"),
                     "golden_stream_boot_load_until": golden_stream.get("boot_load_until"),
                     "golden_stream_valid": golden_stream.get("valid"),
+                    "golden_stream_periodic_count": golden_stream.get("periodic_count"),
+                    "observer_band_strategy": golden_stream.get("band_strategy"),
                     "seasonal_window": seasonal,
                 },
                 {"phase": "normal", "start": cycle_start, "end": buffer_start},
@@ -2367,7 +2413,8 @@ class LiveScenarioQueue:
             result = self._run_restore(args)
         identity = self._parse_golden_result(result)
         stream = self._parse_golden_stream(result)
-        return {**(identity or {"id": None, "sha256": None}), "stream": stream}
+        observer = self._parse_golden_observer(result)
+        return {**(identity or {"id": None, "sha256": None}), "stream": stream, "observer": observer}
 
     def _thaw_trainer(self) -> None:
         """Un-freeze the trainer. Fail-open: never block the queue on thaw."""

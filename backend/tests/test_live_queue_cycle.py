@@ -281,6 +281,8 @@ async def test_phases_json_records_actual_cycle_timeline(tmp_path: Path) -> None
         "golden_stream_generation": None,
         "golden_stream_boot_load_until": None,
         "golden_stream_valid": None,
+        "golden_stream_periodic_count": None,
+        "observer_band_strategy": None,
         "seasonal_window": None,
     }
     assert phases["normal"] == {
@@ -463,8 +465,13 @@ async def test_phases_json_carries_golden_sha256_from_restore_result(
         "golden_stream_generation": None,
         "golden_stream_boot_load_until": None,
         "golden_stream_valid": None,
+        "golden_stream_periodic_count": None,
+        "observer_band_strategy": {"value": None, "source": "unknown", "coverage_overrides": None,
+                                   "sources": None},
     }
     assert seasonal["status"] == "ok" and seasonal["end"] == "2026-07-16T08:00:00Z"
+    assert seasonal["judgement"] == {
+        "relevant": None, "reason": "모름(밴드 전략, 주기 프로필 수, 시리즈별 덮어쓰기 수)"}
 
 
 @pytest.mark.parametrize(
@@ -496,7 +503,12 @@ def test_parse_golden_result_tolerates_non_object_stdout() -> None:
 # ---- G2META (Q19 A, B): golden stream validity and the 21-day seasonal window ----
 
 
+NO_BAND_OVERRIDE = {"detection_policy": None, "model_binding": False, "artifact_uri": None,
+                    "artifact_checksum": None, "coverage_overrides": 0}
+
+
 def _g2meta_queue(tmp_path: Path, monkeypatch, restore_payload: dict):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("MODEL_SNAPSHOT_SSH_TARGET", "ydkim@192.168.230.119")
     queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
     restore = FakeRestoreRunner(json.dumps({
@@ -544,13 +556,22 @@ async def test_phases_json_records_golden_stream_validity_and_the_21_day_window(
         "restored_at": "2026-07-16T08:01:00Z",
         "golden_stream_generation": 1985,
         "golden_stream_boot_load_until": "2026-07-20T16:24:00Z",
+        "golden_stream_periodic_count": 0,
+        "observer_band_sources": NO_BAND_OVERRIDE,
     })
     state, reset = await _g2meta_phases(queue, runner, scheduler, clock,
                                         t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    band = {"value": "auto_single", "source": "code_default", "coverage_overrides": 0,
+            "sources": NO_BAND_OVERRIDE}
     assert state.cycle_golden_stream == {
         "generation": 1985, "boot_load_until": "2026-07-20T16:24:00Z",
         "restored_at": "2026-07-16T08:01:00Z", "valid": True,
+        "periodic_count": 0, "band_strategy": band,
     }
+    assert reset["golden_stream_periodic_count"] == 0
+    assert reset["observer_band_strategy"] == band
+    # auto_single with no trainer periodic profile: the cells cannot reach judgement.
+    assert reset["seasonal_window"]["judgement"] == {"relevant": False, "reason": "주기 프로필 0, auto_single"}
     assert reset["golden_id"] == "2026-11-12T164709Z"
     assert reset["golden_stream_generation"] == 1985
     assert reset["golden_stream_boot_load_until"] == "2026-07-20T16:24:00Z"
@@ -585,6 +606,71 @@ async def test_expired_golden_stream_and_a_clean_injection_cell(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
+async def test_golden_stream_valid_boundary_and_a_generation_that_never_expires(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """observer refuses valid_until_ms <= now: a restore exactly at the deadline is
+    invalid. A generation read without any positive valid_until never expires."""
+    queue, runner, scheduler, clock = _g2meta_queue(tmp_path, monkeypatch, {
+        "restored_at": "2026-07-16T08:01:00Z",
+        "golden_stream_generation": 1985,
+        "golden_stream_boot_load_until": "2026-07-16T08:01:00Z",
+    })
+    _, reset = await _g2meta_phases(queue, runner, scheduler, clock,
+                                    t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    assert reset["golden_stream_valid"] is False
+    queue, runner, scheduler, clock = _g2meta_queue(tmp_path / "never", monkeypatch, {
+        "restored_at": "2026-07-16T08:01:00Z",
+        "golden_stream_generation": 1985,
+        "golden_stream_boot_load_until": None,
+    })
+    _, reset = await _g2meta_phases(queue, runner, scheduler, clock,
+                                    t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    assert reset["golden_stream_boot_load_until"] is None and reset["golden_stream_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_periodic_profiles_or_a_legacy_policy_make_the_window_relevant(
+    tmp_path: Path, monkeypatch
+) -> None:
+    queue, runner, scheduler, clock = _g2meta_queue(tmp_path, monkeypatch, {
+        "golden_stream_generation": 1985, "golden_stream_periodic_count": 12,
+        "observer_band_sources": NO_BAND_OVERRIDE,
+    })
+    _, reset = await _g2meta_phases(queue, runner, scheduler, clock,
+                                    t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    assert reset["seasonal_window"]["judgement"] == {"relevant": True, "reason": "주기 프로필 12"}
+    queue, runner, scheduler, clock = _g2meta_queue(tmp_path / "legacy", monkeypatch, {
+        "golden_stream_generation": 1985, "golden_stream_periodic_count": 0,
+        "observer_band_sources": {**NO_BAND_OVERRIDE, "detection_policy": "legacy_envelope"},
+    })
+    _, reset = await _g2meta_phases(queue, runner, scheduler, clock,
+                                    t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    assert reset["observer_band_strategy"]["value"] == "legacy_envelope"
+    assert reset["observer_band_strategy"]["source"] == "detection_policy"
+    assert reset["seasonal_window"]["judgement"] == {"relevant": True, "reason": "밴드 legacy_envelope"}
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"golden_stream_periodic_count": 0, "observer_band_sources": NO_BAND_OVERRIDE},
+         {"periodic_count": 0, "band_sources": NO_BAND_OVERRIDE}),
+        ({}, {"periodic_count": None, "band_sources": None}),
+        ({"golden_stream_periodic_count": True, "observer_band_sources": []},
+         {"periodic_count": None, "band_sources": None}),
+        ({"golden_stream_periodic_count": -1, "observer_band_sources": "x"},
+         {"periodic_count": None, "band_sources": None}),
+    ],
+)
+def test_parse_golden_observer_reads_the_restore_result(payload, expected) -> None:
+    result = subprocess.CompletedProcess(["ssh"], 0, json.dumps(payload), "")
+    assert LiveScenarioQueue._parse_golden_observer(result) == expected
+    assert LiveScenarioQueue._parse_golden_observer(subprocess.CompletedProcess(["ssh"], 0, "[]", "")) == {
+        "periodic_count": None, "band_sources": None}
+
+
+@pytest.mark.asyncio
 async def test_restore_without_stream_fields_falls_back_to_the_queue_clock(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -594,6 +680,8 @@ async def test_restore_without_stream_fields_falls_back_to_the_queue_clock(
                                         t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
     assert state.cycle_golden_stream == {
         "generation": None, "boot_load_until": None, "restored_at": "2026-07-16T08:00:00Z", "valid": None,
+        "periodic_count": None,
+        "band_strategy": {"value": None, "source": "unknown", "coverage_overrides": None, "sources": None},
     }
     assert reset["golden_stream_valid"] is None
     window = reset["seasonal_window"]
@@ -618,7 +706,10 @@ async def test_a_failing_window_computation_never_blocks_the_cycle(tmp_path: Pat
     })
     _, reset = await _g2meta_phases(queue, runner, scheduler, clock,
                                     t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
-    assert reset["seasonal_window"] == {"status": "error", "error": "OSError: runs root unreadable"}
+    assert reset["seasonal_window"] == {
+        "status": "error", "error": "OSError: runs root unreadable",
+        "judgement": {"relevant": None, "reason": "모름(밴드 전략, 주기 프로필 수, 시리즈별 덮어쓰기 수)"},
+    }
     assert reset["golden_stream_valid"] is True
 
 

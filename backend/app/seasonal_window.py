@@ -9,6 +9,13 @@
     그 칸의 버킷이 장애 값이나 끊긴 값으로 학습된다. 이 모듈은 그 칸을 기계로 계산한다.
     녹화 의미는 바꾸지 않는다: 겹쳐도 채점에서 빼지 않고 기록만 한다.
 
+    단 이 칸이 판정에 닿는지는 밴드 전략과 trainer 주기 프로필에 달렸다(Q19 덧붙임 2). observer
+    기본 전략 auto_single 은 168칸 버킷을 쌓지도 쓰지도 않고(detector.go accumulateBucket 이 바로
+    돌아감, 21일 백필도 버킷에 아무것도 쓰지 않음), 주간 기준선을 trainer 주기 프로필에서만 고른다.
+    그래서 auto_single 이고 복원한 세대의 주기 프로필이 0 이며 시리즈별 전략 덮어쓰기가 없으면
+    칸 겹침은 "판정 무관"이다(``judgement``). 그 밖(legacy_envelope, 주기 프로필 있음, 모름)이면
+    원래 뜻의 "오염 칸 겹침"으로 쓴다.
+
 무엇을 읽나
     - 주입: 러너 실행 기록(runs 폴더의 실행마다 result.json, state.json, timeline.json,
       cleanup.json). 구간 규칙은 testbed-scenario-verify 스킬 run_windows.py 의 겹침 규칙과 같다.
@@ -28,6 +35,10 @@
         [--at ISO_UTC] [--days 21]
     python3 seasonal_window.py plan --runs-root DIR [--outages FILE | --outages-json JSON]
         [--from ISO_UTC] [--hours 48] [--lead-min 130] [--days 21]
+        [--band-strategy S --periodic-count N]
+
+    plan 머리에는 판정 관련 여부를 찍는다: 인자로 준 밴드 전략과 주기 프로필 수, 없으면 runs 폴더의
+    가장 최근 phases.json trainer_reset 기록(러너가 복원 때 적은 값).
 
     plan 은 지금부터 N시간 안의 시각 칸마다, 그 시각에 주입을 시작하면(복원은 lead 분 앞) 그
     녹화의 21일 창에서 그 칸과 다음 칸이 깨끗한지를 KST 로 낸다. 러너 호스트(tb-ops)에서:
@@ -50,6 +61,9 @@ DEFAULT_DAYS = 21
 DEFAULT_OUTAGES_PATH = Path("/opt/lucida/scenario-contracts/registry/observation-outages.json")
 # Normal 2h + buffer 10m: the injection starts this long after the golden restore.
 DEFAULT_LEAD = timedelta(minutes=130)
+# observer code default (lucida-next develop-ai streamanomaly service/params.go, 2026-08-03 전환).
+DEFAULT_BAND_STRATEGY = os.environ.get("OBSERVER_DEFAULT_BAND_STRATEGY", "auto_single")
+AUTO_SINGLE = "auto_single"
 OUTAGE_EDGE = timedelta(hours=1)
 HOUR = timedelta(hours=1)
 KST = timezone(timedelta(hours=9))
@@ -335,6 +349,91 @@ def compute(
     return window_report(restored_at, days=days, windows=windows, outages=outages, sources=sources)
 
 
+# ---------------------------------------------------------------- judgement
+
+
+def band_strategy(sources: Any, default: str = DEFAULT_BAND_STRATEGY) -> dict[str, Any]:
+    """The observer's effective global band strategy from what the restore read.
+
+    Precedence as the observer applies it at boot (runner/main.go, runtime.go
+    effectiveParams, model.go bootLoadModel): the stream-anomaly detection policy
+    params over the boot-loaded model artifact's params over the code default. The
+    artifact is merged over the default, and refused (params kept) when its sha256
+    differs from the version checksum. Sources the restore could not read stay
+    unknown rather than falling back to the default."""
+    if not isinstance(sources, dict):
+        return {"value": None, "source": "unknown", "coverage_overrides": None}
+    overrides = sources.get("coverage_overrides")
+    overrides = overrides if isinstance(overrides, int) and not isinstance(overrides, bool) else None
+    policy, binding = sources.get("detection_policy"), sources.get("model_binding")
+    artifact_band = sources.get("artifact_band_strategy")
+    if isinstance(policy, str) and policy:
+        value, source = policy, "detection_policy"
+    elif binding is False:
+        value, source = default, "code_default"
+    elif binding is not True:
+        value, source = None, "unknown"
+    elif sources.get("artifact_read") is not True:
+        value, source = None, "model_artifact_unread"
+    elif sources.get("artifact_checksum_ok") is False:
+        value, source = default, "code_default_artifact_refused"
+    elif sources.get("artifact_checksum_ok") is not True:
+        value, source = None, "model_artifact_unread"
+    elif isinstance(artifact_band, str) and artifact_band:
+        value, source = artifact_band, "model_artifact"
+    else:
+        value, source = default, "code_default_artifact_silent"
+    return {"value": value, "source": source, "coverage_overrides": overrides}
+
+
+def judgement(band: dict[str, Any] | None, periodic_count: Any) -> dict[str, Any]:
+    """Whether the 21-day bucket window can reach the observer's judgement.
+
+    relevant False only when it provably cannot: auto_single (no weekly buckets),
+    zero trainer periodic profiles (no other weekly baseline) and no series that
+    overrides the strategy. Anything unknown stays relevant=None (treated as relevant)."""
+    band = band or {}
+    value, overrides = band.get("value"), band.get("coverage_overrides")
+    known_count = isinstance(periodic_count, int) and not isinstance(periodic_count, bool)
+    if value == AUTO_SINGLE and known_count and periodic_count == 0 and overrides == 0:
+        return {"relevant": False, "reason": "주기 프로필 0, auto_single"}
+    if value is None or not known_count or overrides is None:
+        missing = [name for name, ok in (("밴드 전략", value is not None), ("주기 프로필 수", known_count),
+                                         ("시리즈별 덮어쓰기 수", overrides is not None)) if not ok]
+        return {"relevant": None, "reason": "모름(" + ", ".join(missing) + ")"}
+    parts = []
+    if value != AUTO_SINGLE:
+        parts.append(f"밴드 {value}")
+    if periodic_count:
+        parts.append(f"주기 프로필 {periodic_count}")
+    if overrides:
+        parts.append(f"시리즈별 덮어쓰기 {overrides}")
+    return {"relevant": True, "reason": ", ".join(parts)}
+
+
+def latest_recorded_judgement(runs_root: Path) -> dict[str, Any] | None:
+    """The newest trainer_reset in runs_root/*/phases.json that carries the band record."""
+    best: tuple[datetime, dict[str, Any]] | None = None
+    try:
+        entries = list(runs_root.iterdir())
+    except OSError:
+        return None
+    for run_dir in entries:
+        doc = _load(run_dir / "phases.json") if run_dir.is_dir() else None
+        phases = doc.get("phases") if isinstance(doc, dict) else None
+        reset = next((p for p in phases or [] if isinstance(p, dict) and p.get("phase") == "trainer_reset"), None)
+        if not reset or "observer_band_strategy" not in reset:
+            continue
+        at = parse_utc(reset.get("at"))
+        if at is None or (best is not None and at <= best[0]):
+            continue
+        band = reset.get("observer_band_strategy") or {}
+        best = (at, {"run_id": run_dir.name, "at": fmt(at), "band": band,
+                     "periodic_count": reset.get("golden_stream_periodic_count"),
+                     "judgement": judgement(band, reset.get("golden_stream_periodic_count"))})
+    return best[1] if best else None
+
+
 # --------------------------------------------------------------------- plan
 
 
@@ -393,6 +492,8 @@ def _main(argv: list[str]) -> int:
             p.add_argument("--from", dest="start", default=None, help="ISO UTC (default now)")
             p.add_argument("--hours", type=int, default=48)
             p.add_argument("--lead-min", type=int, default=int(DEFAULT_LEAD.total_seconds() // 60))
+            p.add_argument("--band-strategy", default=None, help="observer band strategy, overrides the record")
+            p.add_argument("--periodic-count", type=int, default=None, help="active generation periodic profiles")
     args = parser.parse_args(argv)
     now = datetime.now(timezone.utc)
     if args.command == "window":
@@ -412,6 +513,25 @@ def _main(argv: list[str]) -> int:
                      windows=windows, outages=outages)
     print(f"# 주입 시작 후보 {args.hours}시간 (KST, 복원은 주입 {args.lead_min}분 앞, 창 {args.days}일)")
     print(f"# 실행 {len(windows)}개, 읽지 못한 실행 폴더 {len(unreadable)}, 정지 기록 {status} {len(outages)}건")
+    if args.band_strategy is not None or args.periodic_count is not None:
+        band = {"value": args.band_strategy, "source": "argument", "coverage_overrides": 0}
+        verdict = judgement(band, args.periodic_count)
+        basis = f"인자(밴드 {args.band_strategy}, 주기 프로필 {args.periodic_count}, 시리즈별 덮어쓰기 0 가정)"
+    else:
+        record = latest_recorded_judgement(args.runs_root)
+        if record is None:
+            verdict = {"relevant": None, "reason": "복원 기록 없음"}
+            basis = "runs 폴더에 밴드 기록이 있는 phases.json 이 없다(G2META 러너 배포 전). --band-strategy, --periodic-count 로 줄 수 있다"
+        else:
+            verdict = record["judgement"]
+            band = record["band"]
+            basis = (f"최근 복원 기록 {record['run_id']} {parse_utc(record['at']).astimezone(KST):%m-%d %H:%M} KST, "
+                     f"밴드 {band.get('value')}({band.get('source')}), 주기 프로필 {record['periodic_count']}")
+    if verdict["relevant"] is False:
+        print(f"# 판정 관련: 무관({verdict['reason']}). 21일 창 칸은 판정에 닿지 않아 주입 시각 제약이 없다. 근거: {basis}")
+    else:
+        word = "관련" if verdict["relevant"] else "모름, 관련으로 본다"
+        print(f"# 판정 관련: {word}({verdict['reason']}). 아래 깨끗한 칸에서 고른다. 근거: {basis}")
     print("주입 시작 KST | 칸 | 이 칸 | 다음 칸 | 오염 출처")
     for row in rows:
         mark = "깨끗" if row["clean"] else "오염"

@@ -287,3 +287,93 @@ def test_cli_runs_from_stdin_with_only_the_standard_library(tmp_path: Path) -> N
     assert window["sources"]["outages_path"] == "inline"
     assert [c["runs"] for c in window["injection_cells"]] == [["F51-H-run-1"]]
     assert {c["cell"] for c in window["outage_cells"]} == {5 * 24 + 16, 5 * 24 + 17, 24 + 8, 24 + 9}
+
+
+# ------------------------------------------------- judgement (Q19 덧붙임 2)
+
+NO_OVERRIDE = {"detection_policy": None, "model_binding": False, "artifact_uri": None, "artifact_checksum": None,
+               "coverage_overrides": 0}
+BOUND = {**NO_OVERRIDE, "model_binding": True, "artifact_uri": "stream-anomaly/global/v1/model.json",
+         "artifact_checksum": "a" * 64}
+
+
+@pytest.mark.parametrize(
+    ("sources", "expected"),
+    [
+        (None, ("unknown", None, None)),
+        (NO_OVERRIDE, ("code_default", "auto_single", 0)),
+        ({**BOUND, "detection_policy": "legacy_envelope", "artifact_read": True, "artifact_checksum_ok": True,
+          "artifact_band_strategy": "auto_single"}, ("detection_policy", "legacy_envelope", 0)),
+        ({**BOUND, "artifact_read": True, "artifact_checksum_ok": True, "artifact_band_strategy": "legacy_envelope"},
+         ("model_artifact", "legacy_envelope", 0)),
+        # 119 on 2026-11-13: the v1 artifact's sha256 differs from the version checksum, so the
+        # observer keeps its default params whatever the artifact says.
+        ({**BOUND, "artifact_read": True, "artifact_checksum_ok": False, "artifact_band_strategy": "legacy_envelope"},
+         ("code_default_artifact_refused", "auto_single", 0)),
+        ({**BOUND, "artifact_read": True, "artifact_checksum_ok": True, "artifact_band_strategy": None},
+         ("code_default_artifact_silent", "auto_single", 0)),
+        ({**BOUND, "artifact_read": False, "artifact_checksum_ok": None}, ("model_artifact_unread", None, 0)),
+        (BOUND, ("model_artifact_unread", None, 0)),
+        ({**BOUND, "artifact_read": True, "artifact_checksum_ok": None}, ("model_artifact_unread", None, 0)),
+        ({**NO_OVERRIDE, "model_binding": None, "coverage_overrides": True}, ("unknown", None, None)),
+        ({**NO_OVERRIDE, "detection_policy": "", "coverage_overrides": 3}, ("code_default", "auto_single", 3)),
+    ],
+)
+def test_band_strategy_follows_the_observer_precedence(sources, expected) -> None:
+    band = sw.band_strategy(sources)
+    assert (band["source"], band["value"], band["coverage_overrides"]) == expected
+
+
+def test_judgement_is_irrelevant_only_when_provably_so() -> None:
+    auto = sw.band_strategy(NO_OVERRIDE)
+    assert sw.judgement(auto, 0) == {"relevant": False, "reason": "주기 프로필 0, auto_single"}
+    assert sw.judgement(auto, 5) == {"relevant": True, "reason": "주기 프로필 5"}
+    assert sw.judgement({**auto, "coverage_overrides": 2}, 0) == {"relevant": True, "reason": "시리즈별 덮어쓰기 2"}
+    legacy = sw.band_strategy({**NO_OVERRIDE, "detection_policy": "legacy_envelope"})
+    assert sw.judgement(legacy, 0) == {"relevant": True, "reason": "밴드 legacy_envelope"}
+    assert sw.judgement(auto, None) == {"relevant": None, "reason": "모름(주기 프로필 수)"}
+    assert sw.judgement(auto, True)["relevant"] is None
+    assert sw.judgement(None, 0) == {"relevant": None, "reason": "모름(밴드 전략, 시리즈별 덮어쓰기 수)"}
+
+
+def _phases(run_dir: Path, at: str, **reset) -> None:
+    write(run_dir, "phases.json", {"phases": [{"phase": "trainer_reset", "at": at, **reset},
+                                              {"phase": "normal", "start": at, "end": at}]})
+
+
+def test_latest_recorded_judgement_takes_the_newest_band_record(tmp_path: Path) -> None:
+    band = {"value": "auto_single", "source": "code_default", "coverage_overrides": 0, "sources": NO_OVERRIDE}
+    _phases(tmp_path / "A-run-1", "2026-11-13T04:00:00Z", observer_band_strategy=band, golden_stream_periodic_count=0)
+    _phases(tmp_path / "B-run-1", "2026-11-14T04:00:00Z", observer_band_strategy=band, golden_stream_periodic_count=7)
+    _phases(tmp_path / "C-run-1", "2026-11-15T04:00:00Z", golden_id="g")  # older runner: no band record
+    (tmp_path / "cycle-topology").mkdir()
+    record = sw.latest_recorded_judgement(tmp_path)
+    assert record["run_id"] == "B-run-1" and record["periodic_count"] == 7
+    assert record["judgement"] == {"relevant": True, "reason": "주기 프로필 7"}
+    assert sw.latest_recorded_judgement(tmp_path / "absent") is None
+
+
+def _plan(runs: Path, *extra: str) -> list[str]:
+    return subprocess.run(
+        [sys.executable, "-I", str(MODULE), "plan", "--runs-root", str(runs), "--outages-json", '{"outages": []}',
+         "--from", "2026-11-18T05:30:00Z", "--hours", "1", *extra],
+        capture_output=True, text=True, check=True, cwd=runs.parent,
+    ).stdout.splitlines()
+
+
+def test_plan_header_states_whether_the_cells_reach_judgement(tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    assert _plan(runs)[2] == (
+        "# 판정 관련: 모름, 관련으로 본다(복원 기록 없음). 아래 깨끗한 칸에서 고른다. 근거: runs 폴더에 "
+        "밴드 기록이 있는 phases.json 이 없다(G2META 러너 배포 전). --band-strategy, --periodic-count 로 줄 수 있다")
+    assert _plan(runs, "--band-strategy", "auto_single", "--periodic-count", "0")[2] == (
+        "# 판정 관련: 무관(주기 프로필 0, auto_single). 21일 창 칸은 판정에 닿지 않아 주입 시각 제약이 없다. "
+        "근거: 인자(밴드 auto_single, 주기 프로필 0, 시리즈별 덮어쓰기 0 가정)")
+    band = {"value": "auto_single", "source": "code_default", "coverage_overrides": 0, "sources": NO_OVERRIDE}
+    _phases(runs / "A-run-1", "2026-11-13T04:00:00Z", observer_band_strategy=band, golden_stream_periodic_count=0)
+    assert _plan(runs)[2] == (
+        "# 판정 관련: 무관(주기 프로필 0, auto_single). 21일 창 칸은 판정에 닿지 않아 주입 시각 제약이 없다. "
+        "근거: 최근 복원 기록 A-run-1 11-13 13:00 KST, 밴드 auto_single(code_default), 주기 프로필 0")
+    _phases(runs / "B-run-1", "2026-11-14T04:00:00Z", observer_band_strategy=band, golden_stream_periodic_count=4)
+    assert _plan(runs)[2].startswith("# 판정 관련: 관련(주기 프로필 4). 아래 깨끗한 칸에서 고른다.")
