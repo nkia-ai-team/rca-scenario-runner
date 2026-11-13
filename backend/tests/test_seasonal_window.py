@@ -334,6 +334,11 @@ def test_judgement_is_irrelevant_only_when_provably_so() -> None:
     assert sw.judgement(auto, None) == {"relevant": None, "reason": "모름(주기 프로필 수)"}
     assert sw.judgement(auto, True)["relevant"] is None
     assert sw.judgement(None, 0) == {"relevant": None, "reason": "모름(밴드 전략, 시리즈별 덮어쓰기 수)"}
+    # auto_single and no periodic profile, but the series overrides were not counted:
+    # unknown, never "irrelevant" (G2META 3회차, 재리뷰 하 2).
+    assert sw.judgement({**auto, "coverage_overrides": None}, 0) == {
+        "relevant": None, "reason": "모름(시리즈별 덮어쓰기 수)"}
+    assert sw.judgement(sw.band_strategy({**NO_OVERRIDE, "coverage_overrides": "0"}), 0)["relevant"] is None
 
 
 def _phases(run_dir: Path, at: str, **reset) -> None:

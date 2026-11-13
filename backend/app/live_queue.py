@@ -1747,8 +1747,10 @@ class LiveScenarioQueue:
         restore-golden-state.sh reads, before the observer boots, the golden active
         generation's periodic profile count (golden_stream_periodic_count) and the
         band strategy sources (observer_band_sources: detection_policy,
-        model_version, active_model_bindings, coverage_overrides). Malformed or
-        missing values are None; the band decision is app.seasonal_window.band_strategy."""
+        model_binding, artifact_uri, artifact_checksum, coverage_overrides and, once
+        the observer is up, artifact_read, artifact_checksum_ok,
+        artifact_band_strategy). Malformed or missing values are None; the band
+        decision is app.seasonal_window.band_strategy."""
         empty: dict[str, Any] = {"periodic_count": None, "band_sources": None}
         if result is None:
             return empty
