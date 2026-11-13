@@ -73,6 +73,17 @@ class IncidentCloseError(RuntimeError):
         )
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect. urllib turns a POST answered with 301, 302 or
+    303 into a GET of the new location, and a 200 there would count as a
+    close that never happened. None of these APIs redirects today (the
+    observer proxy maps 3xx to 503), so a redirect is an error to surface:
+    urllib then raises HTTPError with the 3xx code."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class _Endpoints:
     def __init__(self, *, query_url: str, incidents_url: str, origin: str):
         self.query_url = query_url
@@ -135,7 +146,9 @@ def _session(*, query_url, observer_url, incidents_url, username, password, open
     if not username or not password:
         raise RuntimeError("LUCIDA_LOGIN_USER/LUCIDA_LOGIN_PASSWORD are not configured")
     if opener_factory is None:
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()), _RefuseRedirect()
+        )
     else:
         opener = opener_factory()
     login = urllib.request.Request(
@@ -163,9 +176,17 @@ def _open_incidents(opener, endpoints: _Endpoints) -> list[dict]:
             document = json.loads(response.read())
         if isinstance(document, list):
             items, next_cursor = document, ""
-        else:
-            items = document.get("incidents") or document.get("items") or []
+        elif isinstance(document, dict) and isinstance(
+            document.get("items", document.get("incidents")), list
+        ):
+            items = document.get("items", document.get("incidents"))
             next_cursor = str(document.get("nextCursor") or "")
+        else:
+            # A 200 that is not an incident list (a wrong LUCIDA_INCIDENTS_URL,
+            # a portal page) used to read as zero open incidents: a false clean
+            # that would let the gate pass. Refuse it instead.
+            keys = sorted(document)[:10] if isinstance(document, dict) else type(document).__name__
+            raise RuntimeError(f"incident list response from {url} has no items list: {keys}")
         # The status filter is the server's; keep the client check so an older
         # observer that ignores it still cannot count a closed incident.
         found.extend(
@@ -231,6 +252,11 @@ def _close_one(opener, endpoints: _Endpoints, incident_id: str) -> str | None:
         with opener.open(close, timeout=_TIMEOUT_SEC) as response:
             if response.status >= 300:
                 return f"HTTP {response.status}"
+            # Second guard for an opener that does follow redirects (an
+            # injected one): an answer from another URL is not this close.
+            final_url = getattr(response, "geturl", lambda: close.full_url)()
+            if final_url != close.full_url:
+                return f"redirected to {final_url}"
     except urllib.error.HTTPError as error:
         body = b""
         try:

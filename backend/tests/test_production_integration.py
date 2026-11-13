@@ -973,6 +973,20 @@ def test_capture_end_close_records_closed_and_refused_incidents(tmp_path, monkey
     assert "failed" not in record and "error" not in record
 
 
+    # Login or listing failure: still fail-open, still recorded and logged.
+    def login_fails():
+        raise RuntimeError("lucida login failed: HTTP 401")
+
+    monkeypatch.setattr("app.incident_close.close_open_incidents", login_fails)
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="app.production_runtime"):
+        invoker._close_open_incidents(SimpleNamespace(run_id="run-close"))
+    record = json.loads((runs / "run-close" / "incidents-closed.json").read_text())
+    assert record["error"] == "RuntimeError: lucida login failed: HTTP 401"
+    assert "closed" not in record
+    assert "capture-end incident close for run-close: lucida login failed" in caplog.text
+
+
 async def test_capture_worker_isolates_one_failed_job_and_completes_another(tmp_path) -> None:
     jobs = {
         "failed": SimpleNamespace(run_id="failed", status="pending"),

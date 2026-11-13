@@ -566,6 +566,11 @@ async def test_dirty_preflight_rechecks_every_five_minutes_then_skips(tmp_path: 
     assert state.phase == "running"
     assert state.preflight_attempts == 1
     assert state.preflight_retry_not_before is not None
+    # The wait reason names the failing check and its value, not only "(dirty)".
+    assert state.reason == (
+        f"preflight not clean (dirty): active_alarms=1 (fail, eq 0); "
+        f"recheck 1/{PREFLIGHT_MAX_ATTEMPTS}"
+    )
 
     state = await queue.tick()  # before recheck interval: no re-evaluation
     assert state.preflight_attempts == 1
@@ -585,6 +590,52 @@ async def test_dirty_preflight_rechecks_every_five_minutes_then_skips(tmp_path: 
     assert state.skipped_scenario_ids == ["F01-R"]
     assert state.next_index == 1
     assert state.preflight_attempts == 0
+    assert state.reason == (
+        "preflight timeout: skipped F01-R (dirty): active_alarms=1 (fail, eq 0)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_v2_wait_and_skip_reasons_carry_a_refused_incident_sweep(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Review K3SEP M1: the v2 gate's wait and skip reasons are where an
+    operator reads why a scenario never injected; a refused sweep must show."""
+    from app.incident_close import IncidentCloseError
+
+    def refuse():
+        raise IncidentCloseError(
+            closed=[],
+            failed=[{"id": "inc-1", "status": "active", "title": "t",
+                     "error": 'HTTP 403 {"message":"forbidden origin"}'}],
+        )
+
+    monkeypatch.setattr("app.incident_close.close_open_incidents", refuse)
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.preflight_probe = FakePreflightProbe(
+        {**FakePreflightProbe.CLEAN, "open_incidents": 3}
+    )
+    await queue.start()
+
+    state = await queue.tick()
+    assert runner.started == []
+    assert state.reason.startswith(
+        "preflight not clean (dirty): open_incidents=3 (fail, eq 0); "
+        "incident sweep failed: IncidentCloseError: incident close failed for 1 of 1"
+    )
+    assert "forbidden origin" in state.reason
+    assert state.reason.endswith(f"; recheck 1/{PREFLIGHT_MAX_ATTEMPTS}")
+    assert json.loads(queue.state_path.read_text())["reason"] == state.reason
+
+    for _ in range(2, PREFLIGHT_MAX_ATTEMPTS + 1):
+        clock.value += timedelta(minutes=5)
+        state = await queue.tick()
+    assert state.skipped_scenario_ids == ["F01-R"]
+    assert state.reason.startswith(
+        "preflight timeout: skipped F01-R (dirty): open_incidents=3 (fail, eq 0); "
+        "incident sweep failed: IncidentCloseError"
+    )
+    assert "forbidden origin" in state.reason
 
 
 @pytest.mark.asyncio

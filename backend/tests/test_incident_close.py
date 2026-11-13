@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import urllib.error
 import urllib.parse
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -39,6 +41,8 @@ class FakeOpener:
         collection="http://o/api/v1/incidents",
         allowed_origins=("http://q",),
         refuse=(),
+        unreachable=(),
+        redirect=(),
     ):
         if pages is None:
             pages = [incidents or []]
@@ -46,17 +50,21 @@ class FakeOpener:
         self.collection = collection
         self.allowed_origins = set(allowed_origins)
         self.refuse = set(refuse)
+        self.unreachable = set(unreachable)
+        self.redirect = set(redirect)
         self.requests = []
         self.headers = []
 
     @contextmanager
-    def _response(self, status, body=b""):
+    def _response(self, status, body=b"", final_url=None):
         class Response:
             pass
 
         response = Response()
         response.status = status
         response.read = lambda: body
+        if final_url is not None:
+            response.geturl = lambda: final_url
         yield response
 
     def open(self, request, timeout=None):
@@ -85,6 +93,11 @@ class FakeOpener:
                 raise urllib.error.HTTPError(
                     url, 403, "Forbidden", {}, io.BytesIO(b'{"message":"forbidden origin"}')
                 )
+            if incident_id in self.unreachable:
+                raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+            if incident_id in self.redirect:
+                # An opener that followed a redirect lands on another page with 200.
+                return self._response(200, final_url="http://q/login")
             if incident_id in self.refuse:
                 raise urllib.error.HTTPError(
                     url, 403, "Forbidden", {}, io.BytesIO(b'{"message":"permission denied"}')
@@ -257,6 +270,120 @@ def test_a_cookie_only_close_is_a_reported_failure_not_a_silent_one(monkeypatch)
     with pytest.raises(IncidentCloseError, match="forbidden origin"):
         close_open_incidents(query_url="http://q", observer_url="http://o",
                              username="u", password="p", opener_factory=lambda: opener)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [{"total": 0}, {"items": None, "nextCursor": ""}, {"message": "ok"}, "ok"],
+)
+def test_a_200_that_is_not_an_incident_list_is_an_error_not_zero(document):
+    """Review K3SEP L-a: a wrong LUCIDA_INCIDENTS_URL that answers 200 with
+    other JSON used to read as zero open incidents, a false clean."""
+
+    class Other(FakeOpener):
+        def open(self, request, timeout=None):
+            if request.get_method() == "GET":
+                return self._response(200, json.dumps(document).encode())
+            return super().open(request, timeout)
+
+    opener = Other([])
+    with pytest.raises(RuntimeError, match="has no items list"):
+        open_incident_count(query_url="http://q", observer_url="http://o",
+                            username="u", password="p", opener_factory=lambda: opener)
+
+
+def test_an_empty_items_list_is_zero():
+    """The live empty answer (119, 11-13): {"items":[],"nextCursor":"","total":0}."""
+    opener = FakeOpener([])
+    assert open_incident_count(query_url="http://q", observer_url="http://o",
+                               username="u", password="p", opener_factory=lambda: opener) == 0
+
+
+def test_a_close_that_cannot_connect_is_reported_with_its_error():
+    opener = FakeOpener(
+        [{"id": "a1", "status": "active"}, {"id": "b2", "status": "active"}],
+        unreachable=("a1",),
+    )
+    with pytest.raises(IncidentCloseError) as raised:
+        close_open_incidents(query_url="http://q", observer_url="http://o",
+                             username="u", password="p", opener_factory=lambda: opener)
+    assert [item["id"] for item in raised.value.closed] == ["b2"]
+    assert raised.value.failed[0]["id"] == "a1"
+    assert raised.value.failed[0]["error"].startswith("URLError: ")
+    assert "Connection refused" in raised.value.failed[0]["error"]
+
+
+def test_a_close_answered_from_another_url_is_not_a_close():
+    opener = FakeOpener([{"id": "a1", "status": "active"}], redirect=("a1",))
+    with pytest.raises(IncidentCloseError, match="redirected to http://q/login"):
+        close_open_incidents(query_url="http://q", observer_url="http://o",
+                             username="u", password="p", opener_factory=lambda: opener)
+
+
+class _LucidaStub(BaseHTTPRequestHandler):
+    """Real HTTP for the default opener: login sets a cookie, the list serves
+    one active incident, and the close answers 302 like a login redirect."""
+
+    seen: list[tuple[str, str, dict]] = []
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body=b"", headers=()):
+        self.send_response(code)
+        for key, value in headers:
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self.seen.append(("POST", self.path, dict(self.headers)))
+        if self.path == "/api/v1/login":
+            self._send(200, b"{}", [("Set-Cookie", "lucida_session=s1; Path=/")])
+        elif self.path.endswith("/close"):
+            self._send(302, b"", [("Location", "/api/v1/ai/incidents")])
+        else:
+            self._send(404)
+
+    def do_GET(self):
+        self.seen.append(("GET", self.path, dict(self.headers)))
+        if self.path.startswith("/api/v1/ai/incidents?"):
+            body = json.dumps({"items": [{"id": "a1", "status": "active"}],
+                               "nextCursor": "", "total": 1}).encode()
+            self._send(200, body)
+        else:
+            self._send(404)
+
+
+def test_the_default_opener_does_not_follow_a_redirect_on_close(monkeypatch):
+    """Review K3SEP L-c: urllib would turn the POST into a GET of the
+    Location and count its 200 as a close. Over real HTTP, with the default
+    opener, the 302 must be a reported failure and nothing must be fetched."""
+    _LucidaStub.seen = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _LucidaStub)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        monkeypatch.setenv("LUCIDA_QUERY_URL", base)
+        with pytest.raises(IncidentCloseError, match="HTTP 302"):
+            close_open_incidents(username="u", password="p")
+    finally:
+        server.shutdown()
+        server.server_close()
+    methods = [(method, path.split("?")[0]) for method, path, _headers in _LucidaStub.seen]
+    assert methods == [
+        ("POST", "/api/v1/login"),
+        ("GET", "/api/v1/ai/incidents"),
+        ("POST", "/api/v1/ai/incidents/a1/close"),
+    ]
+    close_headers = _LucidaStub.seen[2][2]
+    assert close_headers["Origin"] == base
+    assert close_headers["Referer"] == base + "/"
+    assert "lucida_session=s1" in close_headers["Cookie"]
 
 
 def test_missing_credentials_raise(monkeypatch):
