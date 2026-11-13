@@ -271,7 +271,18 @@ async def test_phases_json_records_actual_cycle_timeline(tmp_path: Path) -> None
     assert doc["capture_end"] == "2026-07-16T10:45:00Z"        # t2 + 30m
     phases = {p["phase"]: p for p in doc["phases"]}
     assert phases["trainer_reset"]["at"] == "2026-07-16T08:00:00Z"
-    assert set(phases["trainer_reset"]) == {"phase", "at", "golden_id", "golden_sha256"}
+    # G2META (Q19 A, B): the golden stream and 21-day window fields are always
+    # present; with golden reset off no observer was rebooted, so all are null.
+    assert phases["trainer_reset"] == {
+        "phase": "trainer_reset",
+        "at": "2026-07-16T08:00:00Z",
+        "golden_id": None,
+        "golden_sha256": None,
+        "golden_stream_generation": None,
+        "golden_stream_boot_load_until": None,
+        "golden_stream_valid": None,
+        "seasonal_window": None,
+    }
     assert phases["normal"] == {
         "phase": "normal", "start": "2026-07-16T08:00:00Z", "end": "2026-07-16T10:00:00Z",
     }
@@ -442,12 +453,18 @@ async def test_phases_json_carries_golden_sha256_from_restore_result(
 
     doc = json.loads((runner.artifact_store.root / run_id / "phases.json").read_text())
     reset = next(p for p in doc["phases"] if p["phase"] == "trainer_reset")
+    seasonal = reset.pop("seasonal_window")
     assert reset == {
         "phase": "trainer_reset",
         "at": "2026-07-16T08:00:00Z",
         "golden_id": "golden-0900",
         "golden_sha256": GOLDEN_SHA,
+        # A restore result without the G2META stream fields leaves them unknown.
+        "golden_stream_generation": None,
+        "golden_stream_boot_load_until": None,
+        "golden_stream_valid": None,
     }
+    assert seasonal["status"] == "ok" and seasonal["end"] == "2026-07-16T08:00:00Z"
 
 
 @pytest.mark.parametrize(
@@ -474,6 +491,165 @@ def test_parse_golden_result_reads_golden_sha256(payload, expected) -> None:
 def test_parse_golden_result_tolerates_non_object_stdout() -> None:
     result = subprocess.CompletedProcess(["ssh"], 0, "[]", "")
     assert LiveScenarioQueue._parse_golden_result(result) is None
+
+
+# ---- G2META (Q19 A, B): golden stream validity and the 21-day seasonal window ----
+
+
+def _g2meta_queue(tmp_path: Path, monkeypatch, restore_payload: dict):
+    monkeypatch.setenv("MODEL_SNAPSHOT_SSH_TARGET", "ydkim@192.168.230.119")
+    queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
+    restore = FakeRestoreRunner(json.dumps({
+        "action": "restore-golden", "status": "ok",
+        "golden_dir": "/data/eval-cases/goldens/2026-11-12T164709Z", "golden_sha256": GOLDEN_SHA,
+        **restore_payload,
+    }))
+    ssh_key = queue.state_path.parent / "ssh_key"
+    ssh_key.write_text("key", encoding="utf-8")
+    queue.golden_reset_enabled = True
+    queue.restore_retry_delay_sec = 0
+    queue._restore_runner = restore  # type: ignore[assignment]
+    queue.required_paths["ssh_key"] = ssh_key
+    ledger = tmp_path / "observation-outages.json"
+    ledger.write_text(json.dumps({"outages": [{
+        "id": "observer-stop", "start": "2026-07-12T03:30:00Z", "end": "2026-07-13T05:20:00Z",
+        "source": "test ledger"}]}), encoding="utf-8")
+    queue.observation_outages_path = ledger
+    root = runner.artifact_store.root
+    # A week earlier, same Thursday 10 UTC cell as this cycle's injection.
+    for name, t1, t2 in (
+        ("F72-R-run-aaaa0001", "2026-07-09T10:05:00Z", "2026-07-09T10:40:00Z"),
+        # Older than 21 days before the restore: outside the window.
+        ("F63-R-run-aaaa0002", "2026-06-20T10:05:00Z", "2026-06-20T10:30:00Z"),
+    ):
+        (root / name).mkdir(parents=True)
+        (root / name / "result.json").write_text(json.dumps({"t1": t1, "t2": t2}), encoding="utf-8")
+    return queue, runner, scheduler, clock
+
+
+async def _g2meta_phases(queue, runner, scheduler, clock, *, t1, t2):
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+    _complete_injection(runner, scheduler, clock, run_id, t1=t1, t2=t2)
+    await queue.tick()  # -> cooldown, writes phases.json
+    doc = json.loads((runner.artifact_store.root / run_id / "phases.json").read_text())
+    return state, next(p for p in doc["phases"] if p["phase"] == "trainer_reset")
+
+
+@pytest.mark.asyncio
+async def test_phases_json_records_golden_stream_validity_and_the_21_day_window(
+    tmp_path: Path, monkeypatch
+) -> None:
+    queue, runner, scheduler, clock = _g2meta_queue(tmp_path, monkeypatch, {
+        "restored_at": "2026-07-16T08:01:00Z",
+        "golden_stream_generation": 1985,
+        "golden_stream_boot_load_until": "2026-07-20T16:24:00Z",
+    })
+    state, reset = await _g2meta_phases(queue, runner, scheduler, clock,
+                                        t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    assert state.cycle_golden_stream == {
+        "generation": 1985, "boot_load_until": "2026-07-20T16:24:00Z",
+        "restored_at": "2026-07-16T08:01:00Z", "valid": True,
+    }
+    assert reset["golden_id"] == "2026-11-12T164709Z"
+    assert reset["golden_stream_generation"] == 1985
+    assert reset["golden_stream_boot_load_until"] == "2026-07-20T16:24:00Z"
+    assert reset["golden_stream_valid"] is True
+    window = reset["seasonal_window"]
+    # The window ends at the restore the result reports, not the queue clock.
+    assert (window["status"], window["days"], window["start"], window["end"]) == (
+        "ok", 21, "2026-06-25T08:01:00Z", "2026-07-16T08:01:00Z")
+    thu, sun, mon = 4 * 24, 0, 24
+    assert window["injection_cells"] == [{"cell": thu + 10, "kst": "목 19시", "runs": ["F72-R-run-aaaa0001"]}]
+    assert [c["cell"] for c in window["outage_cells"]] == [sun + 3, sun + 4, mon + 5, mon + 6]
+    assert [r["run_id"] for r in window["runs_counted"]] == ["F72-R-run-aaaa0001"]
+    assert window["sources"]["outages_status"] == "ok"
+    assert window["this_injection_cells"] == [{"cell": thu + 10, "kst": "목 19시"}]
+    assert window["overlap"] is True
+    assert window["overlap_cells"] == [{"cell": thu + 10, "kst": "목 19시"}]
+
+
+@pytest.mark.asyncio
+async def test_expired_golden_stream_and_a_clean_injection_cell(tmp_path: Path, monkeypatch) -> None:
+    queue, runner, scheduler, clock = _g2meta_queue(tmp_path, monkeypatch, {
+        "restored_at": "2026-07-16T08:01:00Z",
+        "golden_stream_generation": 1985,
+        # Seven days after the capture: the observer refuses the golden generation.
+        "golden_stream_boot_load_until": "2026-07-16T08:00:59Z",
+    })
+    _, reset = await _g2meta_phases(queue, runner, scheduler, clock,
+                                    t1="2026-07-16T11:10:00Z", t2="2026-07-16T11:15:00Z")
+    assert reset["golden_stream_valid"] is False
+    assert reset["seasonal_window"]["overlap"] is False
+    assert reset["seasonal_window"]["overlap_cells"] == []
+
+
+@pytest.mark.asyncio
+async def test_restore_without_stream_fields_falls_back_to_the_queue_clock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    queue, runner, scheduler, clock = _g2meta_queue(tmp_path, monkeypatch, {})
+    queue.observation_outages_path = tmp_path / "absent.json"
+    state, reset = await _g2meta_phases(queue, runner, scheduler, clock,
+                                        t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    assert state.cycle_golden_stream == {
+        "generation": None, "boot_load_until": None, "restored_at": "2026-07-16T08:00:00Z", "valid": None,
+    }
+    assert reset["golden_stream_valid"] is None
+    window = reset["seasonal_window"]
+    assert window["end"] == "2026-07-16T08:00:00Z"
+    assert window["sources"]["outages_status"] == "missing"
+    assert window["outage_cells"] == []
+    assert any("관측 정지 기록을 읽지 못했다" in line for line in window["limits"])
+
+
+@pytest.mark.asyncio
+async def test_a_failing_window_computation_never_blocks_the_cycle(tmp_path: Path, monkeypatch) -> None:
+    from app import seasonal_window
+
+    def boom(*_args, **_kwargs):
+        raise OSError("runs root unreadable")
+
+    monkeypatch.setattr(seasonal_window, "compute", boom)
+    queue, runner, scheduler, clock = _g2meta_queue(tmp_path, monkeypatch, {
+        "restored_at": "2026-07-16T08:01:00Z",
+        "golden_stream_generation": 1985,
+        "golden_stream_boot_load_until": "2026-07-20T16:24:00Z",
+    })
+    _, reset = await _g2meta_phases(queue, runner, scheduler, clock,
+                                    t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    assert reset["seasonal_window"] == {"status": "error", "error": "OSError: runs root unreadable"}
+    assert reset["golden_stream_valid"] is True
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"golden_stream_generation": 1985, "golden_stream_boot_load_until": "2026-11-19T16:24:00Z",
+          "restored_at": "2026-11-12T19:00:00Z"},
+         {"generation": 1985, "boot_load_until": "2026-11-19T16:24:00Z", "restored_at": "2026-11-12T19:00:00Z"}),
+        # KST offsets are normalized to UTC.
+        ({"golden_stream_generation": 0, "golden_stream_boot_load_until": "2026-11-20T01:24:00+09:00"},
+         {"generation": 0, "boot_load_until": "2026-11-19T16:24:00Z", "restored_at": None}),
+        ({}, {"generation": None, "boot_load_until": None, "restored_at": None}),
+        ({"golden_stream_generation": True, "golden_stream_boot_load_until": "2026-11-19 16:24"},
+         {"generation": None, "boot_load_until": None, "restored_at": None}),
+        ({"golden_stream_generation": -1, "golden_stream_boot_load_until": "2026-11-19T16:24:00"},
+         {"generation": None, "boot_load_until": None, "restored_at": None}),
+        ({"golden_stream_generation": "1985", "restored_at": 5},
+         {"generation": None, "boot_load_until": None, "restored_at": None}),
+    ],
+)
+def test_parse_golden_stream_reads_the_restore_result(payload, expected) -> None:
+    result = subprocess.CompletedProcess(["ssh"], 0, json.dumps(payload), "")
+    assert LiveScenarioQueue._parse_golden_stream(result) == expected
+
+
+def test_parse_golden_stream_tolerates_non_object_stdout() -> None:
+    empty = {"generation": None, "boot_load_until": None, "restored_at": None}
+    assert LiveScenarioQueue._parse_golden_stream(subprocess.CompletedProcess(["ssh"], 0, "[]", "")) == empty
+    assert LiveScenarioQueue._parse_golden_stream(subprocess.CompletedProcess(["ssh"], 0, "not json", "")) == empty
+    assert LiveScenarioQueue._parse_golden_stream(None) == empty
 
 
 @pytest.mark.asyncio

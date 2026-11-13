@@ -19,7 +19,7 @@ from contextlib import suppress
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -51,6 +51,7 @@ from app.preflight import (
     evaluate_preflight,
 )
 from app.runner import ScenarioRunner, get_runner
+from app import seasonal_window
 
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -262,6 +263,12 @@ class LiveQueueState(StrictModel):
     cycle_restart_counts: dict[str, int] = Field(default_factory=dict)
     cycle_golden_id: str | None = None
     cycle_golden_sha256: str | None = None
+    # Golden stream generation the restore put back and whether the observer could
+    # still boot-load it (Q19 B): {generation, boot_load_until, restored_at, valid}.
+    cycle_golden_stream: dict[str, Any] | None = None
+    # Injection and outage cells inside the restore's 21-day seasonal backfill
+    # window (Q19 A, app.seasonal_window). None when no golden restore ran.
+    cycle_seasonal_window: dict[str, Any] | None = None
     # Decoy deployments planned for the current cycle (U7). Empty when the
     # feature is off or the cycle drew zero decoys; seed is None only when off.
     cycle_decoy_seed: int | None = None
@@ -402,6 +409,15 @@ class LiveScenarioQueue:
             os.environ.get("RESTORE_SCRIPT", "/opt/lucida/restore-golden-state.sh")
         )
         self._restore_runner = restore_runner or subprocess.run
+        # The observer refills its 168-cell stream buckets from this many days of
+        # VM history at boot; keep in step with its STREAM_ANOMALY_SEASONAL_BACKFILL_DAYS.
+        self.seasonal_backfill_days = int(
+            os.environ.get("STREAM_ANOMALY_SEASONAL_BACKFILL_DAYS", seasonal_window.DEFAULT_DAYS)
+        )
+        # Ledger of observation outages (testbed-services registry), read per cycle.
+        self.observation_outages_path = Path(
+            os.environ.get("OBSERVATION_OUTAGES_PATH", str(seasonal_window.DEFAULT_OUTAGES_PATH))
+        )
         # Settle delay before the single golden-restore retry; injected runners
         # (tests) get no artificial wait.
         self.restore_retry_delay_sec = 30 if restore_runner is None else 0
@@ -702,6 +718,8 @@ class LiveScenarioQueue:
                         "cycle_buffer_started_at": None,
                         "cycle_golden_id": None,
                         "cycle_golden_sha256": None,
+                        "cycle_golden_stream": None,
+                        "cycle_seasonal_window": None,
                         # Operator resume clears the restart budget: a fixed blocker
                         # shouldn't leave a stale count that pauses again immediately.
                         "cycle_restart_counts": {},
@@ -1170,6 +1188,7 @@ class LiveScenarioQueue:
             return self._pause(state, f"golden reset failed for {scenario_id}: {error}")
         self._thaw_trainer()
         now = self.clock.now()
+        golden_stream, seasonal = self._cycle_restore_records(golden, now)
         try:
             decoy_seed, decoy_policy_sha256, decoys = self._plan_cycle_decoys(
                 state, scenario_id, now
@@ -1187,6 +1206,8 @@ class LiveScenarioQueue:
                 "expected_transition_at": self._format(now + CYCLE_NORMAL_DURATION),
                 "cycle_golden_id": (golden or {}).get("id"),
                 "cycle_golden_sha256": (golden or {}).get("sha256"),
+                "cycle_golden_stream": golden_stream,
+                "cycle_seasonal_window": seasonal,
                 "cycle_decoy_seed": decoy_seed,
                 "cycle_decoy_policy_sha256": decoy_policy_sha256,
                 "cycle_decoys": decoys,
@@ -1470,6 +1491,8 @@ class LiveScenarioQueue:
                 "cycle_buffer_started_at": None,
                 "cycle_golden_id": None,
                 "cycle_golden_sha256": None,
+                "cycle_golden_stream": None,
+                "cycle_seasonal_window": None,
                 "cycle_decoy_seed": None,
                 "cycle_decoy_policy_sha256": None,
                 "cycle_decoys": [],
@@ -1549,6 +1572,8 @@ class LiveScenarioQueue:
                 "cycle_buffer_started_at": None,
                 "cycle_golden_id": None,
                 "cycle_golden_sha256": None,
+                "cycle_golden_stream": None,
+                "cycle_seasonal_window": None,
                 "cycle_decoy_seed": None,
                 "cycle_decoy_policy_sha256": None,
                 "cycle_decoys": [],
@@ -1682,6 +1707,69 @@ class LiveScenarioQueue:
             "sha256": sha256 if isinstance(sha256, str) and _SHA256_HEX.fullmatch(sha256) else None,
         }
 
+    @staticmethod
+    def _parse_golden_stream(
+        result: "subprocess.CompletedProcess[str] | None",
+    ) -> dict[str, Any]:
+        """Golden stream generation fields of the restore result (Q19 B).
+
+        restore-golden-state.sh reads, right after the data restore and before the
+        observer boots, the active stream generation and the earliest valid_until of
+        its artifacts (golden_stream_generation, golden_stream_boot_load_until), and
+        stamps restored_at. A restore script that predates them, or a malformed
+        value, leaves the field None rather than failing the cycle."""
+        empty: dict[str, Any] = {"generation": None, "boot_load_until": None, "restored_at": None}
+        if result is None:
+            return empty
+        try:
+            payload = json.loads((result.stdout or "").strip() or "{}")
+        except Exception:
+            return empty
+        if not isinstance(payload, dict):
+            return empty
+        generation = payload.get("golden_stream_generation")
+        until = seasonal_window.parse_utc(payload.get("golden_stream_boot_load_until"))
+        restored = seasonal_window.parse_utc(payload.get("restored_at"))
+        return {
+            "generation": generation
+            if isinstance(generation, int) and not isinstance(generation, bool) and generation >= 0
+            else None,
+            "boot_load_until": seasonal_window.fmt(until),
+            "restored_at": seasonal_window.fmt(restored),
+        }
+
+    def _cycle_restore_records(
+        self, golden: dict[str, Any] | None, now: datetime
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Golden stream validity and the 21-day seasonal window of this restore.
+
+        Both describe the observer the restore just rebooted, so both are None
+        when no golden restore ran. Recording only: a failure here is written
+        into the record, never into the cycle (fail-open)."""
+        if not self.golden_reset_enabled:
+            return None, None
+        stream = dict((golden or {}).get("stream") or {})
+        restored_at = seasonal_window.parse_utc(stream.get("restored_at")) or now
+        until = seasonal_window.parse_utc(stream.get("boot_load_until"))
+        golden_stream = {
+            "generation": stream.get("generation"),
+            "boot_load_until": seasonal_window.fmt(until),
+            "restored_at": seasonal_window.fmt(restored_at),
+            # The observer boot-loads the golden generation only while every artifact
+            # of it is unexpired; past boot_load_until it waits for the trainer.
+            "valid": (restored_at < until) if until is not None else None,
+        }
+        try:
+            seasonal = seasonal_window.compute(
+                restored_at,
+                runs_root=self.runner.artifact_store.root,
+                outages_path=self.observation_outages_path,
+                days=self.seasonal_backfill_days,
+            )
+        except Exception as error:  # recording only; never block the cycle
+            seasonal = {"status": "error", "error": f"{type(error).__name__}: {error}"}
+        return golden_stream, seasonal
+
     def _write_cycle_phases(self, state: LiveQueueState) -> None:
         """Write <run-id>/phases.json (spec §2.2 phases[]) so the capture invoker
         forwards it as --phases-json. Boundaries are the actual recorded cycle
@@ -1698,6 +1786,12 @@ class LiveScenarioQueue:
         cooldown_end = self._format(
             parse_utc(t2, field="t2") + CYCLE_COOLDOWN_DURATION
         )
+        golden_stream = state.cycle_golden_stream or {}
+        seasonal = state.cycle_seasonal_window
+        if isinstance(seasonal, dict) and seasonal.get("status") == "ok":
+            seasonal = seasonal_window.with_overlap(
+                seasonal, parse_utc(t1, field="t1"), parse_utc(t2, field="t2")
+            )
         document = {
             "schema_version": "2.0",
             "timeline": "continuous",
@@ -1711,6 +1805,10 @@ class LiveScenarioQueue:
                     "at": cycle_start,
                     "golden_id": state.cycle_golden_id,
                     "golden_sha256": state.cycle_golden_sha256,
+                    "golden_stream_generation": golden_stream.get("generation"),
+                    "golden_stream_boot_load_until": golden_stream.get("boot_load_until"),
+                    "golden_stream_valid": golden_stream.get("valid"),
+                    "seasonal_window": seasonal,
                 },
                 {"phase": "normal", "start": cycle_start, "end": buffer_start},
                 {"phase": "buffer", "start": buffer_start, "end": t1},
@@ -2249,12 +2347,13 @@ class LiveScenarioQueue:
                 f"restore script exit {error.returncode}: {tail.strip() or 'no output captured'}"
             ) from error
 
-    def _restore_golden(self, scenario_id: str) -> dict[str, str | None] | None:
+    def _restore_golden(self, scenario_id: str) -> dict[str, Any] | None:
         """Freeze trainer + reset AI DB state + restart observer to a clean golden.
 
         In v2 this runs just before injection; in v3 it runs at cycle start.
-        Returns the restored golden's identity (id/sha256) when available, else
-        None. No-op unless golden reset is enabled."""
+        Returns the restored golden's identity (id/sha256, None when the result
+        does not carry them) and its stream generation fields under "stream".
+        None (no-op) unless golden reset is enabled."""
         if not self.golden_reset_enabled:
             return None
         args = ["--golden-root", str(self.golden_store_root), "--for-time", "now"]
@@ -2266,7 +2365,9 @@ class LiveScenarioQueue:
             # retry; give it one settle-and-retry before pausing the queue.
             time.sleep(self.restore_retry_delay_sec)
             result = self._run_restore(args)
-        return self._parse_golden_result(result)
+        identity = self._parse_golden_result(result)
+        stream = self._parse_golden_stream(result)
+        return {**(identity or {"id": None, "sha256": None}), "stream": stream}
 
     def _thaw_trainer(self) -> None:
         """Un-freeze the trainer. Fail-open: never block the queue on thaw."""
