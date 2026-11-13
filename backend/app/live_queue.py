@@ -197,6 +197,14 @@ CYCLE_COOLDOWN_DURATION = _cycle_duration("CYCLE_COOLDOWN_SEC", timedelta(minute
 # Same-scenario cycle restarts are bounded to break infinite loops: two
 # consecutive restarts are allowed, the third pauses (spec §2.2 resume table).
 MAX_CYCLE_RESTARTS = 2
+# Capture-only retry on resume (2026-11-13 CAPFIX). A run whose injection
+# succeeded but whose capture failed terminally can be captured again only while
+# 119 still holds every row of its window. The shortest store retention there is
+# otel_traces_local, TTL 3 days (VictoriaMetrics 7d, lucida_events and logs 7d,
+# 2026-11-13 reading). The window starts at the cycle start (phases.json
+# capture_start), so a retry is allowed while that start is younger than this
+# margin; older windows have begun to lose traces and re-inject instead.
+CAPTURE_RETRY_MAX_AGE = _cycle_duration("CAPTURE_RETRY_MAX_AGE_SEC", timedelta(hours=48))
 
 QueuePhase = Literal[
     "idle",
@@ -240,6 +248,9 @@ class LiveQueueState(StrictModel):
     current_run_id: str | None = None
     completed_run_ids: list[str] = Field(default_factory=list)
     auto_retry_counts: dict[str, int] = Field(default_factory=dict)
+    # Run whose capture alone is being retried after an operator resume (cycle
+    # mode). Set by resume, cleared when that capture completes or the queue moves
+    # on; the capture tick names a second failure as a retry failure.
     pending_retry_capture_run_id: str | None = None
     last_auto_retry_reason: str | None = None
     first_gate_passed: bool = False
@@ -686,10 +697,31 @@ class LiveScenarioQueue:
             if not readiness.ready:
                 raise RuntimeError(f"live queue readiness failed: {', '.join(readiness.missing)}")
             if state.cycle_mode:
-                # Operator resume of a paused cycle re-enters at the safe point:
-                # restart the current scenario's cycle from trainer_reset. Timed
-                # phases resume on their own (expected_transition_at persists), so
-                # only the paused case reaches here.
+                # A run whose injection succeeded and only its capture failed is
+                # captured again, nothing else (spec §2.2 resume table: capture ->
+                # retry capture only), while 119 still holds its window.
+                retry_refused: str | None = None
+                retry = await asyncio.to_thread(self._capture_retry_check, state)
+                if retry is not None:
+                    allowed, detail = retry
+                    if allowed:
+                        # The pause thawed the trainer; hold it again so the
+                        # retried capture does not race further training.
+                        await asyncio.to_thread(self._freeze_trainer)
+                        try:
+                            state = await asyncio.to_thread(self._rearm_capture, state, detail)
+                        except Exception:
+                            await asyncio.to_thread(self._thaw_trainer)
+                            raise
+                        self._write(state)
+                        self.runner.ensure_capture_worker()
+                        self.ensure_worker()
+                        return self.snapshot()
+                    retry_refused = detail
+                # Otherwise re-enter at the safe point: restart the current
+                # scenario's cycle from trainer_reset. Timed phases resume on
+                # their own (expected_transition_at persists), so only the paused
+                # case reaches here.
                 now_at = self.clock.now()
                 now = self._format(now_at)
                 # The paused run (a DIRTY one cleaned up by hand, typically)
@@ -725,13 +757,20 @@ class LiveScenarioQueue:
                         # Operator resume clears the restart budget: a fixed blocker
                         # shouldn't leave a stale count that pauses again immediately.
                         "cycle_restart_counts": {},
+                        "pending_retry_capture_run_id": None,
                         "phase_started_at": now,
                         "expected_transition_at": reset_at,
-                        "reason": (
-                            f"resumed; normal window held until {reset_at}"
-                            if reset_at != now
-                            else None
-                        ),
+                        "reason": "; ".join(
+                            part
+                            for part in (
+                                retry_refused,
+                                f"resumed; normal window held until {reset_at}"
+                                if reset_at != now
+                                else None,
+                            )
+                            if part
+                        )
+                        or None,
                         "updated_at": now,
                     }
                 )
@@ -1075,30 +1114,6 @@ class LiveScenarioQueue:
             state.clean_window_not_before, field="clean_window_not_before"
         ):
             return state
-        if state.pending_retry_capture_run_id is not None:
-            job = self._capture_job(state.pending_retry_capture_run_id)
-            if job is None:
-                return self._pause(
-                    state,
-                    f"retry capture disappeared: {state.pending_retry_capture_run_id}",
-                )
-            if job.status == "failed":
-                return self._pause(
-                    state,
-                    f"retry capture failed: {job.run_id}: {job.failure}",
-                )
-            if job.status != "completed":
-                return state
-            evidence = (
-                self.runner.artifact_store.root
-                / state.pending_retry_capture_run_id
-                / "capture-complete.json"
-            )
-            if not evidence.is_file():
-                return self._pause(
-                    state,
-                    f"retry capture completion evidence missing: {job.run_id}",
-                )
         readiness = self.readiness()
         if not readiness.ready:
             blockers = set(readiness.missing) - {"coordinator_clean", "runner_idle"}
@@ -1449,14 +1464,20 @@ class LiveScenarioQueue:
     def _tick_cycle_capture(self, state: LiveQueueState) -> LiveQueueState:
         """Wait for capture completion, thaw the trainer, then start the next
         cycle. Capture retries are owned by the scheduler; a terminal failure
-        pauses (resume table: capture -> retry capture only)."""
+        pauses, and resume then retries that capture only (``resume``,
+        ``_capture_retry_check``) while 119 still holds the window."""
         assert state.current_run_id is not None
         if capture_enabled():
             job = self._capture_job(state.current_run_id)
             if job is None:
                 return self._pause(state, f"capture job disappeared: {state.current_run_id}")
             if job.status == "failed":
-                return self._pause(state, f"capture failed: {state.current_run_id}: {job.failure}")
+                label = (
+                    "capture retry failed"
+                    if state.pending_retry_capture_run_id == state.current_run_id
+                    else "capture failed"
+                )
+                return self._pause(state, f"{label}: {state.current_run_id}: {job.failure}")
             if job.status != "completed":
                 return state
             if not (
@@ -1500,6 +1521,7 @@ class LiveScenarioQueue:
                 "cycle_decoy_seed": None,
                 "cycle_decoy_policy_sha256": None,
                 "cycle_decoys": [],
+                "pending_retry_capture_run_id": None,
                 "phase_started_at": self._format(now),
                 "expected_transition_at": self._format(now),
                 "reason": None,
@@ -1508,6 +1530,68 @@ class LiveScenarioQueue:
         )
         self._write(state)
         return state
+
+    def _capture_window(self, run_id: str, job: CaptureJob) -> tuple[str, str]:
+        """The window the capture script actually exports: phases.json
+        [capture_start, capture_end] in cycle mode, else the job's t1-10m, t2+20m."""
+        path = self.runner.artifact_store.root / run_id / "phases.json"
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            start, end = document["capture_start"], document["capture_end"]
+            parse_utc(start, field="capture_start")
+            parse_utc(end, field="capture_end")
+            return start, end
+        except Exception:
+            return job.capture_start, job.capture_end
+
+    def _capture_retry_check(self, state: LiveQueueState) -> tuple[bool, str] | None:
+        """Whether a paused cycle's resume should retry only the capture.
+
+        None when it does not apply (no run, no failed capture job, or the run's
+        own evidence is bad: then the cycle restarts as before). (False, why)
+        when it applies but the window is too old for 119 to still hold it.
+        (True, detail) otherwise; detail goes into the queue reason.
+        """
+        run_id = state.current_run_id
+        if run_id is None or not capture_enabled():
+            return None
+        job = self._capture_job(run_id)
+        if job is None or job.status != "failed":
+            return None
+        if self._controller_evidence_error(run_id) is not None:
+            return None
+        start, end = self._capture_window(run_id, job)
+        age = self.clock.now() - parse_utc(start, field="capture_start")
+        hours = age.total_seconds() / 3600
+        limit = CAPTURE_RETRY_MAX_AGE.total_seconds() / 3600
+        if age > CAPTURE_RETRY_MAX_AGE:
+            return (
+                False,
+                f"capture-only retry refused for {run_id}: window start {start} is "
+                f"{hours:.1f}h old, past the {limit:g}h margin within which 119 still "
+                f"holds the whole window (last failure: {job.failure}); re-injecting",
+            )
+        return (
+            True,
+            f"resumed: capture-only retry of {run_id} over the unchanged window "
+            f"{start}..{end}, possible only while 119 still holds it (window start "
+            f"{hours:.1f}h old, limit {limit:g}h); last failure: {job.failure}",
+        )
+
+    def _rearm_capture(self, state: LiveQueueState, detail: str) -> LiveQueueState:
+        assert state.current_run_id is not None
+        self.runner.capture_scheduler.rearm(state.current_run_id)
+        now = self._format(self.clock.now())
+        return state.model_copy(
+            update={
+                "phase": "waiting_capture",
+                "pending_retry_capture_run_id": state.current_run_id,
+                "phase_started_at": now,
+                "expected_transition_at": None,
+                "reason": detail,
+                "updated_at": now,
+            }
+        )
 
     def _write_cycle_clean_window_excuse(
         self, run_id: str, scenario_id: str, reason: str

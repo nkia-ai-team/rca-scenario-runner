@@ -47,6 +47,15 @@ class Scheduler:
     def snapshot(self):
         return SimpleNamespace(jobs=self.jobs)
 
+    def rearm(self, run_id: str):
+        # Mirrors CaptureScheduler.rearm: only the attempt bookkeeping changes.
+        self.rearmed = [*getattr(self, "rearmed", []), run_id]
+        job = self.jobs[run_id]
+        if job.status != "failed":
+            raise RuntimeError("only a failed capture job can be re-armed")
+        job.status, job.failure = "pending", None
+        return job
+
 
 class Runner:
     def __init__(self, root: Path, coordinator: Coordinator, scheduler: Scheduler) -> None:
@@ -1975,3 +1984,149 @@ async def test_manual_cleanup_is_refused_while_the_queue_restores_the_golden(
 
     assert response.status_code == 409
     assert runner.started == []
+
+
+
+# ---------------------------------------------------------------------------
+# Capture-only retry on resume (2026-11-13 CAPFIX, G2 F49-H: injection
+# succeeded, capture failed three times on a PG permission error, and the only
+# resume re-injected the scenario).
+# ---------------------------------------------------------------------------
+FAILURE = "capture command failed: pg_dump: error: query failed: ERROR:  permission denied for schema security"
+
+
+async def _capture_failed_and_paused(tmp_path: Path):
+    queue, runner, coordinator, scheduler, clock = make_cycle_queue(tmp_path)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+    _complete_injection(runner, scheduler, clock, run_id,
+                        t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    state = await queue.tick()  # -> cooldown
+    clock.value = state_expected(state)
+    state = await queue.tick()  # -> waiting_capture
+    assert state.phase == "waiting_capture"
+    scheduler.jobs[run_id].status = "failed"
+    scheduler.jobs[run_id].failure = FAILURE
+    state = await queue.tick()
+    assert state.phase == "paused"
+    assert state.reason == f"capture failed: {run_id}: {FAILURE}"
+    return queue, runner, scheduler, clock, state
+
+
+@pytest.mark.asyncio
+async def test_resume_after_a_failed_capture_retries_only_that_capture(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    run_id = paused.current_run_id
+    phases = runner.artifact_store.root / run_id / "phases.json"
+    phases_bytes = phases.read_bytes()
+    started = list(runner.started)
+    clock.value = datetime(2026, 7, 16, 14, 0, tzinfo=timezone.utc)
+
+    state = await queue.resume()
+
+    assert state.phase == "waiting_capture"
+    assert scheduler.rearmed == [run_id]
+    assert runner.started == started  # nothing re-injected
+    assert (state.current_run_id, state.current_scenario_id) == (run_id, "F01-R")
+    assert state.next_index == 0
+    for field in ("cycle_started_at", "cycle_buffer_started_at", "cycle_golden_id", "cycle_decoys"):
+        assert getattr(state, field) == getattr(paused, field), field
+    assert state.pending_retry_capture_run_id == run_id
+    assert state.expected_transition_at is None
+    # The retry exports the window of the first attempts: phases.json is untouched.
+    assert phases.read_bytes() == phases_bytes
+    doc = json.loads(phases_bytes)
+    assert (doc["capture_start"], doc["capture_end"]) == ("2026-07-16T08:00:00Z", "2026-07-16T10:45:00Z")
+    assert state.reason == (
+        f"resumed: capture-only retry of {run_id} over the unchanged window "
+        "2026-07-16T08:00:00Z..2026-07-16T10:45:00Z, possible only while 119 still holds it "
+        f"(window start 6.0h old, limit 48h); last failure: {FAILURE}"
+    )
+
+    scheduler.jobs[run_id].status = "completed"
+    (runner.artifact_store.root / run_id / "capture-complete.json").write_text("{}\n", encoding="utf-8")
+    state = await queue.tick()
+    assert state.phase == "cycle_reset"
+    assert state.next_index == 1
+    assert state.completed_run_ids == [run_id]
+    assert state.pending_retry_capture_run_id is None
+    assert json.loads((runner.artifact_store.root / run_id / "clean-window-excused.json").read_text())[
+        "reason"] == "cycle-complete"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_capture_retry_pauses_as_a_retry_failure_and_can_be_retried_again(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    run_id = paused.current_run_id
+    await queue.resume()
+    scheduler.jobs[run_id].status = "failed"
+    scheduler.jobs[run_id].failure = "capture command failed: still broken"
+    state = await queue.tick()
+    assert state.phase == "paused"
+    assert state.reason == f"capture retry failed: {run_id}: capture command failed: still broken"
+
+    state = await queue.resume()
+    assert state.phase == "waiting_capture"
+    assert scheduler.rearmed == [run_id, run_id]
+
+
+@pytest.mark.asyncio
+async def test_resume_re_injects_when_the_window_is_older_than_119_keeps_it(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    run_id = paused.current_run_id
+    # The window starts at the cycle start, 08:00. 48h and one second later the
+    # oldest traces may already be merged away (otel_traces_local TTL 3d).
+    clock.value = datetime(2026, 7, 18, 8, 0, 1, tzinfo=timezone.utc)
+
+    state = await queue.resume()
+
+    assert state.phase == "cycle_reset"
+    assert getattr(scheduler, "rearmed", []) == []
+    assert state.current_run_id is None
+    assert state.pending_retry_capture_run_id is None
+    assert state.reason.startswith(
+        f"capture-only retry refused for {run_id}: window start 2026-07-16T08:00:00Z is 48.0h old, "
+        "past the 48h margin within which 119 still holds the whole window "
+        f"(last failure: {FAILURE}); re-injecting"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_retries_the_capture_right_up_to_the_age_limit(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    clock.value = datetime(2026, 7, 18, 8, 0, 0, tzinfo=timezone.utc)
+    state = await queue.resume()
+    assert state.phase == "waiting_capture"
+
+
+@pytest.mark.asyncio
+async def test_resume_with_bad_run_evidence_restarts_the_cycle_instead(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    queue._controller_evidence_error = lambda _: "controller aborted"  # type: ignore[method-assign]
+    state = await queue.resume()
+    assert state.phase == "cycle_reset"
+    assert getattr(scheduler, "rearmed", []) == []
+    assert state.reason is None or "capture-only" not in state.reason
+
+
+@pytest.mark.asyncio
+async def test_resume_retry_freezes_the_trainer_for_the_capture(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    calls = []
+    queue._freeze_trainer = lambda: calls.append("freeze")  # type: ignore[method-assign]
+    await queue.resume()
+    assert calls == ["freeze"]
+
+
+@pytest.mark.asyncio
+async def test_resume_retry_is_refused_if_the_trainer_cannot_be_frozen(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+
+    def broken() -> None:
+        raise RuntimeError("restore --freeze failed")
+
+    queue._freeze_trainer = broken  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="freeze failed"):
+        await queue.resume()
+    assert queue.snapshot().phase == "paused"
+    assert getattr(scheduler, "rearmed", []) == []

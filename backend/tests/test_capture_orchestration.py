@@ -238,3 +238,85 @@ def test_failed_capture_attempt_survives_restart_and_retries(tmp_path) -> None:
     )
     assert restored.snapshot().jobs["run-001"].attempt_count == 1
     assert restored.tick("run-001").status == "completed"
+
+
+class FailingStoresInvoker(FakeInvoker):
+    def dump_stores(self, job, *, idempotency_key: str) -> None:
+        self.calls.append(("stores", job.run_id, idempotency_key))
+        raise RuntimeError("capture command failed: permission denied for schema security")
+
+
+def _fail_until_terminal(scheduler, clock) -> None:
+    for at in ("2026-07-16T10:40:00Z", "2026-07-16T10:41:00Z", "2026-07-16T10:43:00Z"):
+        clock.set(at)
+        job = scheduler.tick("run-001")
+    assert job.status == "failed" and job.attempt_count == 3
+
+
+def test_rearm_keeps_the_window_and_resumes_at_the_store_dump(tmp_path) -> None:
+    # 2026-11-13 CAPFIX: resume of a paused cycle retries only a failed capture.
+    clock = FakeClock("2026-07-16T10:40:00Z")
+    state = tmp_path / "state.json"
+    scheduler = CaptureScheduler(state, clock=clock, invoker=FailingStoresInvoker())
+    scheduler.schedule(calibration_request())
+    _fail_until_terminal(scheduler, clock)
+    before = scheduler.snapshot().jobs["run-001"]
+
+    clock.set("2026-07-16T13:00:00Z")
+    rearmed = scheduler.rearm("run-001")
+    assert rearmed.status == "model_requested"  # the checkpoint taken after the window is kept
+    assert rearmed.attempt_count == 0 and rearmed.next_retry_at is None and rearmed.failure is None
+    assert rearmed.rearm_count == 1 and rearmed.rearmed_at == "2026-07-16T13:00:00Z"
+    assert rearmed.previous_failures == ["capture command failed: permission denied for schema security"]
+    for field in ("run_id", "case_id", "scenario_id", "mode", "t1", "t2", "capture_start", "capture_end",
+                  "scheduled_at", "model_snapshot_requested_at", "model_snapshot_lag_sec"):
+        assert getattr(rearmed, field) == getattr(before, field), field
+
+    invoker = FakeInvoker()
+    restored = CaptureScheduler(state, clock=clock, invoker=invoker)
+    assert restored.snapshot().jobs["run-001"].rearm_count == 1  # survives a restart
+    assert restored.tick("run-001").status == "completed"
+    assert invoker.calls == [("stores", "run-001", "capture:run-001:stores")]
+
+
+def test_rearm_before_the_model_checkpoint_starts_from_the_model(tmp_path) -> None:
+    class FailingModelInvoker(FakeInvoker):
+        def snapshot_model(self, job, *, idempotency_key: str) -> None:
+            raise RuntimeError("model unavailable")
+
+    clock = FakeClock("2026-07-16T10:40:00Z")
+    scheduler = CaptureScheduler(tmp_path / "state.json", clock=clock, invoker=FailingModelInvoker())
+    scheduler.schedule(calibration_request())
+    _fail_until_terminal(scheduler, clock)
+    assert scheduler.rearm("run-001").status == "pending"
+
+
+def test_only_a_failed_job_can_be_rearmed_and_each_rearm_keeps_its_failure(tmp_path) -> None:
+    clock = FakeClock("2026-07-16T10:40:00Z")
+    scheduler = CaptureScheduler(tmp_path / "state.json", clock=clock, invoker=FailingStoresInvoker())
+    with pytest.raises(KeyError):
+        scheduler.rearm("run-001")
+    scheduler.schedule(calibration_request())
+    with pytest.raises(RuntimeError, match="only a failed capture job"):
+        scheduler.rearm("run-001")
+    _fail_until_terminal(scheduler, clock)
+    scheduler.rearm("run-001")
+    with pytest.raises(RuntimeError, match="only a failed capture job"):
+        scheduler.rearm("run-001")
+    for at in ("2026-07-16T14:00:00Z", "2026-07-16T14:01:00Z", "2026-07-16T14:03:00Z"):
+        clock.set(at)
+        scheduler.tick("run-001")
+    second = scheduler.rearm("run-001")
+    assert second.rearm_count == 2 and len(second.previous_failures) == 2
+
+
+def test_job_written_before_rearm_fields_still_loads(tmp_path) -> None:
+    state = tmp_path / "state.json"
+    scheduler = CaptureScheduler(state, clock=FakeClock("2026-07-16T09:00:00Z"), invoker=FakeInvoker())
+    scheduler.schedule(calibration_request())
+    document = json.loads(state.read_text())
+    for field in ("rearm_count", "rearmed_at", "previous_failures"):
+        del document["jobs"]["run-001"][field]
+    state.write_text(json.dumps(document))
+    job = scheduler.snapshot().jobs["run-001"]
+    assert job.rearm_count == 0 and job.previous_failures == []

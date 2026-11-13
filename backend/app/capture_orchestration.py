@@ -183,6 +183,12 @@ class CaptureJob(CaptureRequest):
     failure: str | None = None
     attempt_count: int = Field(default=0, ge=0, le=MAX_CAPTURE_ATTEMPTS)
     next_retry_at: str | None = None
+    # Operator re-arm of a terminally failed job (2026-11-13 CAPFIX): the queue's
+    # cycle resume retries only the capture of a run whose injection succeeded.
+    # Each re-arm keeps the failure it cleared so the job still tells its story.
+    rearm_count: int = Field(default=0, ge=0)
+    rearmed_at: str | None = None
+    previous_failures: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_derived_window(self) -> "CaptureJob":
@@ -207,6 +213,10 @@ class CaptureJob(CaptureRequest):
             parse_utc(self.completed_at, field="completed_at")
         if self.next_retry_at is not None:
             parse_utc(self.next_retry_at, field="next_retry_at")
+        if self.rearmed_at is not None:
+            parse_utc(self.rearmed_at, field="rearmed_at")
+        if len(self.previous_failures) != self.rearm_count:
+            raise ValueError("every re-arm must keep the failure it cleared")
         return self
 
     def trusted_result(self) -> dict[str, object]:
@@ -293,6 +303,37 @@ class CaptureScheduler:
                 scheduled_at=format_utc(now),
             )
             self._write(state.model_copy(update={"jobs": {**state.jobs, request.run_id: job}}))
+            return job
+
+    def rearm(self, run_id: str) -> CaptureJob:
+        """Give a terminally failed job a fresh attempt budget for the same run.
+
+        Only the attempt bookkeeping changes. The request, and so the capture
+        window (t1, t2, and the run's phases.json the invoker forwards), stays
+        exactly what the first attempts used. A job whose model checkpoint was
+        already taken resumes at the store dump, like a restart does, so the
+        checkpoint keeps the moment right after the window rather than the
+        moment of the retry.
+        """
+        with self._locked() as state:
+            job = state.jobs.get(run_id)
+            if job is None:
+                raise KeyError(f"unknown capture job: {run_id}")
+            if job.status != "failed":
+                raise RuntimeError(f"only a failed capture job can be re-armed: {run_id} is {job.status}")
+            job = job.model_copy(
+                update={
+                    "status": "pending" if job.model_snapshot_requested_at is None else "model_requested",
+                    "attempt_count": 0,
+                    "next_retry_at": None,
+                    "failure": None,
+                    "rearm_count": job.rearm_count + 1,
+                    "rearmed_at": format_utc(self._now()),
+                    "previous_failures": [*job.previous_failures, job.failure or "unknown failure"],
+                }
+            )
+            job = CaptureJob.model_validate(job.model_dump(mode="json"))
+            self._write(self._replace_job(state, job))
             return job
 
     def tick(self, run_id: str) -> CaptureJob:

@@ -714,6 +714,73 @@ def test_capture_invoker_checkpoints_model_before_store_process_and_no_golden(tm
     assert not (tmp_path / "cases" / "case-f07-h" / "golden.anomaly.json").exists()
 
 
+def test_capture_retry_after_rearm_runs_the_same_command_over_the_same_phases_window(tmp_path) -> None:
+    # 2026-11-13 CAPFIX: a capture retried by the cycle resume must export exactly
+    # the window the first attempts used: the same --t1, --t2 and phases.json.
+    model = tmp_path / "model.json"
+    model.write_text('{"version": 1}\n', encoding="utf-8")
+    script = tmp_path / "capture-eval-case.sh"
+    script.write_text("trusted", encoding="utf-8")
+    runs = tmp_path / "runs"
+    run_dir = runs / "run-007"
+    run_dir.mkdir(parents=True)
+    phases = run_dir / "phases.json"
+    phases.write_text(json.dumps({
+        "schema_version": "2.0", "timeline": "continuous", "run_id": "run-007",
+        "capture_start": "2026-07-16T06:00:00Z", "capture_end": "2026-07-16T10:50:00Z",
+        "phases": [{"phase": "normal", "start": "2026-07-16T06:00:00Z", "end": "2026-07-16T08:00:00Z"}],
+    }) + "\n", encoding="utf-8")
+    phases_bytes = phases.read_bytes()
+    calls: list[list[str]] = []
+    outcomes = [False, False, False, True]
+
+    def process(argv, **kwargs):
+        calls.append(list(argv))
+        if not outcomes.pop(0):
+            raise subprocess.CalledProcessError(1, argv, "", "pg_dump: error: permission denied for schema security\n")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    class MovingClock:
+        value = datetime(2026, 7, 16, 10, 40, tzinfo=timezone.utc)
+
+        def now(self):
+            return self.value
+
+    clock = MovingClock()
+    invoker = ProductionCaptureInvoker(
+        runs_root=runs, capture_script=script, output_root=tmp_path / "cases",
+        model_source=model, process_runner=process,
+    )
+    invoker._close_open_incidents = lambda job: None  # type: ignore[method-assign]
+    scheduler = CaptureScheduler(tmp_path / "capture-state.json", clock=clock, invoker=invoker)
+    scheduler.schedule(CaptureRequest(
+        run_id="run-007", case_id="case-f07-h", scenario_id="F07-H",
+        scenario_metadata=scenario_metadata(), mode="calibration",
+        t1="2026-07-16T08:10:00Z", t2="2026-07-16T10:20:00Z",
+    ))
+    for minutes in (0, 1, 3):
+        clock.value = datetime(2026, 7, 16, 10, 40 + minutes, tzinfo=timezone.utc)
+        job = scheduler.tick("run-007")
+    assert job.status == "failed"
+    checkpoint_sha = (run_dir / "model-checkpoint.json").read_text()
+
+    model.write_text('{"version": 2}\n', encoding="utf-8")  # the trainer moved on meanwhile
+    clock.value = datetime(2026, 7, 16, 15, 0, tzinfo=timezone.utc)
+    scheduler.rearm("run-007")
+    assert scheduler.tick("run-007").status == "completed"
+
+    assert len(calls) == 4
+    assert all(call == calls[0] for call in calls[1:])
+    assert calls[0][calls[0].index("--phases-json") + 1] == str(phases)
+    assert calls[0][calls[0].index("--t1") + 1] == "2026-07-16T08:10:00Z"
+    assert calls[0][calls[0].index("--t2") + 1] == "2026-07-16T10:20:00Z"
+    assert phases.read_bytes() == phases_bytes
+    # The model checkpoint is the one taken right after the window, not the retry's.
+    assert (run_dir / "model-checkpoint.json").read_text() == checkpoint_sha
+    assert json.loads((run_dir / "model.json").read_text()) == {"version": 1}
+    assert (run_dir / "capture-complete.json").is_file()
+
+
 def test_capture_invoker_forwards_preflight_and_normal_segment(tmp_path) -> None:
     model = tmp_path / "model.json"
     model.write_text('{"version": 1}\n', encoding="utf-8")
