@@ -12,7 +12,8 @@ Signal sources were fixed empirically (2026-07-21, 119 live):
   requests actually served — one sampled failure read as 20% against a 1% floor.
 - active alarms: vmalert firing list via the VM select endpoint /api/v1/alerts,
   minus alarms a decoy deployment of the cycle explains (queue-set filter, U7).
-- open incidents: observer 18087 via the manager session (incident_close).
+- open incidents: the incidents API via the manager session (incident_close;
+  web gateway /api/v1/ai/incidents by default, status=active, every page).
 - pool residue: max db.client.connections.pending_requests over commerce apps.
 
 Any fetch failure raises — the queue's gate treats a probe failure as pause,

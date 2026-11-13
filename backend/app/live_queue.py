@@ -446,6 +446,8 @@ class LiveScenarioQueue:
         self.injection_reserved = False
         self._functional_cache: tuple[datetime, dict[str, bool]] | None = None
         self._functional_details: dict[str, str] = {}
+        # Reason the last lingering-incident sweep was refused (None = no refusal).
+        self.last_sweep_error: str | None = None
         # First tick at which the probe alone blocked readiness; None while ready.
         self._probe_grace_since: datetime | None = None
 
@@ -1331,7 +1333,9 @@ class LiveScenarioQueue:
             if not verdict.is_clean:
                 return (
                     self._restart_cycle(
-                        state, f"preflight not clean at buffer end ({verdict.verdict})"
+                        state,
+                        f"preflight not clean at buffer end ({verdict.verdict}): "
+                        f"{self._not_clean_detail(verdict)}",
                     ),
                     None,
                 )
@@ -2262,7 +2266,10 @@ class LiveScenarioQueue:
                     "skipped_scenario_ids": [*state.skipped_scenario_ids, scenario_id],
                     "preflight_attempts": 0,
                     "preflight_retry_not_before": None,
-                    "reason": f"preflight timeout: skipped {scenario_id} ({verdict.verdict})",
+                    "reason": (
+                        f"preflight timeout: skipped {scenario_id} ({verdict.verdict}): "
+                        f"{self._not_clean_detail(verdict)}"
+                    ),
                     "updated_at": self._format(now),
                 }
             )
@@ -2276,7 +2283,8 @@ class LiveScenarioQueue:
                 "preflight_attempts": attempts,
                 "preflight_retry_not_before": self._format(now + PREFLIGHT_RECHECK_INTERVAL),
                 "reason": (
-                    f"preflight not clean ({verdict.verdict}); "
+                    f"preflight not clean ({verdict.verdict}): "
+                    f"{self._not_clean_detail(verdict)}; "
                     f"recheck {attempts}/{PREFLIGHT_MAX_ATTEMPTS}"
                 ),
                 "updated_at": self._format(now),
@@ -2356,6 +2364,14 @@ class LiveScenarioQueue:
         )
 
     def _sweep_lingering_incidents(self, verdict: PreflightVerdict) -> bool:
+        """Close lingering incidents when they are the only hard failure.
+
+        A refused close used to vanish here: the gate then restarted the cycle
+        with nothing but "(dirty)", and on 11-13 the first v4 recording lost a
+        two-hour window to 102 incidents nobody could see it trying to close.
+        The failure is now logged and kept on ``last_sweep_error`` for the
+        restart or wait reason."""
+        self.last_sweep_error = None
         failed = [check for check in verdict.checks if check.status == "fail"]
         if not failed or any(check.name != "open_incidents" for check in failed):
             return False
@@ -2364,8 +2380,26 @@ class LiveScenarioQueue:
 
             close_open_incidents()
             return True
-        except Exception:
+        except Exception as error:
+            detail = f"{type(error).__name__}: {error}"
+            self.last_sweep_error = detail
+            logger.warning("lingering incident sweep failed: %s", detail)
             return False
+
+    def _not_clean_detail(self, verdict: PreflightVerdict) -> str:
+        """Which checks kept the gate shut, with their values, plus a refused
+        incident sweep. Goes into the queue reason (state file and log)."""
+        parts = [
+            f"{check.name}={check.value:g} ({check.status}, {check.op} {check.threshold:g})"
+            for check in verdict.checks
+            if check.status != "pass"
+        ]
+        if verdict.ai_judgement is not None and not verdict.ai_judgement.clean:
+            parts.append(f"ai_judge: {verdict.ai_judgement.rationale[:200]}")
+        sweep_error = getattr(self, "last_sweep_error", None)
+        if sweep_error:
+            parts.append(f"incident sweep failed: {sweep_error[:300]}")
+        return "; ".join(parts) or "no failing check recorded"
 
     def _run_restore(
         self, args: list[str], *, timeout: int = 900
@@ -2755,7 +2789,9 @@ def get_live_queue() -> LiveScenarioQueue:
             )
 
             interval = int(os.environ.get("TOPOLOGY_SNAPSHOT_INTERVAL_SEC", DEFAULT_INTERVAL_SEC))
-            query_url = os.environ.get("LUCIDA_QUERY_URL", "http://192.168.230.119:18080")
+            from app.incident_close import DEFAULT_QUERY_URL
+
+            query_url = os.environ.get("LUCIDA_QUERY_URL") or DEFAULT_QUERY_URL
 
             def topology_collector_factory(bundle_dir: Path) -> TopologyCollector:
                 return TopologyCollector(

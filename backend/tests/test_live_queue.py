@@ -1082,6 +1082,60 @@ def test_lingering_incident_sweep_only_fires_when_incidents_are_the_sole_blocker
     assert closed == [True]
 
 
+def test_a_refused_sweep_is_kept_for_the_reason_not_swallowed(monkeypatch, caplog):
+    """11-13: every close was refused (403 forbidden origin) and the sweep
+    returned False with nothing logged, so the restart said only "(dirty)"."""
+    from types import SimpleNamespace
+
+    from app.incident_close import IncidentCloseError
+    from app.live_queue import LiveScenarioQueue
+    from app.preflight import PreflightCheckInput, evaluate_preflight
+
+    def refuse(**kwargs):
+        raise IncidentCloseError(
+            closed=[],
+            failed=[{"id": "inc-1", "status": "active", "title": "t",
+                     "error": 'HTTP 403 {"message":"forbidden origin"}'}],
+        )
+
+    monkeypatch.setattr("app.incident_close.close_open_incidents", refuse)
+    stub = SimpleNamespace(last_sweep_error="stale")
+    now = datetime(2026, 11, 13, 6, 39, tzinfo=timezone.utc)
+    verdict = evaluate_preflight(
+        window=("a", "b"),
+        checks=[
+            PreflightCheckInput(name="open_incidents", value=102.0, threshold=0.0, op="eq"),
+            PreflightCheckInput(name="active_alarms", value=0.0, threshold=0.0, op="eq"),
+        ],
+        now=now,
+    )
+    with caplog.at_level("WARNING", logger="scenario_runner.live_queue"):
+        assert LiveScenarioQueue._sweep_lingering_incidents(stub, verdict) is False
+    assert "forbidden origin" in stub.last_sweep_error
+    assert "lingering incident sweep failed" in caplog.text
+
+    detail = LiveScenarioQueue._not_clean_detail(stub, verdict)
+    assert detail.startswith("open_incidents=102 (fail, eq 0)")
+    assert "active_alarms" not in detail
+    assert "incident sweep failed: IncidentCloseError" in detail
+    assert "forbidden origin" in detail
+
+    # A sweep that was not attempted clears the previous refusal.
+    mixed = evaluate_preflight(
+        window=("a", "b"),
+        checks=[
+            PreflightCheckInput(name="open_incidents", value=1.0, threshold=0.0, op="eq"),
+            PreflightCheckInput(name="active_alarms", value=2.0, threshold=0.0, op="eq"),
+        ],
+        now=now,
+    )
+    assert LiveScenarioQueue._sweep_lingering_incidents(stub, mixed) is False
+    assert stub.last_sweep_error is None
+    assert LiveScenarioQueue._not_clean_detail(stub, mixed) == (
+        "open_incidents=1 (fail, eq 0); active_alarms=2 (fail, eq 0)"
+    )
+
+
 class FakeRestoreRunner:
     """Capture golden-restore invocations and record injection ordering."""
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -59,6 +60,8 @@ from app.live_probes import (
 from app.adaptive_runtime import AdaptiveRuntime
 from app.level_pins import load_level_pins, pin_controller_spec, resolve_pinned_level
 
+
+logger = logging.getLogger(__name__)
 
 TRUSTED_RUNS_ROOT = Path("/var/lib/lucida/scenario-runs")
 TRUSTED_CONTRACT_ROOT = Path("/opt/lucida/scenario-contracts")
@@ -1214,7 +1217,7 @@ class ProductionCaptureInvoker:
         judge cannot merge its anomalies into a stale incident. Fail-open —
         never fails the capture; the outcome (or error) lands next to the run.
         """
-        from app.incident_close import close_open_incidents
+        from app.incident_close import IncidentCloseError, close_open_incidents
 
         record = self.runs_root / job.run_id / "incidents-closed.json"
         try:
@@ -1226,7 +1229,20 @@ class ProductionCaptureInvoker:
                     "observed_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
+        except IncidentCloseError as error:
+            # Partial: keep both lists so the operator sees which ones stayed open.
+            logger.warning("capture-end incident close for %s: %s", job.run_id, error)
+            atomic_json(
+                record,
+                {
+                    "closed": error.closed,
+                    "failed": error.failed,
+                    "error": f"{type(error).__name__}: {error}",
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
         except Exception as error:
+            logger.warning("capture-end incident close for %s: %s", job.run_id, error)
             atomic_json(
                 record,
                 {

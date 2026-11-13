@@ -116,12 +116,18 @@ services:
       - RESTORE_SCRIPT=${RESTORE_SCRIPT:-/opt/lucida/restore-golden-state.sh}
       - PG_USER=${PG_USER:-lucida}
       # 신계약 캡처의 토폴로지 스냅샷용 query API 로그인
-      - QUERY_API_URL=${QUERY_API_URL:-http://192.168.230.119:18080}
+      - QUERY_API_URL=${QUERY_API_URL:-http://192.168.230.119:13080}
       - QUERY_API_USER=${QUERY_API_USER:-manager}
       - QUERY_API_PASSWORD=${QUERY_API_PASSWORD:-}
-      # 캡처 종료 시 열린 인시던트 자동 종결(clean-slate 정책, 2026-07-21)
-      - LUCIDA_QUERY_URL=${LUCIDA_QUERY_URL:-http://192.168.230.119:18080}
-      - LUCIDA_OBSERVER_URL=${LUCIDA_OBSERVER_URL:-http://192.168.230.119:18087}
+      # 캡처 종료 시 열린 인시던트 자동 종결(clean-slate 정책, 2026-07-21)과 preflight open_incidents.
+      # 119 는 k3s 라 로그인과 인시던트 모두 웹 게이트웨이(13080)를 탄다. 인시던트 주소는
+      # LUCIDA_INCIDENTS_URL(컬렉션 전체 주소) > LUCIDA_OBSERVER_URL(옛 observer 직접 주소,
+      # /api/v1/incidents 를 붙임) > 게이트웨이 {LUCIDA_QUERY_URL}/api/v1/ai/incidents 순.
+      # 닫기 POST 는 Origin, Referer 를 붙인다(기본 LUCIDA_QUERY_URL 의 origin). 근거 backend/app/incident_close.py
+      - LUCIDA_QUERY_URL=${LUCIDA_QUERY_URL:-http://192.168.230.119:13080}
+      - LUCIDA_INCIDENTS_URL=${LUCIDA_INCIDENTS_URL:-}
+      - LUCIDA_OBSERVER_URL=${LUCIDA_OBSERVER_URL:-}
+      - LUCIDA_REQUEST_ORIGIN=${LUCIDA_REQUEST_ORIGIN:-}
       - LUCIDA_LOGIN_USER=${LUCIDA_LOGIN_USER:-}
       - LUCIDA_LOGIN_PASSWORD=${LUCIDA_LOGIN_PASSWORD:-}
       - DEFAULT_DOMAIN=${DEFAULT_DOMAIN:-plopvape-shop}

@@ -8,43 +8,128 @@ realistic human action (trigger=human precedent, F08-H) and happens after the
 capture window, so the incident's natural lifecycle inside the window is
 untouched.
 
-Fail-open by design: a login or close failure must never fail the capture.
+Endpoints (v4, 2026-11-13). 119 runs the k3s install, where the browser
+reaches incidents through the web gateway: ``/api/v1/ai/incidents`` on the
+gateway is rewritten to the observer's ``/api/v1/incidents``. The runner goes
+the same way by default, so a close is the exact request the screen sends.
+Two rules of that path the runner must honour:
+
+- Login and incidents share one origin. The session cookie comes from
+  ``{LUCIDA_QUERY_URL}/api/v1/login`` and is sent back to the incidents path.
+- A cookie-bearing write must carry an allowed Origin (the AI service and
+  query both answer 403 "forbidden origin" otherwise). The observer's close
+  is a proxy to query that forwards that Origin, so a cookie-only POST never
+  closed anything: the sweep swallowed the 403 and 102 incidents piled up
+  from 11-11 until the first v4 recording stopped on them.
+
+Precedence for the incidents collection URL: ``incidents_url`` argument,
+``observer_url`` argument (direct observer, ``/api/v1/incidents``), env
+``LUCIDA_INCIDENTS_URL``, env ``LUCIDA_OBSERVER_URL`` (direct observer, kept
+for the evaluation port), then the gateway path under the login base.
+
+Listing asks for ``status=active`` and follows ``nextCursor``: an unfiltered
+first page holds the newest 200 incidents of any state, so an active incident
+older than those was invisible to the gate and to the sweep.
+
+Fail-open by design for the capture: a login or close failure must never
+fail the capture, but it is no longer silent. ``close_open_incidents`` tries
+every open incident and raises :class:`IncidentCloseError` naming each one it
+could not close, so callers can record what happened.
 """
 from __future__ import annotations
 
 import json
 import os
+import urllib.error
+import urllib.parse
 import urllib.request
 from http.cookiejar import CookieJar
 
-DEFAULT_QUERY_URL = "http://192.168.230.119:18080"
-DEFAULT_OBSERVER_URL = "http://192.168.230.119:18087"
+# k3s web gateway on 119: serves login (query) and incidents (observer).
+DEFAULT_QUERY_URL = "http://192.168.230.119:13080"
+GATEWAY_INCIDENTS_PATH = "/api/v1/ai/incidents"
+OBSERVER_INCIDENTS_PATH = "/api/v1/incidents"
 _TIMEOUT_SEC = 10
-_CLOSED_STATES = {"closed", "resolved"}
+# superseded: replaced by another incident (lucida NKIAAI-818), never open.
+_CLOSED_STATES = {"closed", "resolved", "superseded"}
+_PAGE_LIMIT = 200
+# 50 pages of 200 is far beyond any real backlog; hitting it means the cursor
+# does not advance, and a count that silently stops there would read as clean.
+_MAX_PAGES = 50
+_ERROR_BODY_LIMIT = 200
+
+
+class IncidentCloseError(RuntimeError):
+    """Some open incidents could not be closed. Every one was attempted."""
+
+    def __init__(self, *, closed: list[dict[str, str]], failed: list[dict[str, str]]):
+        self.closed = closed
+        self.failed = failed
+        shown = "; ".join(f"{item['id']}: {item['error']}" for item in failed[:3])
+        more = f" (+{len(failed) - 3} more)" if len(failed) > 3 else ""
+        super().__init__(
+            f"incident close failed for {len(failed)} of {len(failed) + len(closed)}: "
+            f"{shown}{more}"
+        )
+
+
+class _Endpoints:
+    def __init__(self, *, query_url: str, incidents_url: str, origin: str):
+        self.query_url = query_url
+        self.incidents_url = incidents_url
+        self.origin = origin
+
+
+def resolve_endpoints(
+    *,
+    query_url: str | None = None,
+    observer_url: str | None = None,
+    incidents_url: str | None = None,
+) -> _Endpoints:
+    """Login base, incidents collection URL, and the Origin writes carry."""
+    query = (query_url or os.environ.get("LUCIDA_QUERY_URL") or DEFAULT_QUERY_URL).rstrip("/")
+    if incidents_url:
+        collection = incidents_url.rstrip("/")
+    elif observer_url:
+        collection = observer_url.rstrip("/") + OBSERVER_INCIDENTS_PATH
+    elif os.environ.get("LUCIDA_INCIDENTS_URL"):
+        collection = os.environ["LUCIDA_INCIDENTS_URL"].rstrip("/")
+    elif os.environ.get("LUCIDA_OBSERVER_URL"):
+        collection = os.environ["LUCIDA_OBSERVER_URL"].rstrip("/") + OBSERVER_INCIDENTS_PATH
+    else:
+        collection = query + GATEWAY_INCIDENTS_PATH
+    origin = os.environ.get("LUCIDA_REQUEST_ORIGIN") or _origin_of(query)
+    return _Endpoints(query_url=query, incidents_url=collection, origin=origin.rstrip("/"))
+
+
+def _origin_of(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        raise RuntimeError(f"cannot derive an Origin from {url!r}; set LUCIDA_REQUEST_ORIGIN")
+    return f"{parts.scheme}://{parts.netloc}"
 
 
 def open_incident_count(
     *,
     query_url: str | None = None,
     observer_url: str | None = None,
+    incidents_url: str | None = None,
     username: str | None = None,
     password: str | None = None,
     opener_factory=None,
 ) -> int:
     """Count non-closed incidents (R6 preflight `open_incidents` signal)."""
-    opener, observer_url = _session(
-        query_url=query_url, observer_url=observer_url,
+    opener, endpoints = _session(
+        query_url=query_url, observer_url=observer_url, incidents_url=incidents_url,
         username=username, password=password, opener_factory=opener_factory,
     )
-    return sum(1 for item in _incidents(opener, observer_url)
-               if str(item.get("status", "")) not in _CLOSED_STATES)
+    return len(_open_incidents(opener, endpoints))
 
 
-def _session(*, query_url, observer_url, username, password, opener_factory):
-    query_url = (query_url or os.environ.get("LUCIDA_QUERY_URL") or DEFAULT_QUERY_URL).rstrip("/")
-    observer_url = (
-        observer_url or os.environ.get("LUCIDA_OBSERVER_URL") or DEFAULT_OBSERVER_URL
-    ).rstrip("/")
+def _session(*, query_url, observer_url, incidents_url, username, password, opener_factory):
+    endpoints = resolve_endpoints(
+        query_url=query_url, observer_url=observer_url, incidents_url=incidents_url
+    )
     username = username or os.environ.get("LUCIDA_LOGIN_USER")
     password = password or os.environ.get("LUCIDA_LOGIN_PASSWORD")
     if not username or not password:
@@ -54,7 +139,7 @@ def _session(*, query_url, observer_url, username, password, opener_factory):
     else:
         opener = opener_factory()
     login = urllib.request.Request(
-        f"{query_url}/api/v1/login",
+        f"{endpoints.query_url}/api/v1/login",
         data=json.dumps({"username": username, "password": password}).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -62,52 +147,98 @@ def _session(*, query_url, observer_url, username, password, opener_factory):
     with opener.open(login, timeout=_TIMEOUT_SEC) as response:
         if response.status != 200:
             raise RuntimeError(f"lucida login failed: HTTP {response.status}")
-    return opener, observer_url
+    return opener, endpoints
 
 
-def _incidents(opener, observer_url: str) -> list:
-    with opener.open(
-        urllib.request.Request(f"{observer_url}/api/v1/incidents"), timeout=_TIMEOUT_SEC
-    ) as response:
-        document = json.loads(response.read())
-    return document if isinstance(document, list) else (
-        document.get("incidents") or document.get("items") or []
-    )
+def _open_incidents(opener, endpoints: _Endpoints) -> list[dict]:
+    """Every non-closed incident, across all pages."""
+    found: list[dict] = []
+    cursor = ""
+    for _page in range(_MAX_PAGES):
+        params = {"status": "active", "limit": str(_PAGE_LIMIT)}
+        if cursor:
+            params["cursor"] = cursor
+        url = f"{endpoints.incidents_url}?{urllib.parse.urlencode(params)}"
+        with opener.open(urllib.request.Request(url), timeout=_TIMEOUT_SEC) as response:
+            document = json.loads(response.read())
+        if isinstance(document, list):
+            items, next_cursor = document, ""
+        else:
+            items = document.get("incidents") or document.get("items") or []
+            next_cursor = str(document.get("nextCursor") or "")
+        # The status filter is the server's; keep the client check so an older
+        # observer that ignores it still cannot count a closed incident.
+        found.extend(
+            item for item in items if str(item.get("status", "")) not in _CLOSED_STATES
+        )
+        if not next_cursor:
+            return found
+        if next_cursor == cursor:
+            raise RuntimeError(f"incident list cursor did not advance: {next_cursor!r}")
+        cursor = next_cursor
+    raise RuntimeError(f"incident list exceeded {_MAX_PAGES} pages; refusing a partial count")
 
 
 def close_open_incidents(
     *,
     query_url: str | None = None,
     observer_url: str | None = None,
+    incidents_url: str | None = None,
     username: str | None = None,
     password: str | None = None,
     opener_factory=None,
 ) -> list[dict[str, str]]:
-    """Close every non-closed incident; return [{id, status, title}] handled."""
-    opener, observer_url = _session(
-        query_url=query_url, observer_url=observer_url,
+    """Close every non-closed incident; return [{id, status, title}] handled.
+
+    Raises :class:`IncidentCloseError` after trying them all when any close
+    was refused, carrying both the closed and the failed ones."""
+    opener, endpoints = _session(
+        query_url=query_url, observer_url=observer_url, incidents_url=incidents_url,
         username=username, password=password, opener_factory=opener_factory,
     )
-    items = _incidents(opener, observer_url)
-
     closed: list[dict[str, str]] = []
-    for item in items:
+    failed: list[dict[str, str]] = []
+    for item in _open_incidents(opener, endpoints):
         status = str(item.get("status", ""))
-        if status in _CLOSED_STATES:
-            continue
         incident_id = str(item.get("incident_id") or item.get("id") or "")
         if not incident_id:
             continue
-        close = urllib.request.Request(
-            f"{observer_url}/api/v1/incidents/{incident_id}/close",
-            data=b"{}",
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        error = _close_one(opener, endpoints, incident_id)
+        record = {"id": incident_id, "status": status, "title": str(item.get("title", ""))[:120]}
+        if error is None:
+            closed.append(record)
+        else:
+            failed.append({**record, "error": error})
+    if failed:
+        raise IncidentCloseError(closed=closed, failed=failed)
+    return closed
+
+
+def _close_one(opener, endpoints: _Endpoints, incident_id: str) -> str | None:
+    """POST the close the screen sends; None on success, else the reason."""
+    close = urllib.request.Request(
+        f"{endpoints.incidents_url}/{urllib.parse.quote(incident_id, safe='')}/close",
+        data=b"{}",
+        headers={
+            "Content-Type": "application/json",
+            # Same-origin proof for a cookie-bearing write (see module doc).
+            "Origin": endpoints.origin,
+            "Referer": endpoints.origin + "/",
+        },
+        method="POST",
+    )
+    try:
         with opener.open(close, timeout=_TIMEOUT_SEC) as response:
             if response.status >= 300:
-                raise RuntimeError(f"incident close failed: {incident_id}: HTTP {response.status}")
-        closed.append(
-            {"id": incident_id, "status": status, "title": str(item.get("title", ""))[:120]}
-        )
-    return closed
+                return f"HTTP {response.status}"
+    except urllib.error.HTTPError as error:
+        body = b""
+        try:
+            body = error.read() or b""
+        except Exception:
+            pass
+        text = body.decode("utf-8", "replace").strip()[:_ERROR_BODY_LIMIT]
+        return f"HTTP {error.code}" + (f" {text}" if text else "")
+    except Exception as error:
+        return f"{type(error).__name__}: {error}"
+    return None

@@ -933,6 +933,44 @@ def test_capture_invoker_auto_mode_falls_back_to_docker_without_k8s(tmp_path) ->
     assert json.loads((runs / "run-auto" / "model.json").read_text())["version"] == 4
 
 
+def test_capture_end_close_records_closed_and_refused_incidents(tmp_path, monkeypatch, caplog) -> None:
+    """Fail-open stays, silence goes: a partly refused close keeps both lists
+    next to the run and logs a warning (11-13, 102 incidents piled up because
+    every capture-end close was refused without a trace)."""
+    from app.incident_close import IncidentCloseError
+
+    runs = tmp_path / "runs"
+    (runs / "run-close").mkdir(parents=True)
+    invoker = ProductionCaptureInvoker(runs_root=runs, model_source=tmp_path / "m.json")
+
+    def refuse_one():
+        raise IncidentCloseError(
+            closed=[{"id": "a1", "status": "active", "title": "ok"}],
+            failed=[{"id": "b2", "status": "active", "title": "no",
+                     "error": 'HTTP 403 {"message":"forbidden origin"}'}],
+        )
+
+    monkeypatch.setattr("app.incident_close.close_open_incidents", refuse_one)
+    with caplog.at_level("WARNING", logger="app.production_runtime"):
+        invoker._close_open_incidents(SimpleNamespace(run_id="run-close"))
+
+    record = json.loads((runs / "run-close" / "incidents-closed.json").read_text())
+    assert [item["id"] for item in record["closed"]] == ["a1"]
+    assert [item["id"] for item in record["failed"]] == ["b2"]
+    assert "forbidden origin" in record["failed"][0]["error"]
+    assert record["error"].startswith("IncidentCloseError: incident close failed for 1 of 2")
+    assert "capture-end incident close for run-close" in caplog.text
+
+    monkeypatch.setattr(
+        "app.incident_close.close_open_incidents",
+        lambda: [{"id": "c3", "status": "active", "title": "t"}],
+    )
+    invoker._close_open_incidents(SimpleNamespace(run_id="run-close"))
+    record = json.loads((runs / "run-close" / "incidents-closed.json").read_text())
+    assert [item["id"] for item in record["closed"]] == ["c3"]
+    assert "failed" not in record and "error" not in record
+
+
 async def test_capture_worker_isolates_one_failed_job_and_completes_another(tmp_path) -> None:
     jobs = {
         "failed": SimpleNamespace(run_id="failed", status="pending"),

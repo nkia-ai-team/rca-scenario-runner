@@ -40,7 +40,8 @@ GRAPH_QUERY = {
     "includeSelfMonitor": "true",
 }
 DEFAULT_INTERVAL_SEC = 30
-DEFAULT_QUERY_URL = "http://192.168.230.119:18080"
+# k3s web gateway on 119 (query behind it); the v3 compose port 18080 is gone.
+DEFAULT_QUERY_URL = "http://192.168.230.119:13080"
 _LOGIN_TIMEOUT_SEC = 10
 _FETCH_TIMEOUT_SEC = 20
 

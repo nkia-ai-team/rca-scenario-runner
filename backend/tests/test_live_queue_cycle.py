@@ -1310,6 +1310,9 @@ async def test_preflight_still_refuses_an_alarm_no_decoy_explains(tmp_path: Path
 
     assert state.phase == "cycle_reset"
     assert "preflight not clean" in state.reason
+    # The reason names the check that shut the gate, with its value (11-13: it
+    # said only "(dirty)" and the operator could not tell why).
+    assert "active_alarms=1 (fail, eq 0)" in state.reason
     assert runner.started == []
 
 
@@ -1351,6 +1354,40 @@ async def test_sweep_does_not_close_incidents_beside_a_real_alarm(tmp_path: Path
 
     assert closed == []
     assert state.phase == "cycle_reset"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_sweep_restarts_with_the_refusal_in_the_reason(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """11-13 G2: open incidents were the only failure, every close was refused
+    with 403 forbidden origin, and the restart reason said only "(dirty)"."""
+    from app.incident_close import IncidentCloseError
+
+    probe = DecoyAwareProbe(open_incidents=102)
+
+    def refuse():
+        raise IncidentCloseError(
+            closed=[],
+            failed=[{"id": "inc-1", "status": "active", "title": "t",
+                     "error": 'HTTP 403 {"message":"forbidden origin"}'}],
+        )
+
+    monkeypatch.setattr("app.incident_close.close_open_incidents", refuse)
+    queue, runner, _, decoy, _ = await _to_buffer_end_with_applied_decoy(tmp_path, monkeypatch, probe)
+    probe.alerts = [_decoy_alarm(decoy)]
+
+    with caplog.at_level("WARNING", logger="scenario_runner.live_queue"):
+        state = await queue.tick()
+
+    assert state.phase == "cycle_reset"
+    assert runner.started == []
+    assert "preflight not clean at buffer end (dirty): open_incidents=102 (fail, eq 0)" in state.reason
+    assert "incident sweep failed: IncidentCloseError" in state.reason
+    assert "forbidden origin" in state.reason
+    persisted = json.loads(queue.state_path.read_text())
+    assert persisted["reason"] == state.reason
+    assert "lingering incident sweep failed" in caplog.text
 
 
 @pytest.mark.asyncio
