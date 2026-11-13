@@ -957,6 +957,7 @@ def test_capture_end_close_records_closed_and_refused_incidents(tmp_path, monkey
     record = json.loads((runs / "run-close" / "incidents-closed.json").read_text())
     assert [item["id"] for item in record["closed"]] == ["a1"]
     assert [item["id"] for item in record["failed"]] == ["b2"]
+    assert (record["closed_count"], record["failed_count"]) == (1, 1)
     assert "forbidden origin" in record["failed"][0]["error"]
     assert record["error"].startswith("IncidentCloseError: incident close failed for 1 of 2")
     assert "capture-end incident close for run-close" in caplog.text
@@ -968,6 +969,7 @@ def test_capture_end_close_records_closed_and_refused_incidents(tmp_path, monkey
     invoker._close_open_incidents(SimpleNamespace(run_id="run-close"))
     record = json.loads((runs / "run-close" / "incidents-closed.json").read_text())
     assert [item["id"] for item in record["closed"]] == ["c3"]
+    assert (record["closed_count"], record["failed_count"]) == (1, 0)
     assert "failed" not in record and "error" not in record
 
 

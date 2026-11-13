@@ -1226,6 +1226,8 @@ class ProductionCaptureInvoker:
                 record,
                 {
                     "closed": closed,
+                    "closed_count": len(closed),
+                    "failed_count": 0,
                     "observed_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
@@ -1237,6 +1239,8 @@ class ProductionCaptureInvoker:
                 {
                     "closed": error.closed,
                     "failed": error.failed,
+                    "closed_count": len(error.closed),
+                    "failed_count": len(error.failed),
                     "error": f"{type(error).__name__}: {error}",
                     "observed_at": datetime.now(timezone.utc).isoformat(),
                 },
