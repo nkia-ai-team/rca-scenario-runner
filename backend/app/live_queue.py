@@ -197,14 +197,35 @@ CYCLE_COOLDOWN_DURATION = _cycle_duration("CYCLE_COOLDOWN_SEC", timedelta(minute
 # Same-scenario cycle restarts are bounded to break infinite loops: two
 # consecutive restarts are allowed, the third pauses (spec §2.2 resume table).
 MAX_CYCLE_RESTARTS = 2
-# Capture-only retry on resume (2026-11-13 CAPFIX). A run whose injection
-# succeeded but whose capture failed terminally can be captured again only while
-# 119 still holds every row of its window. The shortest store retention there is
-# otel_traces_local, TTL 3 days (VictoriaMetrics 7d, lucida_events and logs 7d,
-# 2026-11-13 reading). The window starts at the cycle start (phases.json
-# capture_start), so a retry is allowed while that start is younger than this
-# margin; older windows have begun to lose traces and re-inject instead.
-CAPTURE_RETRY_MAX_AGE = _cycle_duration("CAPTURE_RETRY_MAX_AGE_SEC", timedelta(hours=48))
+# Capture-only retry on resume (2026-11-13 CAPFIX, rule fixed 2026-11-16). A run
+# whose injection succeeded but whose capture failed terminally can be captured
+# again only while 119 still holds every row of its window. The capture script
+# reads, for that window, the retention (TTL) of every ClickHouse table it would
+# take (``capture-eval-case.sh --retention-check``: the v3 fixed tables and the
+# discovered ones, lucida_selfsystem included). A retry is allowed while the window
+# start is younger than the shortest TTL minus this margin, which covers the
+# capture's own run time and its scheduler retries.
+CAPTURE_RETRY_TTL_MARGIN = _cycle_duration("CAPTURE_RETRY_TTL_MARGIN_SEC", timedelta(hours=6))
+
+
+def _non_negative_seconds(env_name: str, default: timedelta) -> timedelta:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    seconds = int(raw)
+    if seconds < 0:
+        raise ValueError(f"{env_name} must be zero or a positive number of seconds: {raw}")
+    return timedelta(seconds=seconds)
+
+
+# Bound used only when the retention check itself could not run (old capture
+# script, ClickHouse unreachable). It must stay below the shortest TTL seen on
+# 119: 1 day (lucida.kcm_flow_pod_edges_local and four lucida_selfsystem tables,
+# 2026-11-16 reading), less the margin above, so 12h. 0 refuses every retry
+# whose retention could not be read.
+CAPTURE_RETRY_FALLBACK_MAX_AGE = _non_negative_seconds(
+    "CAPTURE_RETRY_FALLBACK_MAX_AGE_SEC", timedelta(hours=12)
+)
 
 QueuePhase = Literal[
     "idle",
@@ -261,6 +282,9 @@ class LiveQueueState(StrictModel):
     preflight_retry_not_before: str | None = None
     skipped_scenario_ids: list[str] = Field(default_factory=list)
     reason: str | None = None
+    # Phase the queue was in when it paused (2026-11-16). The capture-only retry
+    # applies only to a pause taken while waiting for the capture.
+    paused_from_phase: str | None = None
     started_at: str | None = None
     updated_at: str | None = None
     # --- v3 continuous-cycle state (CYCLE_MODE only; all default to the v2 no-op) ---
@@ -704,6 +728,7 @@ class LiveScenarioQueue:
                 retry = await asyncio.to_thread(self._capture_retry_check, state)
                 if retry is not None:
                     allowed, detail = retry
+                    logger.warning("live queue %s: %s", state.queue_id, detail)
                     if allowed:
                         # The pause thawed the trainer; hold it again so the
                         # retried capture does not race further training.
@@ -1547,10 +1572,11 @@ class LiveScenarioQueue:
     def _capture_retry_check(self, state: LiveQueueState) -> tuple[bool, str] | None:
         """Whether a paused cycle's resume should retry only the capture.
 
-        None when it does not apply (no run, no failed capture job, or the run's
-        own evidence is bad: then the cycle restarts as before). (False, why)
-        when it applies but the window is too old for 119 to still hold it.
-        (True, detail) otherwise; detail goes into the queue reason.
+        None when it does not apply: no run, no failed capture job, the pause was
+        not taken while waiting for the capture, or the run's own evidence is bad
+        (then the cycle restarts as before). (False, why) when it applies but 119
+        may no longer hold the whole window. (True, detail) otherwise; detail
+        goes into the queue reason.
         """
         run_id = state.current_run_id
         if run_id is None or not capture_enabled():
@@ -1558,25 +1584,75 @@ class LiveScenarioQueue:
         job = self._capture_job(run_id)
         if job is None or job.status != "failed":
             return None
+        if state.paused_from_phase is None:
+            # Paused by a runner from before paused_from_phase: only the capture
+            # tick's own reasons say the pause came from waiting for the capture.
+            if not (state.reason or "").startswith(
+                (f"capture failed: {run_id}:", f"capture retry failed: {run_id}:")
+            ):
+                return None
+        elif state.paused_from_phase != "waiting_capture":
+            return None
         if self._controller_evidence_error(run_id) is not None:
             return None
         start, end = self._capture_window(run_id, job)
         age = self.clock.now() - parse_utc(start, field="capture_start")
-        hours = age.total_seconds() / 3600
-        limit = CAPTURE_RETRY_MAX_AGE.total_seconds() / 3600
-        if age > CAPTURE_RETRY_MAX_AGE:
-            return (
-                False,
-                f"capture-only retry refused for {run_id}: window start {start} is "
-                f"{hours:.1f}h old, past the {limit:g}h margin within which 119 still "
-                f"holds the whole window (last failure: {job.failure}); re-injecting",
-            )
+        age_h = age.total_seconds() / 3600
+        margin_h = CAPTURE_RETRY_TTL_MARGIN.total_seconds() / 3600
+        refused = f"capture-only retry refused for {run_id}: window start {start} is {age_h:.1f}h old"
+        tail = f"(last failure: {job.failure}); re-injecting"
+        try:
+            retention = self._capture_retention(start, end)
+        except Exception as error:
+            fallback_h = CAPTURE_RETRY_FALLBACK_MAX_AGE.total_seconds() / 3600
+            why = f"retention check failed ({type(error).__name__}: {str(error)[:200]})"
+            if age > CAPTURE_RETRY_FALLBACK_MAX_AGE:
+                return False, f"{refused}, {why}, past the fallback limit {fallback_h:g}h {tail}"
+            limit_text = f"{why}, within the fallback limit {fallback_h:g}h"
+        else:
+            unreadable = retention.get("unreadable") or []
+            if unreadable:
+                names = ", ".join(f"{u['table']} ({u['error']})" for u in unreadable[:3])
+                more = f" and {len(unreadable) - 3} more" if len(unreadable) > 3 else ""
+                return (
+                    False,
+                    f"{refused}; retention of {len(unreadable)} captured table(s) could not be read: "
+                    f"{names}{more} {tail}",
+                )
+            shortest = retention.get("shortest")
+            if shortest is None:
+                limit_text = "no captured table has a TTL"
+            else:
+                ttl = timedelta(seconds=int(shortest["ttl_seconds"]))
+                limit = ttl - CAPTURE_RETRY_TTL_MARGIN
+                ttl_h = ttl.total_seconds() / 3600
+                limit_h = limit.total_seconds() / 3600
+                basis = (f"shortest retention {shortest['table']} {ttl_h:.1f}h minus "
+                         f"{margin_h:g}h margin = limit {limit_h:.1f}h")
+                if age > limit:
+                    return False, f"{refused}, past the {basis}, so its oldest rows may be gone {tail}"
+                limit_text = basis
         return (
             True,
             f"resumed: capture-only retry of {run_id} over the unchanged window "
-            f"{start}..{end}, possible only while 119 still holds it (window start "
-            f"{hours:.1f}h old, limit {limit:g}h); last failure: {job.failure}",
+            f"{start}..{end}, possible only while 119 still holds it: window start "
+            f"{age_h:.1f}h old, {limit_text}; last failure: {job.failure}",
         )
+
+    def _capture_retention(self, start: str, end: str) -> dict[str, Any]:
+        """Retention of every ClickHouse table the capture would take for the
+        window, from the trusted capture script (no table data is read)."""
+        script = self.required_paths["capture_script"]
+        result = subprocess.run(
+            [str(script), "--retention-check", "--window-start", start, "--window-end", end],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(_tail(result.stderr or result.stdout))
+        document = json.loads(result.stdout)
+        if not isinstance(document, dict) or "tables" not in document:
+            raise RuntimeError("retention check printed no table list")
+        return document
 
     def _rearm_capture(self, state: LiveQueueState, detail: str) -> LiveQueueState:
         assert state.current_run_id is not None
@@ -2795,7 +2871,12 @@ class LiveScenarioQueue:
         self._stop_cycle_topology()
         self._thaw_trainer()
         state = state.model_copy(
-            update={"phase": "paused", "reason": reason, "updated_at": self._format(self.clock.now())}
+            update={
+                "phase": "paused",
+                "paused_from_phase": state.phase if state.phase != "paused" else state.paused_from_phase,
+                "reason": reason,
+                "updated_at": self._format(self.clock.now()),
+            }
         )
         self._write(state)
         return state

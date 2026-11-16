@@ -1990,13 +1990,36 @@ async def test_manual_cleanup_is_refused_while_the_queue_restores_the_golden(
 # ---------------------------------------------------------------------------
 # Capture-only retry on resume (2026-11-13 CAPFIX, G2 F49-H: injection
 # succeeded, capture failed three times on a PG permission error, and the only
-# resume re-injected the scenario).
+# resume re-injected the scenario). 2026-11-16: the age limit comes from the
+# retention (TTL) of the tables the capture takes, read through the capture
+# script, not from a fixed 48h.
 # ---------------------------------------------------------------------------
 FAILURE = "capture command failed: pg_dump: error: query failed: ERROR:  permission denied for schema security"
+DAY = 86400
 
 
-async def _capture_failed_and_paused(tmp_path: Path):
+def _retention(shortest_table="lucida_selfsystem.otel_traces_local", ttl=DAY, unreadable=()):
+    return {
+        "window_start": "2026-07-16T08:00:00Z",
+        "window_end": "2026-07-16T10:45:00Z",
+        "tables": [{"table": shortest_table, "ttl_seconds": ttl}] if shortest_table else [],
+        "unreadable": list(unreadable),
+        "shortest": {"table": shortest_table, "ttl_seconds": ttl} if shortest_table else None,
+    }
+
+
+async def _capture_failed_and_paused(tmp_path: Path, retention=None):
     queue, runner, coordinator, scheduler, clock = make_cycle_queue(tmp_path)
+    queue.retention_calls = []
+
+    def read(start, end):
+        queue.retention_calls.append((start, end))
+        value = retention if retention is not None else _retention()
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    queue._capture_retention = read  # type: ignore[method-assign]
     state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
     run_id = state.current_run_id
     _complete_injection(runner, scheduler, clock, run_id,
@@ -2009,6 +2032,7 @@ async def _capture_failed_and_paused(tmp_path: Path):
     scheduler.jobs[run_id].failure = FAILURE
     state = await queue.tick()
     assert state.phase == "paused"
+    assert state.paused_from_phase == "waiting_capture"
     assert state.reason == f"capture failed: {run_id}: {FAILURE}"
     return queue, runner, scheduler, clock, state
 
@@ -2033,14 +2057,17 @@ async def test_resume_after_a_failed_capture_retries_only_that_capture(tmp_path:
         assert getattr(state, field) == getattr(paused, field), field
     assert state.pending_retry_capture_run_id == run_id
     assert state.expected_transition_at is None
-    # The retry exports the window of the first attempts: phases.json is untouched.
+    # The retry exports the window of the first attempts: phases.json is untouched,
+    # and the retention is read for exactly that window.
     assert phases.read_bytes() == phases_bytes
     doc = json.loads(phases_bytes)
     assert (doc["capture_start"], doc["capture_end"]) == ("2026-07-16T08:00:00Z", "2026-07-16T10:45:00Z")
+    assert queue.retention_calls == [("2026-07-16T08:00:00Z", "2026-07-16T10:45:00Z")]
     assert state.reason == (
         f"resumed: capture-only retry of {run_id} over the unchanged window "
-        "2026-07-16T08:00:00Z..2026-07-16T10:45:00Z, possible only while 119 still holds it "
-        f"(window start 6.0h old, limit 48h); last failure: {FAILURE}"
+        "2026-07-16T08:00:00Z..2026-07-16T10:45:00Z, possible only while 119 still holds it: "
+        "window start 6.0h old, shortest retention lucida_selfsystem.otel_traces_local 24.0h minus 6h margin "
+        f"= limit 18.0h; last failure: {FAILURE}"
     )
 
     scheduler.jobs[run_id].status = "completed"
@@ -2071,12 +2098,11 @@ async def test_a_failed_capture_retry_pauses_as_a_retry_failure_and_can_be_retri
 
 
 @pytest.mark.asyncio
-async def test_resume_re_injects_when_the_window_is_older_than_119_keeps_it(tmp_path: Path) -> None:
+async def test_resume_re_injects_when_the_window_is_older_than_the_shortest_ttl_allows(tmp_path: Path) -> None:
     queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
     run_id = paused.current_run_id
-    # The window starts at the cycle start, 08:00. 48h and one second later the
-    # oldest traces may already be merged away (otel_traces_local TTL 3d).
-    clock.value = datetime(2026, 7, 18, 8, 0, 1, tzinfo=timezone.utc)
+    # Window start 08:00; shortest TTL 1 day less 6h margin = 18h. One second past it.
+    clock.value = datetime(2026, 7, 17, 2, 0, 1, tzinfo=timezone.utc)
 
     state = await queue.resume()
 
@@ -2085,18 +2111,83 @@ async def test_resume_re_injects_when_the_window_is_older_than_119_keeps_it(tmp_
     assert state.current_run_id is None
     assert state.pending_retry_capture_run_id is None
     assert state.reason.startswith(
-        f"capture-only retry refused for {run_id}: window start 2026-07-16T08:00:00Z is 48.0h old, "
-        "past the 48h margin within which 119 still holds the whole window "
+        f"capture-only retry refused for {run_id}: window start 2026-07-16T08:00:00Z is 18.0h old, "
+        "past the shortest retention lucida_selfsystem.otel_traces_local 24.0h minus 6h margin = limit 18.0h, "
+        f"so its oldest rows may be gone (last failure: {FAILURE}); re-injecting"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_retries_the_capture_right_up_to_the_ttl_limit(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    clock.value = datetime(2026, 7, 17, 2, 0, 0, tzinfo=timezone.utc)
+    state = await queue.resume()
+    assert state.phase == "waiting_capture"
+
+
+@pytest.mark.asyncio
+async def test_a_longer_shortest_ttl_allows_an_older_window(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(
+        tmp_path, retention=_retention("lucida.otel_traces_local", 3 * DAY))
+    clock.value = datetime(2026, 7, 18, 8, 0, 0, tzinfo=timezone.utc)  # 48h: inside 72h - 6h
+    state = await queue.resume()
+    assert state.phase == "waiting_capture"
+    assert "shortest retention lucida.otel_traces_local 72.0h minus 6h margin = limit 66.0h" in state.reason
+
+
+@pytest.mark.asyncio
+async def test_unreadable_table_retention_refuses_and_names_the_tables(tmp_path: Path) -> None:
+    unreadable = [{"table": f"lucida.t{i}", "error": "TTL 계산 실패: Code: 62"} for i in range(4)]
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(
+        tmp_path, retention=_retention(unreadable=unreadable))
+    run_id = paused.current_run_id
+    clock.value = datetime(2026, 7, 16, 9, 0, tzinfo=timezone.utc)  # young window: still refused
+    state = await queue.resume()
+    assert state.phase == "cycle_reset"
+    assert getattr(scheduler, "rearmed", []) == []
+    assert state.reason.startswith(
+        f"capture-only retry refused for {run_id}: window start 2026-07-16T08:00:00Z is 1.0h old; "
+        "retention of 4 captured table(s) could not be read: lucida.t0 (TTL 계산 실패: Code: 62), "
+        "lucida.t1 (TTL 계산 실패: Code: 62), lucida.t2 (TTL 계산 실패: Code: 62) and 1 more "
         f"(last failure: {FAILURE}); re-injecting"
     )
 
 
 @pytest.mark.asyncio
-async def test_resume_retries_the_capture_right_up_to_the_age_limit(tmp_path: Path) -> None:
-    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
-    clock.value = datetime(2026, 7, 18, 8, 0, 0, tzinfo=timezone.utc)
+async def test_failed_retention_check_falls_back_to_the_constant_limit(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(
+        tmp_path, retention=RuntimeError("unknown argument: --retention-check"))
+    run_id = paused.current_run_id
+    clock.value = datetime(2026, 7, 16, 20, 0, 0, tzinfo=timezone.utc)  # 12h: inside the fallback
     state = await queue.resume()
     assert state.phase == "waiting_capture"
+    assert ("window start 12.0h old, retention check failed (RuntimeError: unknown argument: --retention-check), "
+            "within the fallback limit 12h; last failure") in state.reason
+
+
+@pytest.mark.asyncio
+async def test_failed_retention_check_refuses_past_the_constant_limit(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(
+        tmp_path, retention=RuntimeError("clickhouse unreachable"))
+    run_id = paused.current_run_id
+    clock.value = datetime(2026, 7, 16, 20, 0, 1, tzinfo=timezone.utc)
+    state = await queue.resume()
+    assert state.phase == "cycle_reset"
+    assert state.reason.startswith(
+        f"capture-only retry refused for {run_id}: window start 2026-07-16T08:00:00Z is 12.0h old, "
+        "retention check failed (RuntimeError: clickhouse unreachable), past the fallback limit 12h "
+        f"(last failure: {FAILURE}); re-injecting"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_ttl_on_any_captured_table_allows_the_retry(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(
+        tmp_path, retention=_retention(shortest_table=None))
+    clock.value = datetime(2026, 7, 26, 8, 0, tzinfo=timezone.utc)
+    state = await queue.resume()
+    assert state.phase == "waiting_capture"
+    assert "window start 240.0h old, no captured table has a TTL;" in state.reason
 
 
 @pytest.mark.asyncio
@@ -2106,6 +2197,7 @@ async def test_resume_with_bad_run_evidence_restarts_the_cycle_instead(tmp_path:
     state = await queue.resume()
     assert state.phase == "cycle_reset"
     assert getattr(scheduler, "rearmed", []) == []
+    assert queue.retention_calls == []
     assert state.reason is None or "capture-only" not in state.reason
 
 
@@ -2130,3 +2222,126 @@ async def test_resume_retry_is_refused_if_the_trainer_cannot_be_frozen(tmp_path:
         await queue.resume()
     assert queue.snapshot().phase == "paused"
     assert getattr(scheduler, "rearmed", []) == []
+
+
+# 2회차(리뷰 하): 살아남은 변이 RM1, RM2, RM3, RM6 을 잡는 단언과 멈춘 이유로 좁히기.
+@pytest.mark.asyncio
+async def test_a_failed_rearm_thaws_the_trainer_it_froze(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    calls = []
+    queue._freeze_trainer = lambda: calls.append("freeze")  # type: ignore[method-assign]
+    queue._thaw_trainer = lambda: calls.append("thaw")  # type: ignore[method-assign]
+
+    def broken(run_id):
+        raise RuntimeError("only a failed capture job can be re-armed")
+
+    scheduler.rearm = broken
+    with pytest.raises(RuntimeError, match="re-armed"):
+        await queue.resume()
+    assert calls == ["freeze", "thaw"]
+    assert queue.snapshot().phase == "paused"
+
+
+@pytest.mark.asyncio
+async def test_without_phases_json_the_window_is_the_jobs_own(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    run_id = paused.current_run_id
+    (runner.artifact_store.root / run_id / "phases.json").unlink()
+    scheduler.jobs[run_id].capture_start = "2026-07-16T10:00:00Z"
+    scheduler.jobs[run_id].capture_end = "2026-07-16T10:35:00Z"
+    clock.value = datetime(2026, 7, 16, 14, 0, tzinfo=timezone.utc)
+    state = await queue.resume()
+    assert state.phase == "waiting_capture"
+    assert queue.retention_calls == [("2026-07-16T10:00:00Z", "2026-07-16T10:35:00Z")]
+    assert "over the unchanged window 2026-07-16T10:00:00Z..2026-07-16T10:35:00Z" in state.reason
+    assert "window start 4.0h old" in state.reason
+
+
+@pytest.mark.asyncio
+async def test_with_capture_off_resume_restarts_the_cycle(tmp_path: Path, monkeypatch) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    monkeypatch.setattr("app.live_queue.capture_enabled", lambda: False)
+    state = await queue.resume()
+    assert state.phase == "cycle_reset"
+    assert getattr(scheduler, "rearmed", []) == []
+    assert queue.retention_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_second_retry_clears_the_retry_marker(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    run_id = paused.current_run_id
+    await queue.resume()  # retry 1
+    scheduler.jobs[run_id].status = "failed"
+    scheduler.jobs[run_id].failure = "capture command failed: still broken"
+    state = await queue.tick()
+    assert state.phase == "paused" and state.pending_retry_capture_run_id == run_id
+    clock.value = datetime(2026, 7, 17, 3, 0, tzinfo=timezone.utc)  # past 18h
+    state = await queue.resume()
+    assert state.phase == "cycle_reset"
+    assert state.pending_retry_capture_run_id is None
+    assert state.reason.startswith(f"capture-only retry refused for {run_id}")
+
+
+@pytest.mark.asyncio
+async def test_a_pause_outside_the_capture_wait_does_not_become_a_capture_retry(tmp_path: Path) -> None:
+    # 리뷰 하: the capture job runs on its own from t2+20m, inside the 30m cooldown.
+    # A pause taken during the cooldown for another reason must not turn into a
+    # capture-only retry just because the job meanwhile failed.
+    queue, runner, coordinator, scheduler, clock = make_cycle_queue(tmp_path)
+    queue._capture_retention = lambda s, e: _retention()  # type: ignore[method-assign]
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+    _complete_injection(runner, scheduler, clock, run_id,
+                        t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    state = await queue.tick()  # -> cooldown
+    assert state.phase == "cycle_cooldown"
+    paused = queue._pause(state, "DIRTY coordinator state blocks the live queue")
+    assert paused.paused_from_phase == "cycle_cooldown"
+    scheduler.jobs[run_id].status = "failed"
+    scheduler.jobs[run_id].failure = FAILURE
+    state = await queue.resume()
+    assert state.phase == "cycle_reset"
+    assert getattr(scheduler, "rearmed", []) == []
+
+
+@pytest.mark.asyncio
+async def test_a_pause_from_an_older_runner_counts_only_with_the_capture_reason(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(tmp_path)
+    run_id = paused.current_run_id
+    legacy = paused.model_copy(update={"paused_from_phase": None})
+    queue._write(legacy)
+    state = await queue.resume()
+    assert state.phase == "waiting_capture"  # the capture tick's reason marks it
+
+    (tmp_path / "other").mkdir()
+    queue2, runner2, scheduler2, clock2, paused2 = await _capture_failed_and_paused(tmp_path / "other")
+    queue2._write(paused2.model_copy(update={"paused_from_phase": None, "reason": "operator halt"}))
+    state = await queue2.resume()
+    assert state.phase == "cycle_reset"
+    assert getattr(scheduler2, "rearmed", []) == []
+
+
+def test_capture_retention_runs_the_trusted_capture_script(tmp_path: Path, monkeypatch) -> None:
+    queue, runner, coordinator, scheduler, clock = make_cycle_queue(tmp_path)
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append((argv, kwargs.get("timeout")))
+        return subprocess.CompletedProcess(argv, 0, json.dumps(_retention()), "")
+
+    monkeypatch.setattr("app.live_queue.subprocess.run", run)
+    queue.required_paths["capture_script"] = Path("/opt/lucida/capture-eval-case.sh")
+    doc = queue._capture_retention("2026-07-16T08:00:00Z", "2026-07-16T10:45:00Z")
+    assert doc["shortest"]["ttl_seconds"] == DAY
+    assert seen == [(["/opt/lucida/capture-eval-case.sh", "--retention-check", "--window-start",
+                      "2026-07-16T08:00:00Z", "--window-end", "2026-07-16T10:45:00Z"], 300)]
+
+    monkeypatch.setattr("app.live_queue.subprocess.run",
+                        lambda argv, **k: subprocess.CompletedProcess(argv, 2, "", "die: unknown argument"))
+    with pytest.raises(RuntimeError, match="unknown argument"):
+        queue._capture_retention("a", "b")
+    monkeypatch.setattr("app.live_queue.subprocess.run",
+                        lambda argv, **k: subprocess.CompletedProcess(argv, 0, "{}", ""))
+    with pytest.raises(RuntimeError, match="no table list"):
+        queue._capture_retention("a", "b")
