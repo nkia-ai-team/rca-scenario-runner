@@ -226,6 +226,10 @@ def _non_negative_seconds(env_name: str, default: timedelta) -> timedelta:
 CAPTURE_RETRY_FALLBACK_MAX_AGE = _non_negative_seconds(
     "CAPTURE_RETRY_FALLBACK_MAX_AGE_SEC", timedelta(hours=12)
 )
+# CH 밖에서 캡처가 담는 시계열 저장소의 보존(2026-11-16 CAPFIX 6회차, 재리뷰 하 5). VictoriaMetrics 는 119 에서
+# -retentionPeriod=7d(2026-11-13 읽기). CH 표의 TTL 과 함께 가장 짧은 쪽을 상한으로 쓴다. 담는 CH 표에 TTL 이
+# 하나도 없을 때도 이 값이 상한이 된다. 보존을 바꾸면 환경변수로 맞춘다.
+CAPTURE_RETRY_VM_RETENTION = _cycle_duration("CAPTURE_RETRY_VM_RETENTION_SEC", timedelta(days=7))
 
 QueuePhase = Literal[
     "idle",
@@ -1620,18 +1624,21 @@ class LiveScenarioQueue:
                     f"{names}{more} {tail}",
                 )
             shortest = retention.get("shortest")
+            # 가장 짧은 보존: CH 표의 최단 TTL 과 VictoriaMetrics 보존 가운데 작은 쪽. CH 에 TTL 이 없으면 VM 보존.
+            stores = [("victoriametrics retention", CAPTURE_RETRY_VM_RETENTION)]
+            if shortest is not None:
+                stores.append((shortest["table"], timedelta(seconds=int(shortest["ttl_seconds"]))))
+            name, ttl = min(stores, key=lambda x: (x[1], x[0]))
+            limit = ttl - CAPTURE_RETRY_TTL_MARGIN
+            ttl_h = ttl.total_seconds() / 3600
+            limit_h = limit.total_seconds() / 3600
+            basis = (f"shortest retention {name} {ttl_h:.1f}h minus "
+                     f"{margin_h:g}h margin = limit {limit_h:.1f}h")
             if shortest is None:
-                limit_text = "no captured table has a TTL"
-            else:
-                ttl = timedelta(seconds=int(shortest["ttl_seconds"]))
-                limit = ttl - CAPTURE_RETRY_TTL_MARGIN
-                ttl_h = ttl.total_seconds() / 3600
-                limit_h = limit.total_seconds() / 3600
-                basis = (f"shortest retention {shortest['table']} {ttl_h:.1f}h minus "
-                         f"{margin_h:g}h margin = limit {limit_h:.1f}h")
-                if age > limit:
-                    return False, f"{refused}, past the {basis}, so its oldest rows may be gone {tail}"
-                limit_text = basis
+                basis += " (no captured ClickHouse table has a TTL)"
+            if age > limit:
+                return False, f"{refused}, past the {basis}, so its oldest rows may be gone {tail}"
+            limit_text = basis
         return (
             True,
             f"resumed: capture-only retry of {run_id} over the unchanged window "

@@ -2181,13 +2181,35 @@ async def test_failed_retention_check_refuses_past_the_constant_limit(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_no_ttl_on_any_captured_table_allows_the_retry(tmp_path: Path) -> None:
+async def test_no_ttl_on_any_captured_table_is_still_bounded_by_victoriametrics(tmp_path: Path) -> None:
+    # 6회차(재리뷰 하 5): CH 표에 TTL 이 없어도 VictoriaMetrics 보존(기본 7일) 에서 여유를 뺀 162h 가 상한이다.
     queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(
         tmp_path, retention=_retention(shortest_table=None))
-    clock.value = datetime(2026, 7, 26, 8, 0, tzinfo=timezone.utc)
+    clock.value = datetime(2026, 7, 23, 2, 0, tzinfo=timezone.utc)  # 162.0h
     state = await queue.resume()
     assert state.phase == "waiting_capture"
-    assert "window start 240.0h old, no captured table has a TTL;" in state.reason
+    assert ("window start 162.0h old, shortest retention victoriametrics retention 168.0h minus 6h margin = "
+            "limit 162.0h (no captured ClickHouse table has a TTL);") in state.reason
+
+
+@pytest.mark.asyncio
+async def test_no_ttl_past_the_victoriametrics_retention_re_injects(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(
+        tmp_path, retention=_retention(shortest_table=None))
+    clock.value = datetime(2026, 7, 23, 2, 0, 1, tzinfo=timezone.utc)
+    state = await queue.resume()
+    assert state.phase == "cycle_reset"
+    assert "past the shortest retention victoriametrics retention 168.0h" in state.reason
+
+
+@pytest.mark.asyncio
+async def test_victoriametrics_retention_caps_a_longer_clickhouse_ttl(tmp_path: Path) -> None:
+    queue, runner, scheduler, clock, paused = await _capture_failed_and_paused(
+        tmp_path, retention=_retention("lucida.syslog_local", 90 * DAY))
+    clock.value = datetime(2026, 7, 26, 8, 0, tzinfo=timezone.utc)  # 240h: CH 90일 안이지만 VM 7일 밖
+    state = await queue.resume()
+    assert state.phase == "cycle_reset"
+    assert "past the shortest retention victoriametrics retention 168.0h minus 6h margin = limit 162.0h" in state.reason
 
 
 @pytest.mark.asyncio
