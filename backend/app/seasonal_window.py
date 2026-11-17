@@ -29,6 +29,14 @@
       코드에 두지 않고 기록마다 출처를 둔다. 정지 칸은 정지 앞뒤다: 기록의 start 부터 1시간(정지로
       가는 저하 구간)과 end 부터 1시간(재기동과 밀린 수집). 정지 가운데는 표본이 없어 값이 오염되지
       않고 그 칸의 주 수만 준다.
+    - 테스트베드 장애(같은 파일, kind "testbed_fault", v4 ORAFIX Q25 답 3): 러너 밖에서 난 테스트베드
+      장애 구간을 손으로 적는다. 관측은 이어졌으므로 구간 전부가 장애 값이다. 칸은 start 부터 end 뒤
+      1시간(회복 직후)까지 걸친 모든 시각이다. 기록의 scope(domains, services)가 그 장애가 값을 바꾼
+      경로다. 녹화 시나리오의 domain 이 domains 에 있거나, 정답지 서비스(scoring accept, partial,
+      root_cause target_id, trigger_target_id)가 services 에 있으면 그 녹화의 겹침에 넣는다
+      (``fault_applies``). 시나리오를 모르면 넣는다.
+    출처 구분: 주입 칸은 러너 기록(runs 폴더), 정지 칸과 장애 칸은 손 기록(이 파일)이다. 보고의
+    ``origins`` 가 어느 키가 어느 출처인지 적는다. 표시는 연구원용 기록이고 녹화를 막지 않는다.
 
 명령 (표준 라이브러리만 쓴다. 러너 호스트에서 표준 입력으로 흘려 돌릴 수 있다)
     python3 seasonal_window.py window --runs-root DIR [--outages FILE | --outages-json JSON]
@@ -65,6 +73,10 @@ DEFAULT_LEAD = timedelta(minutes=130)
 DEFAULT_BAND_STRATEGY = os.environ.get("OBSERVER_DEFAULT_BAND_STRATEGY", "auto_single")
 AUTO_SINGLE = "auto_single"
 OUTAGE_EDGE = timedelta(hours=1)
+OBSERVATION_OUTAGE = "observation_outage"
+TESTBED_FAULT = "testbed_fault"
+# A fault's values stay off for a while after it ends (reconnects, catch-up): one more hour is its cell.
+FAULT_TAIL = timedelta(hours=1)
 HOUR = timedelta(hours=1)
 KST = timezone(timedelta(hours=9))
 WEEKDAY_KO = ("일", "월", "화", "수", "목", "금", "토")
@@ -73,6 +85,8 @@ LIMITS = (
     "지워진 실행 폴더는 기록이 없어 세지 못한다.",
     "정지는 관측 정지 기록 파일에 적힌 것만 센다. 칸은 정지 앞뒤 각 1시간이고, 정지 가운데 칸은 표본이 "
     "빠질 뿐 값이 오염되지 않아 세지 않는다.",
+    "러너 밖 테스트베드 장애는 같은 파일에 손으로 적힌 것만 센다(장애 칸, 구간 전부와 끝 뒤 1시간). 적지 않은 "
+    "장애는 세지 못한다.",
     "녹화가 쌓일수록 21일 창 안 칸 대부분이 겹치게 되어 이 표시로 가르는 힘이 약해진다.",
 )
 
@@ -235,8 +249,57 @@ def load_outages(path: Path | None = None, *, text: str | None = None) -> tuple[
             return [], f"invalid: outages[{index}] start/end"
         if not isinstance(source, str) or not source.strip():
             return [], f"invalid: outages[{index}].source"
-        out.append({"id": ident, "start": fmt(start), "end": fmt(end), "source": source})
+        kind = record.get("kind", OBSERVATION_OUTAGE)
+        if kind == OBSERVATION_OUTAGE:
+            out.append({"id": ident, "start": fmt(start), "end": fmt(end), "source": source})
+            continue
+        if kind != TESTBED_FAULT:
+            return [], f"invalid: outages[{index}].kind {kind!r}"
+        scope = record.get("scope")
+        if not isinstance(scope, dict):
+            return [], f"invalid: outages[{index}].scope"
+        lists = {}
+        for key in ("domains", "services"):
+            value = scope.get(key, [])
+            if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+                return [], f"invalid: outages[{index}].scope.{key}"
+            lists[key] = list(value)
+        if not lists["domains"] and not lists["services"]:
+            return [], f"invalid: outages[{index}].scope is empty"
+        target = record.get("target")
+        out.append({"id": ident, "kind": TESTBED_FAULT, "start": fmt(start), "end": fmt(end), "source": source,
+                    "target": target if isinstance(target, str) else None, "scope": lists})
     return out, "ok"
+
+
+def is_fault(record: dict[str, Any]) -> bool:
+    return record.get("kind") == TESTBED_FAULT
+
+
+def fault_span(record: dict[str, Any]) -> tuple[datetime, datetime]:
+    return parse_utc(record["start"]), parse_utc(record["end"]) + FAULT_TAIL
+
+
+def scenario_services(scenario: dict[str, Any]) -> set[str]:
+    """Answer-key services of a scenario-metadata entry (the names the scoring uses)."""
+    scoring = scenario.get("scoring") if isinstance(scenario.get("scoring"), dict) else {}
+    root = scenario.get("root_cause") if isinstance(scenario.get("root_cause"), dict) else {}
+    names = list(scoring.get("accept") or []) + list(scoring.get("partial") or [])
+    names += [root.get("target_id"), root.get("trigger_target_id")]
+    return {n for n in names if isinstance(n, str) and n}
+
+
+def fault_applies(record: dict[str, Any], scenario: dict[str, Any] | None) -> str | None:
+    """Why a testbed fault touches this scenario's path, or None. Unknown scenario: it does."""
+    if not isinstance(scenario, dict) or not scenario.get("domain"):
+        return "scenario unknown"
+    scope = record.get("scope") or {}
+    if scenario["domain"] in scope.get("domains", []):
+        return f"domain {scenario['domain']}"
+    shared = sorted(scenario_services(scenario) & set(scope.get("services", [])))
+    if shared:
+        return "service " + ", ".join(shared)
+    return None
 
 
 def outage_edges(record: dict[str, Any]) -> list[tuple[datetime, datetime]]:
@@ -276,7 +339,17 @@ def window_report(
             injection_hits.setdefault(cell, set()).add(window["run_id"])
     outage_hits: dict[int, set[str]] = {}
     outages_counted = []
+    fault_hits: dict[int, set[str]] = {}
+    faults_counted = []
     for record in outages:
+        if is_fault(record):
+            clipped = _clip(*fault_span(record), lo, hi)
+            if clipped is None:
+                continue
+            faults_counted.append(record)
+            for cell in hour_cells(*clipped):
+                fault_hits.setdefault(cell, set()).add(record["id"])
+            continue
         touched = False
         for edge in outage_edges(record):
             clipped = _clip(*edge, lo, hi)
@@ -305,6 +378,13 @@ def window_report(
         "outage_cells": _cell_rows(outage_hits, "outages"),
         "runs_counted": runs_counted,
         "outages_counted": outages_counted,
+        "fault_cells": _cell_rows(fault_hits, "faults"),
+        "faults_counted": faults_counted,
+        "origins": {
+            "runner": {"from": sources.get("runs_root"), "keys": ["injection_cells", "runs_counted"]},
+            "manual": {"from": sources.get("outages_path"),
+                       "keys": ["outage_cells", "outages_counted", "fault_cells", "faults_counted"]},
+        },
         "sources": sources,
         "limits": limits,
     }
@@ -316,16 +396,37 @@ def contaminated_cells(report: dict[str, Any]) -> set[int]:
     }
 
 
-def with_overlap(report: dict[str, Any], t1: datetime, t2: datetime) -> dict[str, Any]:
-    """Add this recording's injection cells and their overlap with the window's cells."""
+def scenario_faults(report: dict[str, Any], scenario: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Testbed faults of the window that touch this scenario's path, with why."""
+    out = []
+    for record in report.get("faults_counted", []):
+        why = fault_applies(record, scenario)
+        if why is not None:
+            out.append({"id": record["id"], "start": record["start"], "end": record["end"],
+                        "target": record.get("target"), "matched_by": why})
+    return out
+
+
+def with_overlap(report: dict[str, Any], t1: datetime, t2: datetime,
+                 scenario: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Add this recording's injection cells and their overlap with the window's cells.
+
+    Injection and outage cells count for every scenario; a testbed fault's cells only for the
+    scenarios on its path (``fault_applies``), which are also listed in ``scenario_faults``."""
     mine = hour_cells(t1, t2)
     dirty = contaminated_cells(report)
-    overlap = [c for c in mine if c in dirty]
+    faults = scenario_faults(report, scenario)
+    mine_faults = {f["id"] for f in faults}
+    fault_dirty = {row["cell"] for row in report.get("fault_cells", [])
+                   if mine_faults.intersection(row["faults"])}
+    overlap = [c for c in mine if c in dirty or c in fault_dirty]
     return {
         **report,
         "this_injection_cells": [{"cell": c, "kst": kst_label(c)} for c in mine],
         "overlap_cells": [{"cell": c, "kst": kst_label(c)} for c in overlap],
         "overlap": bool(overlap),
+        "scenario_faults": faults,
+        "fault_overlap_cells": [{"cell": c, "kst": kst_label(c)} for c in mine if c in fault_dirty],
     }
 
 
@@ -458,9 +559,10 @@ def plan_rows(
             inject_at - lead, days=days, windows=windows, outages=outages, sources={"outages_status": "ok"}
         )
         reasons = {row["cell"]: row["runs"] for row in report["injection_cells"]}
-        for row in report["outage_cells"]:
+        # A testbed fault counts for any scenario here: plan does not know which one will run.
+        for row in report["outage_cells"] + report["fault_cells"]:
             reasons.setdefault(row["cell"], [])
-            reasons[row["cell"]] = reasons[row["cell"]] + row["outages"]
+            reasons[row["cell"]] = reasons[row["cell"]] + row.get("outages", row.get("faults", []))
         cell, nxt = cell_of(inject_at), cell_of(inject_at + HOUR)
         rows.append({
             "inject_at": fmt(inject_at),

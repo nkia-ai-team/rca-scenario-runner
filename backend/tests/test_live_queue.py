@@ -11,6 +11,7 @@ import pytest
 
 from app.live_queue import (
     ARCHIVE_STATE_CHECK_NAME,
+    DOMAIN_PODS_CHECK_NAME,
     LIVE_SCENARIO_ORDER,
     PREFLIGHT_MAX_ATTEMPTS,
     ORACLE_CHECK_MAX_AGE,
@@ -910,6 +911,82 @@ async def test_oracle_check_alert_refuses_start_and_pauses_between_scenarios(tmp
     _oracle_check_dir(tmp_path, clock.value - timedelta(hours=1))
     resumed = await queue.resume()
     assert resumed.phase != "paused"
+
+
+def test_a_purge_failure_blocks_readiness_at_once(tmp_path: Path) -> None:
+    """v4 ORAFIX (Q25 answer 2): 11-16 every hourly purge failed with 'container not found' from
+    11:23 KST, but readiness went false only at 22:07 when the last good check passed 13 hours.
+    oracle-maintenance.sh purge now leaves PURGE_FAILED the moment it cannot reach the container:
+    readiness is false at once, with a fresh check result, and true again once the file is gone."""
+    queue, _, _, _, clock = make_queue(tmp_path)
+    queue.oracle_check_state_dir = _oracle_check_dir(tmp_path, clock.value - timedelta(minutes=30))
+    assert queue.readiness().checks[ORACLE_CHECK_NAME] is True
+    marker = tmp_path / "oracle-capacity" / "PURGE_FAILED"
+    marker.write_text(
+        "2026-11-16T02:23:01Z purge failed: in testbed-oracle-0: error: Internal error occurred: "
+        'unable to upgrade connection: container not found ("oracle")\n',
+        encoding="utf-8",
+    )
+    readiness = queue.readiness()
+    assert not readiness.ready and readiness.missing == [ORACLE_CHECK_NAME]
+    detail = readiness.details[ORACLE_CHECK_NAME]
+    assert detail.startswith("PURGE_FAILED 2026-11-16T02:23:01Z purge failed: in testbed-oracle-0")
+    assert 'container not found ("oracle")' in detail and "next purge" in detail
+    # It is read before ALERT and before staleness: the newest failure is the one shown.
+    _oracle_check_dir(tmp_path, clock.value - timedelta(hours=20), alert="t seed accounts: 1 below 150000\n")
+    assert queue.readiness().details[ORACLE_CHECK_NAME].startswith("PURGE_FAILED ")
+    marker.write_text("", encoding="utf-8")
+    assert "empty PURGE_FAILED file" in queue.readiness().details[ORACLE_CHECK_NAME]
+    marker.unlink()
+    _oracle_check_dir(tmp_path, clock.value - timedelta(minutes=30))
+    assert queue.readiness().checks[ORACLE_CHECK_NAME] is True
+
+
+@pytest.mark.asyncio
+async def test_a_domain_pod_not_ready_pauses_before_the_injection_only(tmp_path: Path) -> None:
+    """v4 ORAFIX (Q25 answer 2): every testbed app pod Ready is judged right before an injection
+    starts, not in readiness() (read while an injection may hold a pod down on purpose)."""
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    answers = ["1 of 7 app pods not Ready: rca-testbed-banking/testbed-oracle-0(CrashLoopBackOff)"]
+    calls = []
+
+    def probe():
+        calls.append(clock.value)
+        return answers[0]
+
+    queue.domain_pods_probe = probe
+    readiness = queue.readiness()
+    assert DOMAIN_PODS_CHECK_NAME not in readiness.checks and calls == []
+    await queue.start()
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == []
+    assert state.reason == (
+        f"operational readiness failed: {DOMAIN_PODS_CHECK_NAME} ({DOMAIN_PODS_CHECK_NAME}: "
+        "1 of 7 app pods not Ready: rca-testbed-banking/testbed-oracle-0(CrashLoopBackOff))"
+    )
+    assert len(calls) == 1
+    answers[0] = None
+    await queue.resume()
+    state = await queue.tick()
+    assert runner.started == [("F01-R", "run")]
+    assert len(calls) == 2
+    # A probe that raises blocks too (it cannot say the pods are fine); no probe, no check.
+
+    def broken():
+        raise RuntimeError("kubectl missing")
+
+    queue.domain_pods_probe = broken
+    assert queue._domain_pods_blocker() == (
+        f"operational readiness failed: {DOMAIN_PODS_CHECK_NAME} "
+        f"({DOMAIN_PODS_CHECK_NAME}: probe failed: RuntimeError: kubectl missing)"
+    )
+    queue.domain_pods_probe = None
+    assert queue._domain_pods_blocker() is None
+
+
+def test_compose_turns_the_domain_pods_check_on() -> None:
+    compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "- DOMAIN_PODS_CHECK=${DOMAIN_PODS_CHECK:-1}" in compose
 
 
 def _archive_facts(

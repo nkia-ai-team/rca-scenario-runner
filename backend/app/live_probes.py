@@ -2779,6 +2779,58 @@ def _response_json(response: Mapping[str, Any]) -> Mapping[str, Any]:
     return body
 
 
+# Domain app pods all Ready at injection start (testbed v4 ORAFIX, Q25 answer 2): 11-16 the bank Oracle
+# stayed in CrashLoopBackOff for 30 hours and nothing between scenarios looked at the pods. App pods are
+# the ones a controller owns (ReplicaSet, StatefulSet, DaemonSet): a standalone pod is a client an
+# executor started and is not part of the domain. Read with one kubectl get (no exec, nothing on a node).
+TESTBED_NAMESPACE_PREFIX = "rca-testbed-"
+APP_POD_OWNERS = frozenset({"ReplicaSet", "StatefulSet", "DaemonSet"})
+
+
+def testbed_pods_not_ready(
+    process_runner: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run,
+    *,
+    prefix: str = TESTBED_NAMESPACE_PREFIX,
+) -> str | None:
+    """None when every app pod of the testbed namespaces is Ready, else what is not (or why it
+    could not be read). Succeeded pods are finished work and do not count."""
+    try:
+        result = process_runner(
+            ["kubectl", "--kubeconfig", KUBECONFIG, "--request-timeout=20s", "get", "pods", "-A", "-o", "json"],
+            check=True, capture_output=True, text=True, env=_read_only_environment(), timeout=30,
+        )
+        items = json.loads(result.stdout).get("items") or []
+    except Exception as error:
+        detail = getattr(error, "stderr", None) or str(error)
+        return f"could not list the testbed pods: {type(error).__name__}: {str(detail).strip()[:200]}"
+    seen = 0
+    not_ready = []
+    for item in items:
+        meta = item.get("metadata") or {}
+        namespace = meta.get("namespace") or ""
+        if not namespace.startswith(prefix):
+            continue
+        owners = {o.get("kind") for o in meta.get("ownerReferences") or []}
+        if not owners & APP_POD_OWNERS:
+            continue
+        status = item.get("status") or {}
+        if status.get("phase") == "Succeeded":
+            continue
+        seen += 1
+        if any(c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions") or []):
+            continue
+        waiting = sorted({
+            ((c.get("state") or {}).get("waiting") or {}).get("reason")
+            for c in status.get("containerStatuses") or []
+        } - {None})
+        not_ready.append(f"{namespace}/{meta.get('name')}({','.join(waiting) or status.get('phase') or 'NotReady'})")
+    if seen == 0:
+        return f"no app pods in namespaces {prefix}*"
+    if not_ready:
+        return f"{len(not_ready)} of {seen} app pods not Ready: " + " ".join(sorted(not_ready))
+    return None
+
+
 def _read_only_environment() -> dict[str, str]:
     return {
         "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"),

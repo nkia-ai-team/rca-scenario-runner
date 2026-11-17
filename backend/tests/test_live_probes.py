@@ -2238,3 +2238,71 @@ def test_pod_ready_still_reads_a_pod_inside_its_startup_probe_as_starting(tmp_pa
     )
 
     assert _restaurant_ready(tmp_path, fakes)["value"] is True
+
+
+# ---- v4 ORAFIX: every testbed app pod Ready at injection start ----
+
+
+def _testbed_pod(namespace, name, *, ready=True, owner="ReplicaSet", phase="Running", waiting=None):
+    meta = {"namespace": namespace, "name": name}
+    if owner:
+        meta["ownerReferences"] = [{"kind": owner, "name": "x"}]
+    state = {"waiting": {"reason": waiting}} if waiting else {"running": {}}
+    return {"metadata": meta, "status": {
+        "phase": phase, "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+        "containerStatuses": [{"name": "c", "state": state}]}}
+
+
+def _kubectl_pods_answer(items):
+    seen = []
+
+    def run(cmd, **kwargs):
+        seen.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, json.dumps({"items": items}), "")
+
+    return run, seen
+
+
+def test_testbed_pods_not_ready_reads_app_pods_with_one_list() -> None:
+    from app.live_probes import KUBECONFIG, testbed_pods_not_ready
+
+    items = [
+        _testbed_pod("rca-testbed-banking", "testbed-oracle-0", owner="StatefulSet"),
+        _testbed_pod("rca-testbed-commerce", "testbed-order-1"),
+        # an executor's own client pod (no controller) and a finished job are not domain app pods
+        _testbed_pod("rca-testbed-commerce", "client-x", ready=False, owner=None),
+        _testbed_pod("rca-testbed-food", "job-y", ready=False, owner="Job", phase="Succeeded"),
+        _testbed_pod("rca-testbed-food", "batch-z", ready=False, owner="ReplicaSet", phase="Succeeded"),
+        # other namespaces are not the testbed
+        _testbed_pod("kube-system", "coredns-a", ready=False),
+    ]
+    run, seen = _kubectl_pods_answer(items)
+    assert testbed_pods_not_ready(run) is None
+    assert len(seen) == 1
+    cmd, kwargs = seen[0]
+    assert cmd == ["kubectl", "--kubeconfig", KUBECONFIG, "--request-timeout=20s", "get", "pods", "-A", "-o", "json"]
+    assert kwargs["check"] is True
+
+
+def test_testbed_pods_not_ready_names_every_pod_that_is_not() -> None:
+    from app.live_probes import testbed_pods_not_ready
+
+    items = [
+        _testbed_pod("rca-testbed-banking", "testbed-oracle-0", ready=False, owner="StatefulSet", waiting="CrashLoopBackOff"),
+        _testbed_pod("rca-testbed-banking", "testbed-ledger-1", ready=False),
+        _testbed_pod("rca-testbed-banking", "testbed-api-1"),
+    ]
+    run, _ = _kubectl_pods_answer(items)
+    assert testbed_pods_not_ready(run) == (
+        "2 of 3 app pods not Ready: rca-testbed-banking/testbed-ledger-1(Running) "
+        "rca-testbed-banking/testbed-oracle-0(CrashLoopBackOff)"
+    )
+    run, _ = _kubectl_pods_answer([_testbed_pod("kube-system", "coredns-a")])
+    assert testbed_pods_not_ready(run) == "no app pods in namespaces rca-testbed-*"
+
+    def refused(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd, "", "The connection to the server was refused\n")
+
+    assert testbed_pods_not_ready(refused) == (
+        "could not list the testbed pods: CalledProcessError: The connection to the server was refused"
+    )

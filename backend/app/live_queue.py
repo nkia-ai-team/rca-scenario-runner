@@ -37,7 +37,7 @@ from app.decoys import (
     load_decoy_policy,
     partition_decoy_alarms,
 )
-from app.live_probes import _is_run_directory, _run_intervals
+from app.live_probes import _is_run_directory, _run_intervals, testbed_pods_not_ready
 from app.pass_mode import (
     capture_enabled,
     golden_reset_enabled,
@@ -124,6 +124,14 @@ TRANSIENT_READINESS_CHECKS = frozenset({"preflight_signals", "capture_self_check
 # check writes it into last.json as check_period_hours, which is read here. A last.json without
 # the field (older script) gets the script's default, 6h, so 13h.
 ORACLE_CHECK_NAME = "oracle_maintenance_check"
+# oracle-maintenance.sh purge leaves PURGE_FAILED in the same directory the moment a purge cannot reach
+# the Oracle container (v4 ORAFIX, Q25 answer 2): readiness is false at once instead of after the
+# 13-hour staleness limit. The next purge that gets through removes it.
+ORACLE_PURGE_FAILED_FILE = "PURGE_FAILED"
+# Every app pod of the testbed namespaces Ready (app.live_probes.testbed_pods_not_ready). Judged only
+# at injection start, where no scenario holds a pod down on purpose; never in readiness(), which is
+# also read while an injection runs.
+DOMAIN_PODS_CHECK_NAME = "domain_pods_ready"
 ORACLE_CHECK_DEFAULT_PERIOD = timedelta(hours=6)
 
 
@@ -545,8 +553,12 @@ class LiveScenarioQueue:
         oracle_check_max_age: timedelta | None = None,
         archive_state_dir: Path | None = None,
         archive_state_max_facts_age: timedelta = ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE,
+        domain_pods_probe: "Callable[[], str | None] | None" = None,
     ) -> None:
         self.runner = runner
+        # None while every testbed app pod is Ready, else what is not. None (no probe) leaves the
+        # check out (unit tests, older deployments). Called only right before an injection starts.
+        self.domain_pods_probe = domain_pods_probe
         # Where oracle-maintenance.sh check leaves last.json and ALERT (mounted read-only).
         # None leaves the check out of readiness (unit tests, older deployments).
         self.oracle_check_state_dir = oracle_check_state_dir
@@ -677,6 +689,7 @@ class LiveScenarioQueue:
         """Read the banking Oracle check's last result; ALERT or a stale result blocks.
 
         Not a probe: the file is the check's own verdict, written by cron on tb-ops.
+        PURGE_FAILED present (the last purge could not reach the container) -> blocked at once.
         ALERT present -> blocked with its reasons. No last.json, or one older than
         the limit (check period from last.json x 2 + 1h, or ``oracle_check_max_age`` when
         set; two failed or missed runs) -> blocked as stale. Never
@@ -688,7 +701,18 @@ class LiveScenarioQueue:
         name = ORACLE_CHECK_NAME
         alert = self.oracle_check_state_dir / "ALERT"
         last = self.oracle_check_state_dir / "last.json"
+        purge_failed = self.oracle_check_state_dir / ORACLE_PURGE_FAILED_FILE
         try:
+            if purge_failed.exists():
+                text = " ".join(
+                    line.strip()
+                    for line in purge_failed.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if line.strip()
+                ) or "empty PURGE_FAILED file"
+                return {name: False}, {
+                    name: f"PURGE_FAILED {text} (the Oracle container could not be reached; the next purge "
+                    "that gets through clears it)"[:600]
+                }
             if alert.exists():
                 reasons = [
                     line.strip()
@@ -1181,6 +1205,11 @@ class LiveScenarioQueue:
             )
             self._write(deferred)
             return deferred, None, None
+        # Every domain app pod Ready before this injection (v4 ORAFIX); the previous scenario's
+        # cleanup and recovery are done by now, so a pod down here is a broken testbed.
+        blocker = self._domain_pods_blocker()
+        if blocker is not None:
+            return self._pause(state, blocker), None, None
         # R6 preflight gate: prove [t1-10m, t1] is clean before injecting.
         short_circuit, verdict = self._preflight_gate(state, scenario_id)
         if short_circuit is not None:
@@ -1534,6 +1563,21 @@ class LiveScenarioQueue:
             self.injection_reserved = False
         return await asyncio.to_thread(self._enter_cycle_running, state, run, verdict)
 
+    def _domain_pods_blocker(self) -> str | None:
+        """Pause reason when a testbed app pod is not Ready at injection start, else None."""
+        if self.domain_pods_probe is None:
+            return None
+        try:
+            detail = self.domain_pods_probe()
+        except Exception as error:
+            detail = f"probe failed: {type(error).__name__}: {error}"
+        if detail is None:
+            return None
+        return (
+            f"operational readiness failed: {DOMAIN_PODS_CHECK_NAME} "
+            f"({DOMAIN_PODS_CHECK_NAME}: {str(detail)[:600]})"
+        )
+
     def _cycle_buffer_gate(
         self, state: LiveQueueState, scenario_id: str
     ) -> tuple[LiveQueueState | None, PreflightVerdict | None]:
@@ -1550,6 +1594,11 @@ class LiveScenarioQueue:
                 ),
                 None,
             )
+        # A domain app pod that is not Ready at injection start is a broken testbed, not a scenario
+        # effect (none runs yet): needs a person, so pause rather than spend the cycle.
+        blocker = self._domain_pods_blocker()
+        if blocker is not None:
+            return self._pause(state, blocker), None
         # None = decoys off; a list (possibly empty) = decoys on for this cycle.
         decoys = state.cycle_decoys if state.cycle_decoy_seed is not None else None
         if self.preflight_probe is not None:
@@ -2186,6 +2235,19 @@ class LiveScenarioQueue:
         seasonal["judgement"] = seasonal_window.judgement(band, periodic_count)
         return golden_stream, seasonal
 
+    def _scenario_entry(self, scenario_id: str | None) -> dict[str, Any] | None:
+        """The scenario-metadata entry (domain, scoring) that decides which hand-written testbed
+        faults touch this recording's path (seasonal_window.fault_applies). None when unreadable:
+        the fault then counts (recording only, never blocks)."""
+        if not scenario_id:
+            return None
+        try:
+            registry = json.loads(self.runner.scenario_metadata_path.read_text(encoding="utf-8"))
+            entry = (registry.get("scenarios") or {}).get(scenario_id)
+        except Exception:
+            return None
+        return entry if isinstance(entry, dict) else None
+
     def _write_cycle_phases(self, state: LiveQueueState) -> None:
         """Write <run-id>/phases.json (spec §2.2 phases[]) so the capture invoker
         forwards it as --phases-json. Boundaries are the actual recorded cycle
@@ -2206,7 +2268,10 @@ class LiveScenarioQueue:
         seasonal = state.cycle_seasonal_window
         if isinstance(seasonal, dict) and seasonal.get("status") == "ok":
             seasonal = seasonal_window.with_overlap(
-                seasonal, parse_utc(t1, field="t1"), parse_utc(t2, field="t2")
+                seasonal,
+                parse_utc(t1, field="t1"),
+                parse_utc(t2, field="t2"),
+                scenario=self._scenario_entry(state.current_scenario_id),
             )
         document = {
             "schema_version": "2.0",
@@ -3228,6 +3293,12 @@ def get_live_queue() -> LiveScenarioQueue:
                 timedelta(seconds=int(os.environ["PETITION_ARCHIVE_STATE_MAX_AGE_SEC"]))
                 if os.environ.get("PETITION_ARCHIVE_STATE_MAX_AGE_SEC", "").strip()
                 else ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE
+            ),
+            # On unless DOMAIN_PODS_CHECK=0 (a testbed without the rca-testbed- namespaces).
+            domain_pods_probe=(
+                None
+                if os.environ.get("DOMAIN_PODS_CHECK", "1").strip().lower() in {"0", "false", "no", "off"}
+                else testbed_pods_not_ready
             ),
         )
     return _queue

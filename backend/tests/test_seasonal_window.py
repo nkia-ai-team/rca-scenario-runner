@@ -135,6 +135,47 @@ def test_outage_ledger_status(tmp_path: Path) -> None:
         assert records == [] and status.startswith("invalid"), bad
 
 
+def test_ledger_reads_testbed_faults_with_their_path() -> None:
+    """kind testbed_fault (v4 ORAFIX, Q25 answer 3): a fault outside the runner, with the path it
+    changed. A malformed fault refuses the whole ledger like any other record."""
+    fault = {"id": "f1", "kind": "testbed_fault", "target": "bank db", "start": "2026-11-16T01:20:14Z",
+             "end": "2026-11-17T08:51:40Z", "source": "ORA.md",
+             "scope": {"domains": ["core-banking"], "services": ["commerce-payment"]}}
+    plain = {"id": "o1", "start": "2026-10-30T16:33:00Z", "end": "2026-11-09T08:12:00Z", "source": "board"}
+    records, status = sw.load_outages(text=json.dumps({"outages": [plain, fault]}))
+    assert status == "ok"
+    assert records == [plain, fault]
+    only_services = {**fault, "scope": {"services": ["commerce-payment"]}}
+    assert sw.load_outages(text=json.dumps({"outages": [only_services]}))[0][0]["scope"] == {
+        "domains": [], "services": ["commerce-payment"]}
+    for bad in (
+        {**fault, "kind": "storm"},
+        {**fault, "scope": None},
+        {**fault, "scope": {}},
+        {**fault, "scope": {"domains": "core-banking"}},
+        {**fault, "scope": {"domains": [""]}},
+        {**fault, "scope": {"services": [1]}},
+    ):
+        records, status = sw.load_outages(text=json.dumps({"outages": [plain, bad]}))
+        assert records == [] and status.startswith("invalid"), bad
+
+
+def test_fault_applies_by_domain_or_answer_key_service() -> None:
+    fault = {"scope": {"domains": ["core-banking"], "services": ["commerce-payment", "commerce-order"]}}
+    assert sw.fault_applies(fault, {"domain": "core-banking"}) == "domain core-banking"
+    assert sw.fault_applies(fault, {"domain": "commerce", "scoring": {"accept": ["x"], "partial": [
+        "commerce-order", "commerce-payment"]}}) == "service commerce-order, commerce-payment"
+    assert sw.fault_applies(fault, {"domain": "commerce", "root_cause": {"target_id": "commerce-payment"}}) \
+        == "service commerce-payment"
+    assert sw.fault_applies(fault, {"domain": "commerce", "root_cause": {"trigger_target_id": "commerce-order"}}) \
+        == "service commerce-order"
+    assert sw.fault_applies(fault, {"domain": "commerce", "scoring": {"accept": ["commerce-postgres"]}}) is None
+    assert sw.fault_applies(fault, {"domain": "food-delivery"}) is None
+    # Unknown scenario: counted (the mark is a record for researchers, never a gate).
+    assert sw.fault_applies(fault, None) == "scenario unknown"
+    assert sw.fault_applies(fault, {"title": "no domain"}) == "scenario unknown"
+
+
 # ------------------------------------------------------------------ window
 
 RESTORE = utc("2026-11-13T04:10:00Z")  # window [10-23 04:10, 11-13 04:10)
@@ -204,6 +245,61 @@ def test_overlap_line_inputs() -> None:
     outage = {"id": "o", "start": "2026-11-09T08:12:00Z", "end": "2026-11-09T08:12:00Z", "source": "s"}
     with_outage = _report([], [outage])
     assert sw.with_overlap(with_outage, utc("2026-11-16T08:30:00Z"), utc("2026-11-16T08:40:00Z"))["overlap"]
+
+
+def test_fault_counts_its_whole_span_and_one_hour_after() -> None:
+    """Observation went on through a testbed fault, so every hour of it carries fault values, and
+    the hour after the end carries the recovery. Hand-written cells are kept apart from the runner's."""
+    fault = {"id": "bank", "kind": "testbed_fault", "target": "t", "start": "2026-11-12T22:20:14Z",
+             "end": "2026-11-13T01:51:40Z", "source": "s", "scope": {"domains": ["core-banking"], "services": []}}
+    report = _report([{"run_id": "R", "t1": "2026-11-13T00:10:00Z", "end": "2026-11-13T00:20:00Z"}], [fault])
+    thu, fri = 4 * 24, 5 * 24
+    assert [row["cell"] for row in report["fault_cells"]] == [thu + 22, thu + 23, fri + 0, fri + 1, fri + 2]
+    assert all(row["faults"] == ["bank"] for row in report["fault_cells"])
+    assert report["faults_counted"] == [fault]
+    assert report["outage_cells"] == [] and report["outages_counted"] == []
+    # injection cells stay the runner's; the fault is not an outage edge.
+    assert [row["cell"] for row in report["injection_cells"]] == [fri + 0]
+    assert report["origins"]["runner"]["keys"] == ["injection_cells", "runs_counted"]
+    assert "fault_cells" in report["origins"]["manual"]["keys"]
+    assert any("손으로 적힌 것만" in line for line in report["limits"])
+    # A fault that ended (with its tail) before the window is not counted.
+    old = {**fault, "start": "2026-10-01T00:00:00Z", "end": "2026-10-01T02:00:00Z"}
+    assert _report([], [old])["fault_cells"] == [] and _report([], [old])["faults_counted"] == []
+    # The tail is clipped at the restore like everything else.
+    late = {**fault, "start": "2026-11-13T03:30:00Z", "end": "2026-11-13T03:40:00Z"}
+    assert [row["cell"] for row in _report([], [late])["fault_cells"]] == [fri + 3, fri + 4]
+
+
+def test_overlap_counts_a_fault_only_on_its_path() -> None:
+    fault = {"id": "bank", "kind": "testbed_fault", "target": "t", "start": "2026-11-12T22:20:14Z",
+             "end": "2026-11-13T01:51:40Z", "source": "s",
+             "scope": {"domains": ["core-banking"], "services": ["commerce-payment"]}}
+    report = _report([], [fault])
+    t1, t2 = utc("2026-11-20T00:10:00Z"), utc("2026-11-20T00:30:00Z")  # Friday 00 UTC, a fault cell
+    fri = 5 * 24
+    off_path = sw.with_overlap(report, t1, t2, scenario={"domain": "food-delivery"})
+    assert off_path["overlap"] is False and off_path["scenario_faults"] == [] and off_path["fault_overlap_cells"] == []
+    on_path = sw.with_overlap(report, t1, t2, scenario={"domain": "commerce", "scoring": {"partial": ["commerce-payment"]}})
+    assert on_path["overlap"] is True
+    assert on_path["overlap_cells"] == on_path["fault_overlap_cells"] == [{"cell": fri, "kst": "금 09시"}]
+    assert on_path["scenario_faults"] == [{"id": "bank", "start": "2026-11-12T22:20:14Z", "end": "2026-11-13T01:51:40Z",
+                                           "target": "t", "matched_by": "service commerce-payment"}]
+    # Without a scenario (older callers) the fault counts.
+    assert sw.with_overlap(report, t1, t2)["scenario_faults"][0]["matched_by"] == "scenario unknown"
+    # A path scenario whose injection cell is clean still carries the fault in scenario_faults.
+    clean = sw.with_overlap(report, utc("2026-11-20T05:10:00Z"), utc("2026-11-20T05:20:00Z"),
+                            scenario={"domain": "core-banking"})
+    assert clean["overlap"] is False and [f["id"] for f in clean["scenario_faults"]] == ["bank"]
+
+
+def test_plan_counts_a_fault_for_any_scenario() -> None:
+    fault = {"id": "bank", "kind": "testbed_fault", "target": "t", "start": "2026-11-12T22:20:00Z",
+             "end": "2026-11-12T22:40:00Z", "source": "s", "scope": {"domains": ["core-banking"], "services": []}}
+    rows = sw.plan_rows(utc("2026-11-19T22:00:00Z"), hours=2, lead=sw.DEFAULT_LEAD, days=21, windows=[],
+                        outages=[fault])
+    assert [(r["inject_at"], r["clean"], r["why"]) for r in rows] == [
+        ("2026-11-19T22:00:00Z", False, ["bank"]), ("2026-11-19T23:00:00Z", False, ["bank"])]
 
 
 def test_compute_reads_runs_and_ledger(tmp_path: Path) -> None:

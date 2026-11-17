@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.live_queue import ARCHIVE_STATE_CHECK_NAME, LiveScenarioQueue
+from app.live_queue import ARCHIVE_STATE_CHECK_NAME, DOMAIN_PODS_CHECK_NAME, LiveScenarioQueue
 from app.models import RunInfo
 
 
@@ -597,6 +597,58 @@ async def test_phases_json_records_golden_stream_validity_and_the_21_day_window(
     assert window["this_injection_cells"] == [{"cell": thu + 10, "kst": "목 19시"}]
     assert window["overlap"] is True
     assert window["overlap_cells"] == [{"cell": thu + 10, "kst": "목 19시"}]
+
+
+@pytest.mark.asyncio
+async def test_a_hand_written_testbed_fault_marks_only_the_scenarios_on_its_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """v4 ORAFIX (Q25 answer 3): a fault outside the runner, written in the same ledger with its
+    path (scope). The window lists its cells with the hand-written records (origins); the overlap
+    counts them only for a scenario whose domain or answer-key services are on that path."""
+    payload = {"restored_at": "2026-07-16T08:01:00Z", "golden_stream_generation": 1985,
+               "golden_stream_boot_load_until": "2026-07-20T16:24:00Z", "golden_stream_periodic_count": 0,
+               "observer_band_sources": NO_BAND_OVERRIDE}
+    fault = {"id": "bank-stall", "kind": "testbed_fault", "target": "bank db",
+             "start": "2026-07-09T10:20:00Z", "end": "2026-07-09T12:00:00Z",
+             "scope": {"domains": ["core-banking"], "services": ["commerce-payment"]}, "source": "test"}
+    t1, t2 = "2026-07-16T11:10:00Z", "2026-07-16T11:15:00Z"
+    thu = 4 * 24
+    for case, entry, expected in (
+        ("other path", {"domain": "commerce", "scoring": {"accept": ["commerce-postgres"]}}, None),
+        ("payment path", {"domain": "commerce", "scoring": {"partial": ["commerce-payment"]}},
+         "service commerce-payment"),
+        ("bank", {"domain": "core-banking"}, "domain core-banking"),
+    ):
+        base = tmp_path / case.replace(" ", "-")
+        queue, runner, scheduler, clock = _g2meta_queue(base, monkeypatch, payload)
+        ledger = json.loads(queue.observation_outages_path.read_text())
+        ledger["outages"].append(fault)
+        queue.observation_outages_path.write_text(json.dumps(ledger), encoding="utf-8")
+        registry = json.loads(runner.scenario_metadata_path.read_text())
+        registry["scenarios"]["F01-R"] = {**registry["scenarios"]["F01-R"], **entry}
+        runner.scenario_metadata_path.write_text(json.dumps(registry), encoding="utf-8")
+        _, reset = await _g2meta_phases(queue, runner, scheduler, clock, t1=t1, t2=t2)
+        window = reset["seasonal_window"]
+        # 10:20 to 12:00 plus the one-hour tail: 10, 11, 12 on Thursday.
+        assert window["fault_cells"] == [
+            {"cell": thu + h, "kst": label, "faults": ["bank-stall"]}
+            for h, label in ((10, "목 19시"), (11, "목 20시"), (12, "목 21시"))
+        ], case
+        assert [f["id"] for f in window["faults_counted"]] == ["bank-stall"]
+        assert window["origins"]["manual"]["keys"] == ["outage_cells", "outages_counted", "fault_cells",
+                                                       "faults_counted"]
+        assert window["origins"]["runner"]["keys"] == ["injection_cells", "runs_counted"]
+        assert window["origins"]["manual"]["from"] == str(queue.observation_outages_path)
+        if expected is None:
+            assert window["scenario_faults"] == [] and window["fault_overlap_cells"] == [], case
+            assert window["overlap"] is False, case
+        else:
+            assert window["scenario_faults"] == [{"id": "bank-stall", "start": "2026-07-09T10:20:00Z",
+                                                  "end": "2026-07-09T12:00:00Z", "target": "bank db",
+                                                  "matched_by": expected}], case
+            assert window["fault_overlap_cells"] == [{"cell": thu + 11, "kst": "목 20시"}], case
+            assert window["overlap"] is True and window["overlap_cells"] == [{"cell": thu + 11, "kst": "목 20시"}]
 
 
 @pytest.mark.asyncio
@@ -2401,6 +2453,35 @@ async def test_cycle_buffer_gate_does_not_inject_when_the_archive_state_blocks(t
     assert ARCHIVE_STATE_CHECK_NAME in (state.reason or "")
     assert "2304561 > 2304560" in (state.reason or "")
     assert runner.started == []
+
+
+@pytest.mark.asyncio
+async def test_cycle_buffer_gate_does_not_inject_while_a_domain_pod_is_not_ready(tmp_path: Path) -> None:
+    """v4 ORAFIX (Q25 answer 2): judged once, at the buffer gate right before the injection (the
+    normal lead-in may roll decoys; the injection itself takes pods down on purpose)."""
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    answers = ["1 of 7 app pods not Ready: rca-testbed-banking/testbed-oracle-0(CrashLoopBackOff)"]
+    calls = []
+    queue.domain_pods_probe = lambda: calls.append(1) or answers[0]
+    await queue.start()
+    state = await queue.tick()  # cycle_reset -> cycle_normal
+    clock.value = state_expected(state)
+    state = await queue.tick()  # -> cycle_buffer
+    assert state.phase == "cycle_buffer" and calls == []
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == [] and len(calls) == 1
+    assert DOMAIN_PODS_CHECK_NAME in (state.reason or "")
+    assert "testbed-oracle-0(CrashLoopBackOff)" in (state.reason or "")
+    answers[0] = None
+    await queue.resume()
+    state = await queue.tick()
+    for _ in range(4):
+        if state.phase == "running":
+            break
+        clock.value = state_expected(state)
+        state = await queue.tick()
+    assert state.phase == "running" and len(runner.started) == 1
 
 
 @pytest.mark.asyncio
