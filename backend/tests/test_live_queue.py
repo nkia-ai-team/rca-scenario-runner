@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -929,6 +930,7 @@ def _archive_facts(
         },
         # Computed at install from the load settings (cap 2,000,000 + 121,824 x 2.5).
         "rows_limit": {"limit": 2_304_560, "keep_rows": 2_000_000, "design_daily_writes": 121_824, "days": 2.5},
+        "archive_schedule": {"timer": "02:20", "window_end": "05:00", "zone": "Asia/Seoul"},
     }
     (state / "last.json").write_text(json.dumps(doc), encoding="utf-8")
     return state
@@ -937,7 +939,7 @@ def _archive_facts(
 def test_archive_state_gates_readiness(tmp_path: Path) -> None:
     """Q22 addendum 2: block before injecting when the civil-petition archive stopped keeping up.
 
-    48h since the last ok (two nightly runs in a row missed) or rows over the limit the db01 line
+    Two nightly windows closed without an ok (counted in windows, see the next test) or rows over the limit the db01 line
     carries (cap + design daily writes x 2.5, Q24) blocks. Facts that are missing, stale or unreadable block too.
     Without a configured directory the check is not part of readiness.
     """
@@ -955,13 +957,11 @@ def test_archive_state_gates_readiness(tmp_path: Path) -> None:
     assert readiness.checks[ARCHIVE_STATE_CHECK_NAME] is True
     assert readiness.ready
 
-    # 48h since the last ok: 47h59m passes, 48h01m blocks.
-    _archive_facts(tmp_path, now, last_ok=now - timedelta(hours=47, minutes=59))
-    assert queue.readiness().checks[ARCHIVE_STATE_CHECK_NAME] is True
-    _archive_facts(tmp_path, now, last_ok=now - timedelta(hours=48, minutes=1))
+    # Two missed windows block (now = 17:00 KST; last ok three days earlier: two full windows closed since).
+    _archive_facts(tmp_path, now, last_ok=now - timedelta(days=2, hours=13))
     readiness = queue.readiness()
     assert readiness.missing == [ARCHIVE_STATE_CHECK_NAME]
-    assert "48h ago > 48h" in readiness.details[ARCHIVE_STATE_CHECK_NAME]
+    assert "2 nightly windows (02:20-05:00 Asia/Seoul) closed since without an ok" in readiness.details[ARCHIVE_STATE_CHECK_NAME]
     _archive_facts(tmp_path, now, last_ok=None)
     assert "no archive batch has ever finished ok" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
 
@@ -976,20 +976,27 @@ def test_archive_state_gates_readiness(tmp_path: Path) -> None:
         "petition rows 2304561 > 2304560 (cap 2000000 + design daily writes 121824 x 2.5)"
         in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
     )
-    _archive_facts(tmp_path, now, rows=2_304_561, last_ok=now - timedelta(hours=60))
+    _archive_facts(tmp_path, now, rows=2_304_561, last_ok=now - timedelta(days=2, hours=13))
     detail = queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
-    assert "60h ago" in detail and "2304561" in detail
+    assert "2 nightly windows" in detail and "2304561" in detail
     # The limit is the one the line carries (computed from the load settings), not a runner constant.
     state = tmp_path / "petition-archive" / "last.json"
     doc = json.loads(state.read_text())
-    doc["rows_limit"]["limit"] = 1_100_000
+    doc["rows_limit"] = {"limit": 1_100_000, "keep_rows": 1_000_000, "design_daily_writes": 40_000, "days": 2.5}
     doc["db"]["rows"]["petition"] = 1_100_001
     state.write_text(json.dumps(doc), encoding="utf-8")
     assert "> 1100000" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
-    # A line without the limit cannot be judged and blocks.
-    del doc["rows_limit"]
-    state.write_text(json.dumps(doc), encoding="utf-8")
-    assert "unreadable" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
+    # Review L11: a limit that does not match its own parts (hand edit, broken render) is not trusted.
+    for broken in ({"limit": 9_000_000}, {"keep_rows": 1_200_000}, {"days": 0}, {"design_daily_writes": True}):
+        doc["rows_limit"] = {"limit": 1_100_000, "keep_rows": 1_000_000, "design_daily_writes": 40_000, "days": 2.5, **broken}
+        state.write_text(json.dumps(doc), encoding="utf-8")
+        assert "unreadable" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME], broken
+    # A line without the limit or the schedule cannot be judged and blocks.
+    doc["rows_limit"] = {"limit": 1_100_000, "keep_rows": 1_000_000, "design_daily_writes": 40_000, "days": 2.5}
+    for key in ("rows_limit", "archive_schedule"):
+        broken_doc = {k: v for k, v in doc.items() if k != key}
+        state.write_text(json.dumps(broken_doc), encoding="utf-8")
+        assert "unreadable" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME], key
 
     # Facts older than the limit (default 1h) say nothing about now.
     _archive_facts(tmp_path, now - timedelta(minutes=59))
@@ -1001,6 +1008,52 @@ def test_archive_state_gates_readiness(tmp_path: Path) -> None:
     readiness = queue.readiness()
     assert readiness.checks[ARCHIVE_STATE_CHECK_NAME] is False
     assert "unreadable" in readiness.details[ARCHIVE_STATE_CHECK_NAME]
+
+
+def test_archive_state_counts_missed_nightly_windows_not_hours(tmp_path: Path) -> None:
+    """Review rv-t2c M3, command-session decision: one failed night is tolerated all through the next
+    night's catch-up (a plain 48h age blocked 02:22-02:40 and paused the queue at dawn); two failed nights
+    in a row block from the first line read after the second window's end; a line that stops coming
+    blocks within the staleness limit."""
+    kst = ZoneInfo("Asia/Seoul")
+    queue, _, _, _, clock = make_queue(tmp_path)
+    queue.archive_state_dir = tmp_path / "petition-archive"
+    first_ok = datetime(2026, 11, 16, 2, 22, 30, tzinfo=kst)        # day 0 ok
+    catch_up_ok = datetime(2026, 11, 18, 2, 24, 10, tzinfo=kst)     # day 1 failed, day 2 catches up
+
+    # One failure: every 5 minutes 02:00-06:00 on day 2, the line read at :05 and :35, the runner 4 min later.
+    t = datetime(2026, 11, 18, 2, 0, tzinfo=kst)
+    while t <= datetime(2026, 11, 18, 6, 0, tzinfo=kst):
+        line_at = t.replace(minute=35 if t.minute >= 35 else 5) if t.minute >= 5 else t - timedelta(minutes=25)
+        last_ok = first_ok if line_at < catch_up_ok else catch_up_ok
+        clock.value = (t + timedelta(minutes=4)).astimezone(timezone.utc)
+        _archive_facts(tmp_path, line_at.astimezone(timezone.utc), last_ok=last_ok.astimezone(timezone.utc))
+        readiness = queue.readiness()
+        assert readiness.checks[ARCHIVE_STATE_CHECK_NAME] is True, (t, readiness.details)
+        t += timedelta(minutes=5)
+
+    # Two failures in a row (day 1 and day 2): passes on lines read before the day-2 window end, blocks after.
+    for line_at, passes in (
+        (datetime(2026, 11, 18, 4, 35, tzinfo=kst), True),
+        (datetime(2026, 11, 18, 4, 59, 59, tzinfo=kst), True),
+        (datetime(2026, 11, 18, 5, 0, tzinfo=kst), False),
+        (datetime(2026, 11, 18, 5, 5, tzinfo=kst), False),
+    ):
+        clock.value = (line_at + timedelta(minutes=4)).astimezone(timezone.utc)
+        _archive_facts(tmp_path, line_at.astimezone(timezone.utc), last_ok=first_ok.astimezone(timezone.utc))
+        readiness = queue.readiness()
+        assert readiness.checks[ARCHIVE_STATE_CHECK_NAME] is passes, (line_at, readiness.details)
+        if not passes:
+            assert "2 nightly windows" in readiness.details[ARCHIVE_STATE_CHECK_NAME]
+
+    # Staleness: the last line before the day-2 window end (04:35, one window missed) passes for up to
+    # an hour; when no line comes after it, the check blocks as stale (61 min).
+    line_at = datetime(2026, 11, 18, 4, 35, tzinfo=kst)
+    _archive_facts(tmp_path, line_at.astimezone(timezone.utc), last_ok=first_ok.astimezone(timezone.utc))
+    clock.value = (line_at + timedelta(minutes=59)).astimezone(timezone.utc)
+    assert queue.readiness().checks[ARCHIVE_STATE_CHECK_NAME] is True
+    clock.value = (line_at + timedelta(minutes=61)).astimezone(timezone.utc)
+    assert "stale" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
 
 
 @pytest.mark.asyncio
@@ -1022,14 +1075,15 @@ async def test_archive_state_refuses_start_pauses_between_scenarios_and_is_recor
     assert recorded["passes"] is True
     assert recorded["facts"]["db"]["rows"]["petition"] == 2_080_000
     assert recorded["rows_limit"] == {"limit": 2_304_560, "keep_rows": 2_000_000, "design_daily_writes": 121_824, "days": 2.5}
-    assert recorded["max_ok_age_hours"] == 48
+    assert recorded["missed_windows_limit"] == 2
+    assert recorded["archive_schedule"] == {"timer": "02:20", "window_end": "05:00", "zone": "Asia/Seoul"}
 
     _wait_in_clean_window(queue, clock)
     started = len(runner.started)
-    _archive_facts(tmp_path, clock.value, last_ok=clock.value - timedelta(hours=50))
+    _archive_facts(tmp_path, clock.value, last_ok=clock.value - timedelta(days=2, hours=13))
     state = await queue.tick()
     assert state.phase == "paused"
-    assert ARCHIVE_STATE_CHECK_NAME in (state.reason or "") and "50h ago" in (state.reason or "")
+    assert ARCHIVE_STATE_CHECK_NAME in (state.reason or "") and "2 nightly windows" in (state.reason or "")
     assert len(runner.started) == started
 
     with pytest.raises(RuntimeError, match=ARCHIVE_STATE_CHECK_NAME):

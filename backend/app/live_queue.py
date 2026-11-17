@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -136,10 +137,17 @@ ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 # §13-12): the main table is held at a row cap by a nightly archive batch. When that batch stops
 # keeping up, the domain's normal period drifts (the baseline moves), so no injection may start
 # (review-session answer Q22 addendum 2, 2026-11-17: block before the run, not after).
-#   - the last archive result "ok" is more than 48h old: two nightly runs in a row failed,
+#   - two nightly archive windows in a row closed with no "ok" (review-session answer Q22 addendum 2:
+#     "48h = does not tolerate two nightly failures in a row", counted in batch windows; command-session
+#     decision 2026-11-17 after review rv-t2c M3). A window counts as missed when its timer time is after
+#     the last ok and its end has passed by the time the db01 line was read ("at"). Counting windows,
+#     not hours, keeps the meaning and does not trip during the catch-up run after one failure (a plain
+#     48h age crossed 02:22 while that run finished at 02:24 and the next line came at 02:35). The
+#     timer time, window end and zone come with the db01 line ("archive_schedule", from the app settings).
+#     After two failures the block starts with the first line read after the second window's end.
 #   - the petition rows exceed the cap + the design daily writes x 2.5 (review-session answer Q24 (c)): one
 #     failed night still passes (at most cap + 2 days of writes before the next run), two in a row block
-#     the next day, the same "two in a row" meaning as the 48h condition. The limit is not written here:
+#     the next day, the same "two in a row" meaning as the window condition. The limit is not written here:
 #     the db01 line carries it ("rows_limit"), computed at install from the load settings
 #     (civil-petition/deploy/tools/design_load.py), and the runner records it with each run.
 # Input: a light db01 read on a fixed 30-minute timer that runs from normal operation on, unrelated to
@@ -152,7 +160,7 @@ ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 # db01. The line's own read time ("at") must be recent (max age, default 1h = two missed timer runs), or
 # the check cannot say anything and blocks. Off unless the directory is configured.
 ARCHIVE_STATE_CHECK_NAME = "petition_archive_state"
-ARCHIVE_STATE_MAX_OK_AGE = timedelta(hours=48)
+ARCHIVE_STATE_MISSED_WINDOWS_LIMIT = 2
 ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE = timedelta(hours=1)
 
 
@@ -160,6 +168,39 @@ def _parse_z(value: object, field: str) -> datetime:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} is missing")
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def missed_archive_windows(last_ok: datetime, observed_at: datetime, schedule: Mapping[str, Any]) -> int:
+    """Nightly archive windows whose timer time is after ``last_ok`` and whose end is at or before
+    ``observed_at`` (the db01 read time): runs that should have ended with an ok and did not."""
+    zone = ZoneInfo(str(schedule["zone"]))
+    timer = dt_time.fromisoformat(str(schedule["timer"]))
+    end = dt_time.fromisoformat(str(schedule["window_end"]))
+    day = last_ok.astimezone(zone).date() - timedelta(days=1)
+    last_day = observed_at.astimezone(zone).date()
+    missed = 0
+    while day <= last_day:
+        start_at = datetime.combine(day, timer, tzinfo=zone)
+        end_at = datetime.combine(day if end > timer else day + timedelta(days=1), end, tzinfo=zone)
+        if start_at > last_ok and end_at <= observed_at:
+            missed += 1
+        day += timedelta(days=1)
+    return missed
+
+
+def _check_rows_limit(limit_doc: Mapping[str, Any]) -> int:
+    """The limit the db01 line carries, checked against its own parts (review rv-t2c L11): a hand-edited
+    line or a broken render must not slip an arbitrarily large limit past the check."""
+    limit, keep, daily, days = (limit_doc[key] for key in ("limit", "keep_rows", "design_daily_writes", "days"))
+    for name, value in (("limit", limit), ("keep_rows", keep), ("design_daily_writes", daily)):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"rows_limit.{name} is not a positive integer: {value!r}")
+    if not isinstance(days, (int, float)) or isinstance(days, bool) or not 0 < days <= 7:
+        raise ValueError(f"rows_limit.days is out of range: {days!r}")
+    expected = keep + math.ceil(daily * days)
+    if limit != expected or not keep < limit:
+        raise ValueError(f"rows_limit.limit {limit} != keep_rows {keep} + ceil({daily} x {days}) = {expected}")
+    return limit
 
 
 def archive_state_verdict(
@@ -175,9 +216,8 @@ def archive_state_verdict(
     if not isinstance(rows, int) or isinstance(rows, bool):
         raise ValueError(f"rows.petition is not an integer: {rows!r}")
     limit_doc = facts["rows_limit"]
-    limit = limit_doc["limit"]
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-        raise ValueError(f"rows_limit.limit is not a positive integer: {limit!r}")
+    limit = _check_rows_limit(limit_doc)
+    schedule = facts["archive_schedule"]
     now = now.astimezone(timezone.utc)
     facts_age = now - at
     if facts_age > max_facts_age:
@@ -190,11 +230,12 @@ def archive_state_verdict(
     if last_ok is None:
         reasons.append("no archive batch has ever finished ok")
     else:
-        ok_age = now - _parse_z(last_ok, "last_archive_ok")
-        if ok_age > ARCHIVE_STATE_MAX_OK_AGE:
+        missed = missed_archive_windows(_parse_z(last_ok, "last_archive_ok"), at, schedule)
+        if missed >= ARCHIVE_STATE_MISSED_WINDOWS_LIMIT:
             reasons.append(
-                f"last archive ok at {last_ok}, {int(ok_age.total_seconds() // 3600)}h ago > "
-                f"{int(ARCHIVE_STATE_MAX_OK_AGE.total_seconds() // 3600)}h (two nightly runs in a row did not finish)"
+                f"last archive ok at {last_ok}, {missed} nightly windows ({schedule['timer']}-"
+                f"{schedule['window_end']} {schedule['zone']}) closed since without an ok "
+                f"(limit {ARCHIVE_STATE_MISSED_WINDOWS_LIMIT}: two nightly runs in a row did not finish)"
             )
     if rows > limit:
         reasons.append(
@@ -702,7 +743,8 @@ class LiveScenarioQueue:
             "detail": detail,
             # The rows limit this injection was judged against (cap + design daily writes x 2.5).
             "rows_limit": (facts or {}).get("rows_limit"),
-            "max_ok_age_hours": int(ARCHIVE_STATE_MAX_OK_AGE.total_seconds() // 3600),
+            "missed_windows_limit": ARCHIVE_STATE_MISSED_WINDOWS_LIMIT,
+            "archive_schedule": (facts or {}).get("archive_schedule"),
         }
         path = self.runner.artifact_store.root / run_id / "archive_state.json"
         path.parent.mkdir(parents=True, exist_ok=True)
