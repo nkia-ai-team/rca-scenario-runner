@@ -132,6 +132,67 @@ def oracle_check_max_age(period: timedelta) -> timedelta:
 
 ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 
+# Traditional 3-tier testbed (civil-petition, testbed-services docs/spec-testbed-vm-3tier.md §2-3, §6-4,
+# §13-12): the main table is held at a row cap by a nightly archive batch. When that batch stops
+# keeping up, the domain's normal period drifts (the baseline moves), so no injection may start
+# (review-session answer Q22 addendum 2, 2026-11-17: block before the run, not after).
+#   - the last archive result "ok" is more than 48h old: two nightly runs in a row failed,
+#   - the petition rows exceed the cap x 1.1: twice one day's writes (about 5% of the cap each).
+# Input: the db01 read the runner keeps doing anyway (civil-petition/deploy/tools/db-facts.sh, one
+# JSON line) left as last.json in a directory. The facts must be recent (max age, default 1h), or the
+# check cannot say anything and blocks. Off unless the directory is configured.
+ARCHIVE_STATE_CHECK_NAME = "petition_archive_state"
+ARCHIVE_STATE_MAX_OK_AGE = timedelta(hours=48)
+ARCHIVE_STATE_ROWS_FACTOR = 1.1
+# Same default as the app's petition.archive.keep-rows (civil-petition application.properties).
+ARCHIVE_STATE_DEFAULT_KEEP_ROWS = 2_000_000
+ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE = timedelta(hours=1)
+
+
+def _parse_z(value: object, field: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} is missing")
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def archive_state_verdict(
+    facts: Mapping[str, Any],
+    now: datetime,
+    *,
+    keep_rows: int = ARCHIVE_STATE_DEFAULT_KEEP_ROWS,
+    max_facts_age: timedelta = ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE,
+) -> tuple[bool, str]:
+    """(passes, detail) for one db-facts.sh line. Raises on an unreadable document."""
+    at = _parse_z(facts.get("at"), "at")
+    db = facts["db"]
+    rows = db["rows"]["petition"]
+    if not isinstance(rows, int) or isinstance(rows, bool):
+        raise ValueError(f"rows.petition is not an integer: {rows!r}")
+    now = now.astimezone(timezone.utc)
+    facts_age = now - at
+    if facts_age > max_facts_age:
+        return False, (
+            f"db facts are stale: read at {facts['at']}, {int(facts_age.total_seconds() // 60)}m ago, "
+            f"limit {int(max_facts_age.total_seconds() // 60)}m (the periodic db01 read stopped)"
+        )
+    reasons: list[str] = []
+    last_ok = db.get("last_archive_ok")
+    if last_ok is None:
+        reasons.append("no archive batch has ever finished ok")
+    else:
+        ok_age = now - _parse_z(last_ok, "last_archive_ok")
+        if ok_age > ARCHIVE_STATE_MAX_OK_AGE:
+            reasons.append(
+                f"last archive ok at {last_ok}, {int(ok_age.total_seconds() // 3600)}h ago > "
+                f"{int(ARCHIVE_STATE_MAX_OK_AGE.total_seconds() // 3600)}h (two nightly runs in a row did not finish)"
+            )
+    limit = int(keep_rows * ARCHIVE_STATE_ROWS_FACTOR)
+    if rows > limit:
+        reasons.append(f"petition rows {rows} > {limit} (cap {keep_rows} x {ARCHIVE_STATE_ROWS_FACTOR})")
+    if reasons:
+        return False, "; ".join(reasons)
+    return True, f"petition rows {rows} <= {limit}, last archive ok {last_ok}"
+
 
 def _tail(text: str, limit: int = 200) -> str:
     """Last line of a failed probe's output, short enough to live in `reason`."""
@@ -410,12 +471,19 @@ class LiveScenarioQueue:
         decoy_seed_base: str = "testbed-v4-decoy",
         oracle_check_state_dir: Path | None = None,
         oracle_check_max_age: timedelta | None = None,
+        archive_state_dir: Path | None = None,
+        archive_state_keep_rows: int = ARCHIVE_STATE_DEFAULT_KEEP_ROWS,
+        archive_state_max_facts_age: timedelta = ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE,
     ) -> None:
         self.runner = runner
         # Where oracle-maintenance.sh check leaves last.json and ALERT (mounted read-only).
         # None leaves the check out of readiness (unit tests, older deployments).
         self.oracle_check_state_dir = oracle_check_state_dir
         self.oracle_check_max_age = oracle_check_max_age
+        # Where the civil-petition db01 facts (last.json) land. None leaves the check out.
+        self.archive_state_dir = archive_state_dir
+        self.archive_state_keep_rows = archive_state_keep_rows
+        self.archive_state_max_facts_age = archive_state_max_facts_age
         # v3 continuous-cycle mode (off by default; v2 behaviour preserved).
         self.cycle_mode = cycle_mode
         self.cycle_scenario_ids = cycle_scenario_ids
@@ -523,10 +591,12 @@ class LiveScenarioQueue:
         checks.update(self._functional_readiness())
         oracle_checks, oracle_details = self._oracle_check_readiness()
         checks.update(oracle_checks)
+        archive_checks, archive_details = self._archive_state_readiness()
+        checks.update(archive_checks)
         missing = sorted(name for name, passed in checks.items() if not passed)
         details = {
             name: text
-            for name, text in {**self._functional_details, **oracle_details}.items()
+            for name, text in {**self._functional_details, **oracle_details, **archive_details}.items()
             if name in missing
         }
         return OperationalReadiness(
@@ -583,6 +653,51 @@ class LiveScenarioQueue:
             return {name: True}, {}
         except Exception as error:
             return {name: False}, {name: f"unreadable check result: {type(error).__name__}: {error}"}
+
+    def _archive_state_facts(self) -> tuple[dict[str, Any] | None, bool, str]:
+        """(facts, passes, detail) from <archive_state_dir>/last.json; facts None when unreadable."""
+        last = self.archive_state_dir / "last.json"  # type: ignore[operator]
+        if not last.is_file():
+            return None, False, f"no db facts at {last} (periodic db01 read not installed or never ran)"
+        try:
+            facts = json.loads(last.read_text(encoding="utf-8"))
+            passes, detail = archive_state_verdict(
+                facts,
+                self.clock.now(),
+                keep_rows=self.archive_state_keep_rows,
+                max_facts_age=self.archive_state_max_facts_age,
+            )
+            return facts, passes, detail
+        except Exception as error:
+            return None, False, f"unreadable db facts: {type(error).__name__}: {error}"
+
+    def _archive_state_readiness(self) -> tuple[dict[str, bool], dict[str, str]]:
+        """Civil-petition archive state (ARCHIVE_STATE_* above). Never transient: a stalled
+        archive needs a person. Checked with readiness and again right before each injection."""
+        if self.archive_state_dir is None:
+            return {}, {}
+        _, passes, detail = self._archive_state_facts()
+        name = ARCHIVE_STATE_CHECK_NAME
+        return ({name: True}, {}) if passes else ({name: False}, {name: detail[:600]})
+
+    def _write_archive_state(self, run_id: str) -> None:
+        """Leave the facts and the verdict this injection started on in the run folder
+        (runner execution record, not the recording) so the verify skill can judge them again."""
+        if self.archive_state_dir is None:
+            return
+        facts, passes, detail = self._archive_state_facts()
+        document = {
+            "checked_at": self._format(self.clock.now()),
+            "facts": facts,
+            "passes": passes,
+            "detail": detail,
+            "keep_rows": self.archive_state_keep_rows,
+            "rows_factor": ARCHIVE_STATE_ROWS_FACTOR,
+            "max_ok_age_hours": int(ARCHIVE_STATE_MAX_OK_AGE.total_seconds() // 3600),
+        }
+        path = self.runner.artifact_store.root / run_id / "archive_state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     @staticmethod
     def _readiness_failure_reason(
@@ -1015,6 +1130,7 @@ class LiveScenarioQueue:
     ) -> LiveQueueState:
         if verdict is not None:
             self._write_preflight(run.run_id, verdict)
+        self._write_archive_state(run.run_id)
         self._write_normal_segment_marker(run.run_id)
         self._write_batch_marker(run.run_id, state)
         state = state.model_copy(
@@ -1352,6 +1468,18 @@ class LiveScenarioQueue:
         self, state: LiveQueueState, scenario_id: str
     ) -> tuple[LiveQueueState | None, PreflightVerdict | None]:
         verdict = None
+        # The cycle queue does not re-run readiness between scenarios; the archive state is
+        # checked here so no injection starts on a drifting baseline (needs a person: pause).
+        archive_checks, archive_details = self._archive_state_readiness()
+        if archive_checks and not all(archive_checks.values()):
+            return (
+                self._pause(
+                    state,
+                    f"operational readiness failed: {ARCHIVE_STATE_CHECK_NAME} "
+                    f"({ARCHIVE_STATE_CHECK_NAME}: {archive_details.get(ARCHIVE_STATE_CHECK_NAME, '')})",
+                ),
+                None,
+            )
         # None = decoys off; a list (possibly empty) = decoys on for this cycle.
         decoys = state.cycle_decoys if state.cycle_decoy_seed is not None else None
         if self.preflight_probe is not None:
@@ -1390,6 +1518,7 @@ class LiveScenarioQueue:
     ) -> LiveQueueState:
         if verdict is not None:
             self._write_preflight(run.run_id, verdict)
+        self._write_archive_state(run.run_id)
         # Decoys are final once the buffer opened; bind them to the run so the
         # capture forwards --decoys-json into meta.json.
         self._write_cycle_decoys(run.run_id, state)
@@ -3018,6 +3147,20 @@ def get_live_queue() -> LiveScenarioQueue:
                 timedelta(seconds=int(os.environ["ORACLE_CHECK_MAX_AGE_SEC"]))
                 if os.environ.get("ORACLE_CHECK_MAX_AGE_SEC", "").strip()
                 else None
+            ),
+            # Civil-petition archive state: off until the periodic db01 read writes last.json (T4).
+            archive_state_dir=(
+                Path(os.environ["PETITION_ARCHIVE_STATE_DIR"])
+                if os.environ.get("PETITION_ARCHIVE_STATE_DIR", "").strip()
+                else None
+            ),
+            archive_state_keep_rows=int(
+                os.environ.get("PETITION_ARCHIVE_KEEP_ROWS", "").strip() or ARCHIVE_STATE_DEFAULT_KEEP_ROWS
+            ),
+            archive_state_max_facts_age=(
+                timedelta(seconds=int(os.environ["PETITION_ARCHIVE_STATE_MAX_AGE_SEC"]))
+                if os.environ.get("PETITION_ARCHIVE_STATE_MAX_AGE_SEC", "").strip()
+                else ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE
             ),
         )
     return _queue

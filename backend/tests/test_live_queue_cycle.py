@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.live_queue import LiveScenarioQueue
+from app.live_queue import ARCHIVE_STATE_CHECK_NAME, LiveScenarioQueue
 from app.models import RunInfo
 
 
@@ -2367,3 +2367,51 @@ def test_capture_retention_runs_the_trusted_capture_script(tmp_path: Path, monke
                         lambda argv, **k: subprocess.CompletedProcess(argv, 0, "{}", ""))
     with pytest.raises(RuntimeError, match="no table list"):
         queue._capture_retention("a", "b")
+
+
+def _archive_facts(tmp_path: Path, at: datetime, *, rows: int = 2_080_000) -> Path:
+    state = tmp_path / "petition-archive"
+    state.mkdir(exist_ok=True)
+    stamp = at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    last_ok = (at - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (state / "last.json").write_text(json.dumps({
+        "host": "db01", "at": stamp,
+        "db": {"rows": {"petition": rows, "petition_history": rows * 3}, "archive_runs": [], "last_archive_ok": last_ok},
+    }), encoding="utf-8")
+    return state
+
+
+@pytest.mark.asyncio
+async def test_cycle_buffer_gate_does_not_inject_when_the_archive_state_blocks(tmp_path: Path) -> None:
+    """The cycle queue runs readiness only at start and resume; the archive state is checked again
+    at the buffer gate so no injection starts on a drifting civil-petition baseline (Q22 addendum 2)."""
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    queue.archive_state_dir = _archive_facts(tmp_path, clock.value)
+    await queue.start()
+    state = await queue.tick()  # cycle_reset -> cycle_normal
+    clock.value = state_expected(state)
+    state = await queue.tick()  # -> cycle_buffer
+    assert state.phase == "cycle_buffer"
+    clock.value = state_expected(state)
+    _archive_facts(tmp_path, clock.value, rows=2_200_001)
+    state = await queue.tick()
+    assert state.phase == "paused"
+    assert ARCHIVE_STATE_CHECK_NAME in (state.reason or "")
+    assert "2200001 > 2200000" in (state.reason or "")
+    assert runner.started == []
+
+
+@pytest.mark.asyncio
+async def test_cycle_injection_records_the_archive_state_it_started_on(tmp_path: Path) -> None:
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    queue.archive_state_dir = _archive_facts(tmp_path, clock.value)
+    await queue.start()
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    _archive_facts(tmp_path, clock.value)
+    state = await queue.tick()
+    assert state.phase == "running"
+    recorded = json.loads((runner.artifact_store.root / state.current_run_id / "archive_state.json").read_text())
+    assert recorded["passes"] is True and recorded["facts"]["host"] == "db01"

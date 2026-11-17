@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.live_queue import (
+    ARCHIVE_STATE_CHECK_NAME,
     LIVE_SCENARIO_ORDER,
     PREFLIGHT_MAX_ATTEMPTS,
     ORACLE_CHECK_MAX_AGE,
@@ -908,6 +909,124 @@ async def test_oracle_check_alert_refuses_start_and_pauses_between_scenarios(tmp
     _oracle_check_dir(tmp_path, clock.value - timedelta(hours=1))
     resumed = await queue.resume()
     assert resumed.phase != "paused"
+
+
+def _archive_facts(
+    tmp_path: Path, at: datetime, *, rows: int = 2_080_000, last_ok: datetime | None | str = "default"
+) -> Path:
+    """What civil-petition/deploy/tools/db-facts.sh prints, left as last.json by the periodic db01 read."""
+    state = tmp_path / "petition-archive"
+    state.mkdir(exist_ok=True)
+    if last_ok == "default":
+        last_ok = at - timedelta(hours=12)
+    doc = {
+        "host": "db01",
+        "at": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "db": {
+            "rows": {"petition": rows, "petition_history": rows * 3},
+            "archive_runs": [],
+            "last_archive_ok": None if last_ok is None else last_ok.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+    }
+    (state / "last.json").write_text(json.dumps(doc), encoding="utf-8")
+    return state
+
+
+def test_archive_state_gates_readiness(tmp_path: Path) -> None:
+    """Q22 addendum 2: block before injecting when the civil-petition archive stopped keeping up.
+
+    48h since the last ok (two nightly runs in a row missed) or rows over the cap x 1.1
+    (twice one day's writes) blocks. Facts that are missing, stale or unreadable block too.
+    Without a configured directory the check is not part of readiness.
+    """
+    queue, _, _, _, clock = make_queue(tmp_path)
+    assert ARCHIVE_STATE_CHECK_NAME not in queue.readiness().checks
+
+    queue.archive_state_dir = tmp_path / "petition-archive"
+    readiness = queue.readiness()
+    assert readiness.checks[ARCHIVE_STATE_CHECK_NAME] is False
+    assert "never ran" in readiness.details[ARCHIVE_STATE_CHECK_NAME]
+
+    now = clock.value
+    _archive_facts(tmp_path, now - timedelta(minutes=5))
+    readiness = queue.readiness()
+    assert readiness.checks[ARCHIVE_STATE_CHECK_NAME] is True
+    assert readiness.ready
+
+    # 48h since the last ok: 47h59m passes, 48h01m blocks.
+    _archive_facts(tmp_path, now, last_ok=now - timedelta(hours=47, minutes=59))
+    assert queue.readiness().checks[ARCHIVE_STATE_CHECK_NAME] is True
+    _archive_facts(tmp_path, now, last_ok=now - timedelta(hours=48, minutes=1))
+    readiness = queue.readiness()
+    assert readiness.missing == [ARCHIVE_STATE_CHECK_NAME]
+    assert "48h ago > 48h" in readiness.details[ARCHIVE_STATE_CHECK_NAME]
+    _archive_facts(tmp_path, now, last_ok=None)
+    assert "no archive batch has ever finished ok" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
+
+    # Rows over the cap x 1.1: 2,200,000 passes, 2,200,001 blocks; both reasons are listed.
+    _archive_facts(tmp_path, now, rows=2_200_000)
+    assert queue.readiness().checks[ARCHIVE_STATE_CHECK_NAME] is True
+    _archive_facts(tmp_path, now, rows=2_200_001)
+    assert "petition rows 2200001 > 2200000 (cap 2000000 x 1.1)" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
+    _archive_facts(tmp_path, now, rows=2_200_001, last_ok=now - timedelta(hours=60))
+    detail = queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
+    assert "60h ago" in detail and "2200001" in detail
+    # The cap follows the configured value (PETITION_ARCHIVE_KEEP_ROWS).
+    queue.archive_state_keep_rows = 1_000_000
+    _archive_facts(tmp_path, now, rows=1_100_001)
+    assert "> 1100000" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
+    queue.archive_state_keep_rows = 2_000_000
+
+    # Facts older than the limit (default 1h) say nothing about now.
+    _archive_facts(tmp_path, now - timedelta(minutes=59))
+    assert queue.readiness().checks[ARCHIVE_STATE_CHECK_NAME] is True
+    _archive_facts(tmp_path, now - timedelta(minutes=61))
+    assert "stale" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
+
+    (tmp_path / "petition-archive" / "last.json").write_text('{"at": "2026-07-16T08:00:00Z"}', encoding="utf-8")
+    readiness = queue.readiness()
+    assert readiness.checks[ARCHIVE_STATE_CHECK_NAME] is False
+    assert "unreadable" in readiness.details[ARCHIVE_STATE_CHECK_NAME]
+
+
+@pytest.mark.asyncio
+async def test_archive_state_refuses_start_pauses_between_scenarios_and_is_recorded(tmp_path: Path) -> None:
+    """Not transient: a stalled archive needs a person. The facts an injection started on are
+    left in the run folder (archive_state.json) for the verify skill."""
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.archive_state_dir = _archive_facts(tmp_path, clock.value, rows=2_300_000)
+    with pytest.raises(RuntimeError, match=ARCHIVE_STATE_CHECK_NAME):
+        await queue.start()
+    assert runner.started == []
+
+    _archive_facts(tmp_path, clock.value)
+    await queue.start()
+    state = await queue.tick()
+    assert runner.started == [("F01-R", "run")]
+    run_id = state.current_run_id
+    recorded = json.loads((runner.artifact_store.root / run_id / "archive_state.json").read_text())
+    assert recorded["passes"] is True
+    assert recorded["facts"]["db"]["rows"]["petition"] == 2_080_000
+    assert (recorded["keep_rows"], recorded["rows_factor"], recorded["max_ok_age_hours"]) == (2_000_000, 1.1, 48)
+
+    _wait_in_clean_window(queue, clock)
+    started = len(runner.started)
+    _archive_facts(tmp_path, clock.value, last_ok=clock.value - timedelta(hours=50))
+    state = await queue.tick()
+    assert state.phase == "paused"
+    assert ARCHIVE_STATE_CHECK_NAME in (state.reason or "") and "50h ago" in (state.reason or "")
+    assert len(runner.started) == started
+
+    with pytest.raises(RuntimeError, match=ARCHIVE_STATE_CHECK_NAME):
+        await queue.resume()
+    _archive_facts(tmp_path, clock.value)
+    assert (await queue.resume()).phase != "paused"
+
+
+def test_compose_passes_the_archive_state_settings_and_leaves_the_check_off() -> None:
+    compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "- PETITION_ARCHIVE_STATE_DIR=${PETITION_ARCHIVE_STATE_DIR:-}" in compose
+    assert "- PETITION_ARCHIVE_KEEP_ROWS=${PETITION_ARCHIVE_KEEP_ROWS:-2000000}" in compose
 
 
 def test_compose_mounts_the_oracle_check_directory_read_only() -> None:
