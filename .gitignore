@@ -21,6 +21,11 @@ dist/
 # Runtime / logs
 logs/
 *.pid
+# compose 기본 호스트 경로(러너 실행 기록, 상태, 녹화 사본). 체크아웃에서 돌려도 빌드 표지가 -dirty 가 되지 않게.
+/runs/
+/state/
+/eval-cases/
+/profile-state/
 # Note: package lock files (uv.lock, package-lock.json) are COMMITTED for reproducibility.
 
 # Editor / OS

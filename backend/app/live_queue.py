@@ -26,7 +26,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.adaptive import ControllerPhase
 from app.adaptive_runtime import ControllerSession, SessionStatus
-from app.capture_orchestration import CaptureJob, load_scenario_metadata, parse_utc
+from app.capture_orchestration import (
+    REQUIRED_CAPTURE_CAPABILITIES,
+    CaptureJob,
+    load_scenario_metadata,
+    parse_utc,
+)
 from app.decoys import (
     ROLLOUT_KINDS,
     DecoyRecord,
@@ -282,6 +287,34 @@ def archive_state_verdict(
     if reasons:
         return False, "; ".join(reasons)
     return True, f"petition rows {rows} <= {limit}, last archive ok {last_ok}"
+
+
+def capture_contract_check(script: Path) -> tuple[bool, str]:
+    """Does the capture script this container runs accept every flag the runner passes?
+
+    v4 CAPMETA review M1: deploying the runner before testbed-services' capture (or
+    replacing the capture on the host without recreating the container, whose single-file
+    bind mount keeps the old inode) makes the first capture die on "unknown argument" and
+    loses a three-hour cycle. Not transient: it needs a deploy, so the queue does not start
+    or resume until it holds.
+    """
+    try:
+        result = subprocess.run([str(script), "--capabilities"], capture_output=True, text=True, timeout=30)
+    except Exception as error:
+        return False, f"cannot ask the capture script for its capabilities: {type(error).__name__}: {error}"
+    offered: set[str] = set()
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.startswith("capabilities:"):
+                offered.update(line[len("capabilities:"):].split())
+    lacking = sorted(REQUIRED_CAPTURE_CAPABILITIES - offered)
+    if not lacking:
+        return True, ""
+    return False, (
+        f"capture script {script} lacks {', '.join(lacking)} that this runner passes; deploy testbed-services "
+        "capture-eval-case.sh first, then recreate the runner container (a single-file bind mount keeps the "
+        "old file until then)"
+    )
 
 
 def _tail(text: str, limit: int = 200) -> str:
@@ -858,6 +891,10 @@ class LiveScenarioQueue:
             except Exception as error:
                 checks["capture_self_check"] = False
                 details["capture_self_check"] = f"{type(error).__name__}: {error}"
+            passed, why = capture_contract_check(script)
+            checks["capture_contract"] = passed
+            if not passed:
+                details["capture_contract"] = why
         try:
             from app.incident_close import open_incident_count
 

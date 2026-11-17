@@ -112,6 +112,10 @@ RUNNER_SOURCE_COMMIT_ENV = "RUNNER_SOURCE_COMMIT"
 # The runner's own marker, baked into the image (Dockerfile copies backend/app).
 RUNNER_SOURCE_COMMIT_MARKER = Path(__file__).resolve().parent / SOURCE_COMMIT_MARKER
 SCENARIO_DOC_FILE = "scenario.md"
+# The capture flags this runner passes (dump_stores). Readiness asks the capture script the
+# container actually sees for them (``--capabilities``), so a runner deployed ahead of its
+# capture stops before a cycle instead of losing the recording to "unknown argument".
+REQUIRED_CAPTURE_CAPABILITIES = frozenset({"scenario-doc-file", "source-commits-json"})
 SOURCE_COMMITS_FILE = "source-commits.json"
 
 
@@ -119,26 +123,36 @@ def parse_source_commit(raw: str | None, *, source: str) -> dict[str, object]:
     """One deploy marker as ``{commit, status, source}``.
 
     ``git archive`` writes the archived commit into the marker (export-subst); the
-    rsync deploy writes HEAD, with ``-dirty`` when the deployed tree had uncommitted
-    changes. A copy that went through neither still holds the placeholder.
+    rsync deploy writes HEAD, with ``-unpushed`` when that commit was on no remote
+    branch and ``-dirty`` when the deployed tree had uncommitted changes. A copy that
+    went through neither still holds the placeholder. ``deploying <commit>`` (a deploy
+    in progress or cut short) and anything else is invalid: no commit is claimed.
     """
     if raw is None:
         return {"commit": None, "status": "missing", "source": source}
     value = raw.strip()
-    if COMMIT_SHA.fullmatch(value):
-        return {"commit": value, "status": "stamped", "source": source}
-    if value.endswith("-dirty") and COMMIT_SHA.fullmatch(value[: -len("-dirty")]):
-        return {"commit": value[: -len("-dirty")], "status": "dirty", "source": source}
+    for suffix, status in (("-unpushed-dirty", "unpushed_dirty"), ("-unpushed", "unpushed"), ("-dirty", "dirty"), ("", "stamped")):
+        base = value[: len(value) - len(suffix)] if suffix else value
+        if value.endswith(suffix) and COMMIT_SHA.fullmatch(base):
+            return {"commit": base, "status": status, "source": source}
     if value.startswith("$Format:"):
         return {"commit": None, "status": "unstamped", "source": source}
     return {"commit": None, "status": "invalid", "source": source}
 
 
+UNREADABLE_MARKER = "unreadable"
+
+
 def _read_marker(path: Path) -> str | None:
+    """The marker text, None when absent. A marker that cannot be read (a directory, no
+    permission, not UTF-8) reads as invalid: the commit record is not a scoring input, so
+    it must not cost the recording its capture (review L2)."""
     try:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
+    except (OSError, UnicodeDecodeError):
+        return UNREADABLE_MARKER
 
 
 def read_runner_source_commit(
@@ -146,7 +160,7 @@ def read_runner_source_commit(
 ) -> dict[str, object]:
     """The runner's commit: the stamped image marker, else the build-time env value."""
     from_marker = parse_source_commit(_read_marker(marker), source="backend/app/SOURCE_COMMIT")
-    if from_marker["status"] in {"stamped", "dirty"}:
+    if from_marker["commit"] is not None:
         return from_marker
     env_value = (environ if environ is not None else os.environ).get(RUNNER_SOURCE_COMMIT_ENV, "").strip()
     if env_value:
@@ -210,7 +224,8 @@ def render_scenario_doc(
         "",
         "이 파일은 녹화 때 러너가 시나리오 등록부(scripts/scenarios/registry/scenario-metadata.json)의 "
         "이 시나리오 항목을 그대로 옮긴 정답지다. 평가 대상 AI 와 판정관에게 주지 않는다. "
-        "칸 내용은 등록부 원문이고 러너가 쓴 것은 이 머리말과 칸 제목뿐이다.",
+        "칸 내용은 등록부 원문이고 러너가 쓴 것은 이 머리말과 칸 제목뿐이다. "
+        "등록부 원문은 설계 때 쓴 글이라 그 안의 수치와 녹화 이름은 이 녹화의 실측이 아니다.",
         "",
         "| 항목 | 값 |",
         "|---|---|",
@@ -218,7 +233,7 @@ def render_scenario_doc(
         f"| case_id | {case_id} |",
         f"| run_id | {run_id} |",
         f"| 등록부 sha256 | {hashlib.sha256(raw).hexdigest()} |",
-        f"| testbed-services 커밋 | {_commit_cell(source_commits['testbed_services'])} |",
+        f"| testbed-services 커밋(scripts/scenarios 배포 기준) | {_commit_cell(source_commits['testbed_services'])} |",
         f"| 러너 커밋 | {_commit_cell(source_commits['runner'])} |",
     ]
     for key, value in entry.items():

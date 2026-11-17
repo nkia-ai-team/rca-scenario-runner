@@ -929,6 +929,11 @@ SHA_B = "fedcba9876543210fedcba9876543210fedcba98"
     [
         (f"{SHA_A}\n", SHA_A, "stamped"),
         (f"{SHA_A}-dirty\n", SHA_A, "dirty"),
+        (f"{SHA_A}-unpushed\n", SHA_A, "unpushed"),
+        (f"{SHA_A}-unpushed-dirty\n", SHA_A, "unpushed_dirty"),
+        (f"{SHA_A}-dirty-unpushed\n", None, "invalid"),
+        (f"deploying {SHA_A}\n", None, "invalid"),
+        (f"deploying {SHA_A}-dirty\n", None, "invalid"),
         ("$Format:%H$\n", None, "unstamped"),
         (None, None, "missing"),
         ("main\n", None, "invalid"),
@@ -968,6 +973,33 @@ def test_collect_source_commits_reads_both_markers_and_env_only_backs_an_unstamp
         "commit": None, "status": "missing", "source": "scenario-contracts/SOURCE_COMMIT",
     }
     assert neither["runner"] == {"commit": None, "status": "unstamped", "source": "backend/app/SOURCE_COMMIT"}
+    # An unpushed image marker still names a commit, so the env value does not replace it.
+    runner_marker.write_text(f"{SHA_B}-unpushed\n", encoding="utf-8")
+    unpushed = collect_source_commits(
+        contracts, runner_marker=runner_marker, environ={"RUNNER_SOURCE_COMMIT": SHA_A}
+    )
+    assert unpushed["runner"] == {"commit": SHA_B, "status": "unpushed", "source": "backend/app/SOURCE_COMMIT"}
+
+
+def test_an_unreadable_marker_reads_invalid_and_does_not_cost_the_capture(tmp_path) -> None:
+    """Review L2: the commit record is not a scoring input; a broken marker must not stop scheduling."""
+    contracts = tmp_path / "scenario-contracts"
+    (contracts / "SOURCE_COMMIT").mkdir(parents=True)  # a directory where the file should be
+    runner_marker = tmp_path / "SOURCE_COMMIT"
+    runner_marker.write_bytes(b"\xff\xfe not utf-8")
+    commits = collect_source_commits(contracts, runner_marker=runner_marker, environ={})
+    assert commits["testbed_services"]["status"] == "invalid"
+    assert commits["testbed_services"]["commit"] is None
+    assert commits["runner"] == {"commit": None, "status": "invalid", "source": "backend/app/SOURCE_COMMIT"}
+    registry, _ = _answer_registry(tmp_path)
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    freeze_capture_inputs(
+        run_dir, registry_path=registry, contract_root=contracts, scenario_id="F07-H",
+        case_id="case-f07-h-v4-1", run_id="run-1", runner_marker=runner_marker, environ={},
+    )
+    assert (run_dir / "scenario.md").is_file()
+    assert json.loads((run_dir / "source-commits.json").read_text(encoding="utf-8")) == commits
 
 
 def _answer_registry(tmp_path) -> tuple[Path, dict]:
@@ -1004,7 +1036,9 @@ def test_scenario_doc_is_the_registry_entry_in_its_own_words(tmp_path) -> None:
     assert doc.startswith("# 시나리오 정답지: F07-H\n")
     assert "| case_id | case-f07-h-v4-1 |" in doc and "| run_id | run-1 |" in doc
     assert f"| 등록부 sha256 | {file_sha256(registry)} |" in doc
-    assert f"| testbed-services 커밋 | {SHA_A} (stamped) |" in doc
+    assert f"| testbed-services 커밋(scripts/scenarios 배포 기준) | {SHA_A} (stamped) |" in doc
+    # Review L1: the registry text was written at design time; its numbers are not this recording's.
+    assert "그 안의 수치와 녹화 이름은 이 녹화의 실측이 아니다" in doc.split("\n## ", 1)[0]
     assert "| 러너 커밋 | (없음, unstamped) |" in doc
     # Every field under its own key, in registry order; text verbatim, string lists as bullets.
     headings = [line[3:] for line in doc.splitlines() if line.startswith("## ")]
@@ -1140,6 +1174,11 @@ def test_the_real_capture_accepts_what_the_runner_freezes(tmp_path) -> None:
     assert meta["source_commits"] == json.loads((run_dir / "source-commits.json").read_text(encoding="utf-8"))
     assert meta["scenario_doc"] == {"file": "scenario.md", "sha256": file_sha256(run_dir / "scenario.md")}
     assert meta["source_commits"]["runner"]["status"] == "missing"
+    assert meta["capture_script"]["sha256"] == file_sha256(capture)
+    # And readiness agrees: this capture knows every flag the runner passes.
+    from app.live_queue import capture_contract_check
+
+    assert capture_contract_check(capture) == (True, "")
 
 
 def test_capture_invoker_can_stream_model_from_fixed_remote_observer(tmp_path) -> None:

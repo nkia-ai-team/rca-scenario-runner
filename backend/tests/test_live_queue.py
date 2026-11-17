@@ -728,7 +728,7 @@ async def test_readiness_probe_hiccup_waits_out_the_grace_and_records_why(
             return {"baseline_loadgen_alive": 1.0}  # the other 7 signals missing
 
     script = tmp_path / "capture.sh"
-    script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    script.write_text("#!/usr/bin/env bash\n[[ \"$1\" == --capabilities ]] && { echo \"capabilities: scenario-doc-file source-commits-json capture-script-meta\"; exit 0; }\nexit 0\n")
     script.chmod(0o755)
     monkeypatch.setattr("app.incident_close.open_incident_count", lambda **kw: 0)
 
@@ -761,7 +761,7 @@ async def test_readiness_pauses_at_once_when_a_non_transient_check_fails(
 ) -> None:
     """The grace is for the probes — a hard dependency failure still pauses now."""
     script = tmp_path / "capture.sh"
-    script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    script.write_text("#!/usr/bin/env bash\n[[ \"$1\" == --capabilities ]] && { echo \"capabilities: scenario-doc-file source-commits-json capture-script-meta\"; exit 0; }\nexit 0\n")
     script.chmod(0o755)
 
     def broken(**kwargs):
@@ -781,6 +781,38 @@ async def test_readiness_pauses_at_once_when_a_non_transient_check_fails(
     assert state.phase == "paused"
     assert "lucida_incident_api" in (state.reason or "")
     assert "incident api down" in (state.reason or "")
+    assert runner.started == []
+
+
+@pytest.mark.asyncio
+async def test_a_capture_that_does_not_know_the_runner_flags_blocks_start_and_pauses_at_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """v4 CAPMETA review M1: the runner deployed ahead of the capture script must stop before a
+    cycle, with the reason, not lose the recording to "unknown argument" at capture time."""
+    old_capture = tmp_path / "capture.sh"
+    old_capture.write_text("#!/usr/bin/env bash\n[[ \"$1\" == --capabilities ]] && { echo \"unknown argument: $1\" >&2; exit 1; }\nexit 0\n")
+    old_capture.chmod(0o755)
+    monkeypatch.setattr("app.incident_close.open_incident_count", lambda **kw: 0)
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.required_paths = {**queue.required_paths, "capture_script": old_capture}
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    queue.functional_readiness_enabled = True
+    with pytest.raises(RuntimeError, match="capture_contract"):
+        await queue.start()
+    assert runner.started == []
+
+    # Already running when the capture is swapped: not a transient probe, so no grace.
+    queue.functional_readiness_enabled = False
+    await queue.start()
+    queue.functional_readiness_enabled = True
+    _wait_in_clean_window(queue, clock)
+    queue._functional_cache = None
+    state = await queue.tick()
+    assert state.phase == "paused"
+    assert "capture_contract" in (state.reason or "")
+    assert "deploy testbed-services capture-eval-case.sh first" in (state.reason or "")
     assert runner.started == []
 
 
@@ -1301,7 +1333,7 @@ async def test_smoke_pass_does_not_gate_the_batch_on_the_unused_capture_chain(
     it gets the same grace as the probe rather than an instant stop.
     """
     script = tmp_path / "capture.sh"
-    script.write_text("#!/usr/bin/env bash\necho '[ERROR] clickhouse' >&2\nexit 1\n")
+    script.write_text("#!/usr/bin/env bash\n[[ \"$1\" == --capabilities ]] && { echo \"capabilities: scenario-doc-file source-commits-json capture-script-meta\"; exit 0; }\necho '[ERROR] clickhouse' >&2\nexit 1\n")
     script.chmod(0o755)
     monkeypatch.setattr("app.incident_close.open_incident_count", lambda **kw: 0)
 
@@ -1470,6 +1502,7 @@ def test_functional_readiness_is_opt_in_and_gates_on_capture_self_check(tmp_path
     checks = LiveScenarioQueue._functional_readiness(stub)
     assert checks["capture_self_check"] is False
     assert checks["lucida_incident_api"] is False
+    assert checks["capture_contract"] is False
 
     script.write_text("#!/usr/bin/env bash\nexit 0\n")
     stub._functional_cache = None
@@ -1479,6 +1512,31 @@ def test_functional_readiness_is_opt_in_and_gates_on_capture_self_check(tmp_path
     checks = LiveScenarioQueue._functional_readiness(stub)
     assert checks["capture_self_check"] is True
     assert checks["lucida_incident_api"] is True
+    # v4 CAPMETA review M1: a capture that passes its self-check but does not know the
+    # flags this runner passes (an old version, or the host file replaced under a
+    # single-file bind mount) is a separate, named failure.
+    assert checks["capture_contract"] is False
+    assert "scenario-doc-file, source-commits-json" in stub._functional_details["capture_contract"]
+    assert "recreate the runner container" in stub._functional_details["capture_contract"]
+
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        '[[ "$1" == --capabilities ]] && { echo "capabilities: scenario-doc-file"; exit 0; }\nexit 0\n'
+    )
+    stub._functional_cache = None
+    checks = LiveScenarioQueue._functional_readiness(stub)
+    assert checks["capture_contract"] is False
+    assert "lacks source-commits-json" in stub._functional_details["capture_contract"]
+
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        '[[ "$1" == --capabilities ]] && { echo "capabilities: scenario-doc-file source-commits-json x"; exit 0; }\n'
+        "exit 0\n"
+    )
+    stub._functional_cache = None
+    checks = LiveScenarioQueue._functional_readiness(stub)
+    assert checks["capture_contract"] is True
+    assert "capture_contract" not in stub._functional_details
 
 
 def test_lingering_incident_sweep_only_fires_when_incidents_are_the_sole_blocker(monkeypatch):
