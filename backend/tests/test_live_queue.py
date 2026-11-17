@@ -970,13 +970,15 @@ async def test_a_domain_pod_not_ready_holds_then_pauses_before_the_injection_onl
     clock.value += timedelta(seconds=31)
     state = await queue.tick()
     assert state.phase != "paused" and len(calls) == 2 and runner.started == []
-    clock.value += timedelta(minutes=3)
-    state = await queue.tick()
-    assert state.phase == "paused" and runner.started == [] and len(calls) == 3
+    # The queue ticks every few seconds, so a held gate is asked again every 31s here until 3 minutes.
+    while state.phase != "paused" and len(calls) < 10:
+        clock.value += timedelta(seconds=31)
+        state = await queue.tick()
+    assert state.phase == "paused" and runner.started == [] and len(calls) == 7
     assert state.reason == (
         f"operational readiness failed: {DOMAIN_PODS_CHECK_NAME} ({DOMAIN_PODS_CHECK_NAME}: "
         "1 of 7 app pods not Ready: rca-testbed-banking/testbed-oracle-0(CrashLoopBackOff); "
-        "not Ready for 211s, limit 180s)"
+        "not Ready for 186s, limit 180s)"
     )
     answers[0] = None
     await queue.resume()
@@ -1011,6 +1013,68 @@ async def test_a_brief_not_ready_or_a_failed_list_does_not_pause(tmp_path: Path)
     assert queue._domain_pods_since is None
     queue.domain_pods_probe = None
     assert queue._domain_pods_gate() == ("go", None)
+
+
+def test_a_hold_left_another_way_does_not_shorten_the_next_grace(tmp_path: Path) -> None:
+    """Review rv-orafix R2-M1: a hold whose last look is old was left another way (deferral, cycle
+    restart, pause and resume, operator stop); a later single not-Ready starts a new grace instead of
+    pausing at once with the old start."""
+    from app.live_queue import DOMAIN_PODS_HOLD_GAP
+
+    assert DOMAIN_PODS_HOLD_GAP == timedelta(seconds=90)
+    queue, _, _, _, clock = make_queue(tmp_path)
+    queue.domain_pods_probe = lambda: "1 of 31 app pods not Ready: rca-testbed-commerce/testbed-cart-1(Running)"
+    assert queue._domain_pods_gate()[0] == "hold"
+    started = queue._domain_pods_since
+    clock.value += timedelta(hours=2)
+    verdict, detail = queue._domain_pods_gate()
+    assert verdict == "hold" and "testbed-cart-1" in detail
+    assert queue._domain_pods_since == clock.value != started
+    # An unbroken hold (looked again within the gap) still counts from its first look.
+    for _ in range(6):
+        clock.value += timedelta(seconds=31)
+        verdict, _ = queue._domain_pods_gate()
+    assert verdict == "pause" and queue._domain_pods_since is None
+    # A gap just over the limit restarts; one at the limit does not.
+    assert queue._domain_pods_gate()[0] == "hold"
+    clock.value += timedelta(seconds=90)
+    assert queue._domain_pods_gate()[0] == "hold"
+    first = queue._domain_pods_since
+    assert first is not None and first == clock.value - timedelta(seconds=90)
+    clock.value += timedelta(seconds=91)
+    queue._domain_pods_gate()
+    assert queue._domain_pods_since == clock.value
+
+
+@pytest.mark.asyncio
+async def test_a_hold_before_a_pause_and_resume_gets_a_fresh_grace(tmp_path: Path) -> None:
+    """The queue path the review reproduced: held on a not-Ready pod, paused on another check (the
+    Oracle ALERT), resumed two hours later, then one not-Ready answer: held again, not paused."""
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    answers = ["1 of 31 app pods not Ready: rca-testbed-commerce/testbed-cart-1(Running)"]
+    queue.domain_pods_probe = lambda: answers[0]
+    queue.oracle_check_state_dir = _oracle_check_dir(tmp_path, clock.value - timedelta(minutes=30))
+    await queue.start()
+    state = await queue.tick()
+    assert state.phase != "paused" and runner.started == []
+    _wait_in_clean_window(queue, clock)
+    _oracle_check_dir(tmp_path, clock.value - timedelta(minutes=30), alert="t seed accounts: 1 below 150000\n")
+    state = await queue.tick()
+    assert state.phase == "paused" and ORACLE_CHECK_NAME in (state.reason or "")
+    clock.value += timedelta(hours=2)
+    _oracle_check_dir(tmp_path, clock.value - timedelta(minutes=30))
+    await queue.resume()
+    for _ in range(3):
+        state = await queue.tick()
+        if state.phase == "paused":
+            break
+    assert state.phase != "paused", state.reason
+    assert runner.started == []
+    answers[0] = None
+    clock.value += timedelta(seconds=31)
+    for _ in range(3):
+        state = await queue.tick()
+    assert runner.started == [("F01-R", "run")]
 
 
 def test_compose_turns_the_domain_pods_check_on() -> None:

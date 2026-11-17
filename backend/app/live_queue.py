@@ -137,6 +137,11 @@ ORACLE_PURGE_FAILED_FILE = "PURGE_FAILED"
 DOMAIN_PODS_CHECK_NAME = "domain_pods_ready"
 DOMAIN_PODS_GRACE = READINESS_PROBE_GRACE
 DOMAIN_PODS_RECHECK = timedelta(seconds=30)
+# A hold is one unbroken wait only while the gate keeps being asked: a running hold looks again every
+# DOMAIN_PODS_RECHECK (ticks every few seconds). When the last look is older than this, the queue left
+# the gate another way meanwhile (protection-window deferral, cycle restart, a pause on another check
+# and resume, an operator stop) and a new not-Ready answer starts a new grace (review rv-orafix R2-M1).
+DOMAIN_PODS_HOLD_GAP = DOMAIN_PODS_RECHECK * 3
 ORACLE_CHECK_DEFAULT_PERIOD = timedelta(hours=6)
 
 
@@ -1580,6 +1585,9 @@ class LiveScenarioQueue:
         if self.domain_pods_probe is None:
             return "go", None
         now = self.clock.now()
+        if self._domain_pods_looked is not None and now - self._domain_pods_looked > DOMAIN_PODS_HOLD_GAP:
+            # Not an unbroken wait: forget it before looking again.
+            self._domain_pods_since = self._domain_pods_looked = self._domain_pods_detail = None
         if (
             self._domain_pods_since is not None
             and self._domain_pods_looked is not None

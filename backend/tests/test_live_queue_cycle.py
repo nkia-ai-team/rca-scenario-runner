@@ -2473,9 +2473,12 @@ async def test_cycle_buffer_gate_does_not_inject_while_a_domain_pod_is_not_ready
     clock.value = state_expected(state)
     state = await queue.tick()
     assert state.phase == "cycle_buffer" and runner.started == [] and len(calls) == 1
-    clock.value += timedelta(minutes=3, seconds=1)
-    state = await queue.tick()
-    assert state.phase == "paused" and runner.started == [] and len(calls) == 2
+    # Ticks come every few seconds; the held gate is asked again every 31s here until 3 minutes.
+    while state.phase != "paused" and len(calls) < 10:
+        clock.value += timedelta(seconds=31)
+        state = await queue.tick()
+    assert state.phase == "paused" and runner.started == [] and len(calls) == 7
+    assert "not Ready for 186s" in (state.reason or "")
     assert DOMAIN_PODS_CHECK_NAME in (state.reason or "")
     assert "testbed-oracle-0(CrashLoopBackOff)" in (state.reason or "") and "limit 180s" in (state.reason or "")
     answers[0] = None
@@ -2487,6 +2490,30 @@ async def test_cycle_buffer_gate_does_not_inject_while_a_domain_pod_is_not_ready
         clock.value = state_expected(state)
         state = await queue.tick()
     assert state.phase == "running" and len(runner.started) == 1
+
+
+@pytest.mark.asyncio
+async def test_cycle_hold_before_a_restart_does_not_shorten_the_next_grace(tmp_path: Path) -> None:
+    """Review rv-orafix R2-M1, cycle path: held at one buffer end, the cycle restarts (the next buffer
+    end is two hours later); one not-Ready answer there is a new hold, not an immediate pause."""
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    answers = ["1 of 31 app pods not Ready: rca-testbed-commerce/testbed-order-1(Running)"]
+    queue.domain_pods_probe = lambda: answers[0]
+    await queue.start()
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "cycle_buffer" and queue._domain_pods_since == clock.value
+    state = queue._restart_cycle(state, "decoy rollout did not settle")
+    for _ in range(4):
+        clock.value = state_expected(state)
+        state = await queue.tick()
+        if state.phase == "cycle_buffer" and queue._domain_pods_looked == clock.value:
+            break
+    assert state.phase == "cycle_buffer" and runner.started == [], state.phase
+    assert queue._domain_pods_since == clock.value
 
 
 @pytest.mark.asyncio
