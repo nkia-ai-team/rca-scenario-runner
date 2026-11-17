@@ -1,0 +1,2 @@
+# git archive 로 tb-ops 에 올릴 때 이 파일에 그 커밋 해시를 적는다(녹화 meta.source_commits.runner 의 근거).
+backend/app/SOURCE_COMMIT export-subst

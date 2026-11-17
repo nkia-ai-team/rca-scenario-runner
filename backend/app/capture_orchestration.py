@@ -98,6 +98,190 @@ def load_scenario_notes(path: Path, scenario_id: str) -> ScenarioNotes | None:
     return ScenarioNotes.model_validate(notes)
 
 
+# --- Recording answer sheet and source commits (2026-11-18 testbed v4 CAPMETA) ---
+#
+# v3 campaign and v4 recordings had no scenario.md: neither the runner nor the capture
+# ever wrote one (the July v3 folders carry one a supervisor session authored after the
+# capture), and meta held no commit of the testbed-services copy the run used. The
+# runner now freezes both next to the run when it schedules the capture, and the
+# capture carries them into the case (scenario.md at the case root, meta.source_commits).
+
+COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+SOURCE_COMMIT_MARKER = "SOURCE_COMMIT"
+RUNNER_SOURCE_COMMIT_ENV = "RUNNER_SOURCE_COMMIT"
+# The runner's own marker, baked into the image (Dockerfile copies backend/app).
+RUNNER_SOURCE_COMMIT_MARKER = Path(__file__).resolve().parent / SOURCE_COMMIT_MARKER
+SCENARIO_DOC_FILE = "scenario.md"
+SOURCE_COMMITS_FILE = "source-commits.json"
+
+
+def parse_source_commit(raw: str | None, *, source: str) -> dict[str, object]:
+    """One deploy marker as ``{commit, status, source}``.
+
+    ``git archive`` writes the archived commit into the marker (export-subst); the
+    rsync deploy writes HEAD, with ``-dirty`` when the deployed tree had uncommitted
+    changes. A copy that went through neither still holds the placeholder.
+    """
+    if raw is None:
+        return {"commit": None, "status": "missing", "source": source}
+    value = raw.strip()
+    if COMMIT_SHA.fullmatch(value):
+        return {"commit": value, "status": "stamped", "source": source}
+    if value.endswith("-dirty") and COMMIT_SHA.fullmatch(value[: -len("-dirty")]):
+        return {"commit": value[: -len("-dirty")], "status": "dirty", "source": source}
+    if value.startswith("$Format:"):
+        return {"commit": None, "status": "unstamped", "source": source}
+    return {"commit": None, "status": "invalid", "source": source}
+
+
+def _read_marker(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+
+
+def read_runner_source_commit(
+    marker: Path = RUNNER_SOURCE_COMMIT_MARKER, *, environ: dict[str, str] | None = None
+) -> dict[str, object]:
+    """The runner's commit: the stamped image marker, else the build-time env value."""
+    from_marker = parse_source_commit(_read_marker(marker), source="backend/app/SOURCE_COMMIT")
+    if from_marker["status"] in {"stamped", "dirty"}:
+        return from_marker
+    env_value = (environ if environ is not None else os.environ).get(RUNNER_SOURCE_COMMIT_ENV, "").strip()
+    if env_value:
+        return parse_source_commit(env_value, source=f"env:{RUNNER_SOURCE_COMMIT_ENV}")
+    return from_marker
+
+
+def collect_source_commits(
+    contract_root: Path,
+    *,
+    runner_marker: Path = RUNNER_SOURCE_COMMIT_MARKER,
+    environ: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """``meta.source_commits``: the testbed-services copy the runner mounts, and the runner."""
+    return {
+        "schema_version": 1,
+        "testbed_services": parse_source_commit(
+            _read_marker(contract_root / SOURCE_COMMIT_MARKER),
+            source=f"scenario-contracts/{SOURCE_COMMIT_MARKER}",
+        ),
+        "runner": read_runner_source_commit(runner_marker, environ=environ),
+    }
+
+
+def _commit_cell(entry: dict[str, object]) -> str:
+    if entry["commit"] is None:
+        return f"(없음, {entry['status']})"
+    return f"{entry['commit']} ({entry['status']})"
+
+
+def _doc_value(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return "\n".join(f"- {item}" for item in value) if value else "(빈 목록)"
+    return "```json\n" + json.dumps(value, ensure_ascii=False, indent=2) + "\n```"
+
+
+def render_scenario_doc(
+    registry_path: Path,
+    scenario_id: str,
+    *,
+    case_id: str,
+    run_id: str,
+    source_commits: dict[str, object],
+) -> str:
+    """The recording's answer sheet: the registry entry, field by field, in its own words.
+
+    Only the heading and the field titles are the runner's; every value is the
+    registry text as written (strings as paragraphs, string lists as bullets, the
+    rest as JSON), followed by the entry's raw JSON so a golden can be built from
+    the case alone. No sentence is generated from IDs.
+    """
+    raw = registry_path.read_bytes()
+    registry = json.loads(raw.decode("utf-8"))
+    entry = registry.get("scenarios", {}).get(scenario_id)
+    if not isinstance(entry, dict):
+        raise RuntimeError(f"AI-authored scenario metadata is missing: {scenario_id}")
+    lines = [
+        f"# 시나리오 정답지: {scenario_id}",
+        "",
+        "이 파일은 녹화 때 러너가 시나리오 등록부(scripts/scenarios/registry/scenario-metadata.json)의 "
+        "이 시나리오 항목을 그대로 옮긴 정답지다. 평가 대상 AI 와 판정관에게 주지 않는다. "
+        "칸 내용은 등록부 원문이고 러너가 쓴 것은 이 머리말과 칸 제목뿐이다.",
+        "",
+        "| 항목 | 값 |",
+        "|---|---|",
+        f"| scenario_id | {scenario_id} |",
+        f"| case_id | {case_id} |",
+        f"| run_id | {run_id} |",
+        f"| 등록부 sha256 | {hashlib.sha256(raw).hexdigest()} |",
+        f"| testbed-services 커밋 | {_commit_cell(source_commits['testbed_services'])} |",
+        f"| 러너 커밋 | {_commit_cell(source_commits['runner'])} |",
+    ]
+    for key, value in entry.items():
+        lines += ["", f"## {key}", "", _doc_value(value)]
+    lines += [
+        "",
+        "## 등록부 항목 원문 (JSON)",
+        "",
+        "```json",
+        json.dumps(entry, ensure_ascii=False, indent=2),
+        "```",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(raw)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def freeze_capture_inputs(
+    run_dir: Path,
+    *,
+    registry_path: Path,
+    contract_root: Path,
+    scenario_id: str,
+    case_id: str,
+    run_id: str,
+    runner_marker: Path = RUNNER_SOURCE_COMMIT_MARKER,
+    environ: dict[str, str] | None = None,
+) -> None:
+    """Write source-commits.json and scenario.md next to the run, once.
+
+    They are taken when the capture is scheduled, from the same registry the six
+    scored fields came from. A capture retried later (re-arm) carries what the run
+    used, not whatever was deployed meanwhile, so existing files are kept.
+    """
+    commits_path = run_dir / SOURCE_COMMITS_FILE
+    if commits_path.exists():
+        source_commits = json.loads(commits_path.read_text(encoding="utf-8"))
+    else:
+        source_commits = collect_source_commits(
+            contract_root, runner_marker=runner_marker, environ=environ
+        )
+        _atomic_write_text(commits_path, json.dumps(source_commits, indent=2, sort_keys=True) + "\n")
+    doc_path = run_dir / SCENARIO_DOC_FILE
+    if not doc_path.exists():
+        _atomic_write_text(
+            doc_path,
+            render_scenario_doc(
+                registry_path, scenario_id, case_id=case_id, run_id=run_id, source_commits=source_commits
+            ),
+        )
+
+
 def parse_utc(value: str, *, field: str) -> datetime:
     """Parse the one timestamp representation accepted by capture artifacts."""
     if not UTC_TIMESTAMP.fullmatch(value):

@@ -82,6 +82,12 @@ COPY --from=frontend-builder /build/dist ${STATIC_DIR}
 # Runtime dirs
 RUN mkdir -p ${LOG_DIR} ${SCRIPT_DIR}
 
+# The runner's commit for recording meta.source_commits (v4 CAPMETA). backend/app/SOURCE_COMMIT
+# carries it when the source came by git archive (export-subst); a build from a git checkout
+# gets it here from build-and-deploy.sh. Last, so a new commit does not bust the layers above.
+ARG RUNNER_SOURCE_COMMIT=
+ENV RUNNER_SOURCE_COMMIT=${RUNNER_SOURCE_COMMIT}
+
 EXPOSE 8000
 WORKDIR /app/backend
 

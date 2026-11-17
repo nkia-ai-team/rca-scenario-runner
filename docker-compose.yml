@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # build-and-deploy.sh 가 git 체크아웃에서 빌드할 때만 채운다(git archive 사본은 SOURCE_COMMIT 파일이 갖는다).
+        RUNNER_SOURCE_COMMIT: ${RUNNER_SOURCE_COMMIT:-}
     image: scenario-runner:latest
     container_name: scenario-runner
     restart: unless-stopped

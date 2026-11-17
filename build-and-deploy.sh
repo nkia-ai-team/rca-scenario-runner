@@ -140,6 +140,18 @@ phase_prereqs() {
 # ---------------------------------------------------------------------------
 phase_build() {
     log_info "=== Phase 2: Docker 이미지 빌드 ==="
+    # 녹화 meta.source_commits.runner 의 근거(v4 CAPMETA). git archive 사본은 backend/app/SOURCE_COMMIT 에
+    # 커밋이 적혀 있다. 치환 전 문구 그대로이고 여기가 git 체크아웃이면 HEAD 를 빌드 인자로 넘긴다
+    # (커밋 안 된 변경이 있으면 -dirty). 둘 다 아니면 녹화에 unstamped 로 남는다.
+    if ! grep -qE '^[0-9a-f]{40}$' backend/app/SOURCE_COMMIT 2>/dev/null &&
+        git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
+        RUNNER_SOURCE_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+        if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain)" ]]; then
+            RUNNER_SOURCE_COMMIT+="-dirty"
+        fi
+        export RUNNER_SOURCE_COMMIT
+        log_info "RUNNER_SOURCE_COMMIT=${RUNNER_SOURCE_COMMIT}"
+    fi
     # BuildKit 활성화 (기본적으로 compose v2 는 buildkit 사용)
     DOCKER_BUILDKIT=1 "${COMPOSE[@]}" build scenario-runner
     log_ok "이미지 빌드 완료: scenario-runner:latest"

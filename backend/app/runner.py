@@ -24,6 +24,7 @@ from app.capture_orchestration import (
     CaptureEvidence,
     CaptureRequest,
     CaptureScheduler,
+    freeze_capture_inputs,
     load_scenario_metadata,
     load_scenario_notes,
 )
@@ -1101,6 +1102,17 @@ class ScenarioRunner:
             t1=session.trusted_evidence()["t1"],
             t2=session.trusted_evidence()["t2"],
             evidence=evidence,
+        )
+        # The recording's answer sheet (scenario.md) and the testbed-services and
+        # runner commits, frozen next to the run from the same registry the six
+        # scored fields came from; the capture carries both into the case (v4 CAPMETA).
+        freeze_capture_inputs(
+            run_dir,
+            registry_path=self.scenario_metadata_path,
+            contract_root=self.dispatcher_path.parent,
+            scenario_id=session.scenario_id,
+            case_id=case_id,
+            run_id=session.run_id,
         )
         job = self.capture_scheduler.schedule(request)
         result = job.trusted_result() if mode == "evaluation" else session.trusted_evidence()

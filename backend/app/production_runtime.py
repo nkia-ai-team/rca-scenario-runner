@@ -30,7 +30,7 @@ from app.adaptive_runtime import (
     EligibilityRequest,
     stderr_detail,
 )
-from app.capture_orchestration import CaptureJob, MODEL_PATH
+from app.capture_orchestration import CaptureJob, MODEL_PATH, SCENARIO_DOC_FILE, SOURCE_COMMITS_FILE
 from app.observations import (
     ApprovedQuery,
     ApprovedQueryRegistry,
@@ -1185,6 +1185,15 @@ class ProductionCaptureInvoker:
             notes_file = self.runs_root / job.run_id / "scenario-notes.json"
             atomic_json(notes_file, job.scenario_notes.model_dump(mode="json"))
             args.extend(["--scenario-notes-file", str(notes_file)])
+        # Answer sheet and source commits frozen next to the run when the capture was
+        # scheduled (v4 CAPMETA): scenario.md goes to the case root, the commits to
+        # meta.source_commits. A job scheduled before that change has neither file.
+        doc_file = self.runs_root / job.run_id / SCENARIO_DOC_FILE
+        if doc_file.is_file():
+            args.extend(["--scenario-doc-file", str(doc_file)])
+        commits_file = self.runs_root / job.run_id / SOURCE_COMMITS_FILE
+        if commits_file.is_file():
+            args.extend(["--source-commits-json", str(commits_file)])
         environment = _trusted_environment()
         environment["MODEL_SOURCE"] = str(checkpoint)
         try:

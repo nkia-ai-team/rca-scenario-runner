@@ -15,7 +15,12 @@ from app.capture_orchestration import (
     CaptureRequest,
     CaptureScheduler,
     ScenarioMetadata,
+    collect_source_commits,
+    freeze_capture_inputs,
+    load_scenario_metadata,
     load_scenario_notes,
+    parse_source_commit,
+    render_scenario_doc,
 )
 from app import live_probes
 from app.live_probes import (
@@ -908,6 +913,233 @@ def test_capture_invoker_forwards_scenario_notes_outside_the_metadata_digest(tmp
     digest = scenario_metadata().sha256()
     assert with_notes[with_notes.index("--scenario-metadata-sha256") + 1] == digest
     assert plain[plain.index("--scenario-metadata-sha256") + 1] == digest
+    # No answer sheet or commit record frozen next to the run (a job scheduled before
+    # v4 CAPMETA): those flags are not passed either.
+    assert "--scenario-doc-file" not in plain
+    assert "--source-commits-json" not in plain
+
+
+# --- v4 CAPMETA: the recording's answer sheet and source commits ------------------
+SHA_A = "0123456789abcdef0123456789abcdef01234567"
+SHA_B = "fedcba9876543210fedcba9876543210fedcba98"
+
+
+@pytest.mark.parametrize(
+    ("raw", "commit", "status"),
+    [
+        (f"{SHA_A}\n", SHA_A, "stamped"),
+        (f"{SHA_A}-dirty\n", SHA_A, "dirty"),
+        ("$Format:%H$\n", None, "unstamped"),
+        (None, None, "missing"),
+        ("main\n", None, "invalid"),
+        (f"{SHA_A[:12]}\n", None, "invalid"),
+        (f"{SHA_A.upper()}\n", None, "invalid"),
+    ],
+)
+def test_source_commit_marker_states(raw, commit, status) -> None:
+    assert parse_source_commit(raw, source="m") == {"commit": commit, "status": status, "source": "m"}
+
+
+def test_collect_source_commits_reads_both_markers_and_env_only_backs_an_unstamped_runner(tmp_path) -> None:
+    contracts = tmp_path / "scenario-contracts"
+    contracts.mkdir()
+    (contracts / "SOURCE_COMMIT").write_text(f"{SHA_A}\n", encoding="utf-8")
+    runner_marker = tmp_path / "SOURCE_COMMIT"
+    runner_marker.write_text(f"{SHA_B}\n", encoding="utf-8")
+
+    stamped = collect_source_commits(
+        contracts, runner_marker=runner_marker, environ={"RUNNER_SOURCE_COMMIT": f"{SHA_A}-dirty"}
+    )
+    assert stamped == {
+        "schema_version": 1,
+        "testbed_services": {"commit": SHA_A, "status": "stamped", "source": "scenario-contracts/SOURCE_COMMIT"},
+        "runner": {"commit": SHA_B, "status": "stamped", "source": "backend/app/SOURCE_COMMIT"},
+    }
+    # A git checkout build: the image marker is the placeholder, build-and-deploy.sh passed HEAD.
+    runner_marker.write_text("$Format:%H$\n", encoding="utf-8")
+    from_env = collect_source_commits(
+        contracts, runner_marker=runner_marker, environ={"RUNNER_SOURCE_COMMIT": f"{SHA_B}-dirty"}
+    )
+    assert from_env["runner"] == {"commit": SHA_B, "status": "dirty", "source": "env:RUNNER_SOURCE_COMMIT"}
+    # Neither: the recording says so instead of naming a commit.
+    (contracts / "SOURCE_COMMIT").unlink()
+    neither = collect_source_commits(contracts, runner_marker=runner_marker, environ={})
+    assert neither["testbed_services"] == {
+        "commit": None, "status": "missing", "source": "scenario-contracts/SOURCE_COMMIT",
+    }
+    assert neither["runner"] == {"commit": None, "status": "unstamped", "source": "backend/app/SOURCE_COMMIT"}
+
+
+def _answer_registry(tmp_path) -> tuple[Path, dict]:
+    entry = {
+        **scenario_metadata().model_dump(mode="json"),
+        "title_ko": "북남 급증",
+        "root_cause": {"target_kind": "service", "target_id": "commerce-order", "trigger_target_id": None},
+        "must_support": ["order 503 이 오른다", "gateway 요청이 같이 오른다"],
+        "must_rule_out": [],
+        "scoring": {"granularity": "service", "accept": ["commerce-order"], "partial": []},
+        "difficulty": "hard",
+    }
+    registry = tmp_path / "scenario-metadata.json"
+    registry.write_text(
+        json.dumps({"schema_version": "1.0", "scenarios": {
+            "F07-H": entry,
+            "F01-R": {**scenario_metadata().model_dump(mode="json"), "title": "another scenario"},
+        }},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return registry, entry
+
+
+def test_scenario_doc_is_the_registry_entry_in_its_own_words(tmp_path) -> None:
+    registry, entry = _answer_registry(tmp_path)
+    commits = {
+        "schema_version": 1,
+        "testbed_services": {"commit": SHA_A, "status": "stamped", "source": "s"},
+        "runner": {"commit": None, "status": "unstamped", "source": "r"},
+    }
+    doc = render_scenario_doc(registry, "F07-H", case_id="case-f07-h-v4-1", run_id="run-1", source_commits=commits)
+
+    assert doc.startswith("# 시나리오 정답지: F07-H\n")
+    assert "| case_id | case-f07-h-v4-1 |" in doc and "| run_id | run-1 |" in doc
+    assert f"| 등록부 sha256 | {file_sha256(registry)} |" in doc
+    assert f"| testbed-services 커밋 | {SHA_A} (stamped) |" in doc
+    assert "| 러너 커밋 | (없음, unstamped) |" in doc
+    # Every field under its own key, in registry order; text verbatim, string lists as bullets.
+    headings = [line[3:] for line in doc.splitlines() if line.startswith("## ")]
+    assert headings == [*entry.keys(), "등록부 항목 원문 (JSON)"]
+    for key in ("title", "description", "cause", "injection_summary", "user_impact", "distinguishing_evidence"):
+        assert f"## {key}\n\n{entry[key]}\n" in doc
+    assert "## must_support\n\n- order 503 이 오른다\n- gateway 요청이 같이 오른다\n" in doc
+    assert "## must_rule_out\n\n(빈 목록)\n" in doc
+    # The raw entry closes the sheet and parses back to the registry entry exactly.
+    raw = doc.split("## 등록부 항목 원문 (JSON)\n\n```json\n", 1)[1].rsplit("\n```\n", 1)[0]
+    assert json.loads(raw) == entry
+    assert "another scenario" not in doc and "F01-R" not in doc  # only this scenario's entry
+    with pytest.raises(RuntimeError):
+        render_scenario_doc(registry, "F99-X", case_id="c", run_id="r", source_commits=commits)
+
+
+async def test_scheduling_a_capture_freezes_the_answer_sheet_and_commits_and_the_invoker_forwards_them(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("SCENARIO_PASS", raising=False)
+    monkeypatch.setenv("CYCLE_MODE", "true")
+    monkeypatch.delenv("RUNNER_SOURCE_COMMIT", raising=False)
+    registry, entry = _answer_registry(tmp_path)
+    contracts = tmp_path / "scenario-contracts"
+    contracts.mkdir()
+    (contracts / "SOURCE_COMMIT").write_text(f"{SHA_A}\n", encoding="utf-8")
+    dispatcher = contracts / "run-scenario.sh"
+    dispatcher.write_text("trusted", encoding="utf-8")
+    model = tmp_path / "model.json"
+    model.write_text('{"version": 1}\n', encoding="utf-8")
+    script = tmp_path / "capture-eval-case.sh"
+    script.write_text("trusted", encoding="utf-8")
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    invoker = ProductionCaptureInvoker(
+        runs_root=tmp_path / "runs", capture_script=script, output_root=tmp_path / "cases",
+        model_source=model, process_runner=process,
+    )
+    invoker._close_open_incidents = lambda job: None  # type: ignore[method-assign]
+    scheduler = CaptureScheduler(tmp_path / "capture.json", clock=Clock(), invoker=invoker)
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir = store.create("run-20261118-abcdef12", {"controller": {}})
+    runner = ScenarioRunner(
+        tmp_path, tmp_path / "logs", artifact_store=store, capture_scheduler=scheduler,
+        dispatcher_path=dispatcher, scenario_metadata_path=registry,
+    )
+    session = SimpleNamespace(
+        run_id="run-20261118-abcdef12",
+        scenario_id="F07-H",
+        profile_id="load.north_south",
+        approved_profile_id="load.north_south",
+        t1=datetime(2026, 7, 16, 10, 0, tzinfo=timezone.utc),
+        t2=datetime(2026, 7, 16, 10, 20, tzinfo=timezone.utc),
+        controller_state=SimpleNamespace(phase=ControllerPhase.SUCCEEDED),
+        spec=SimpleNamespace(
+            cycle_mode=True,
+            capture=SimpleNamespace(enabled=True),
+            adaptive=SimpleNamespace(mode=SimpleNamespace(value="calibration")),
+        ),
+        trusted_evidence=lambda: {
+            "mode": "calibration", "outcome": "succeeded", "dirty": False,
+            "t1": "2026-07-16T10:00:00Z", "t2": "2026-07-16T10:20:00Z",
+        },
+    )
+    runner._schedule_capture(session, run_dir)
+    await runner.stop_capture_worker()
+
+    commits = json.loads((run_dir / "source-commits.json").read_text(encoding="utf-8"))
+    assert commits["testbed_services"] == {
+        "commit": SHA_A, "status": "stamped", "source": "scenario-contracts/SOURCE_COMMIT",
+    }
+    assert set(commits) == {"schema_version", "testbed_services", "runner"}
+    doc = (run_dir / "scenario.md").read_text(encoding="utf-8")
+    assert doc == render_scenario_doc(
+        registry, "F07-H", case_id="case-f07-h-v4-abcdef12", run_id="run-20261118-abcdef12",
+        source_commits=commits,
+    )
+    assert json.loads(doc.split("```json\n")[-1].rsplit("\n```", 1)[0]) == entry
+
+    # A later deploy does not rewrite what the run used: the frozen files stay.
+    (contracts / "SOURCE_COMMIT").write_text(f"{SHA_B}\n", encoding="utf-8")
+    freeze_capture_inputs(
+        run_dir, registry_path=registry, contract_root=contracts, scenario_id="F07-H",
+        case_id="case-f07-h-v4-abcdef12", run_id="run-20261118-abcdef12",
+    )
+    assert json.loads((run_dir / "source-commits.json").read_text(encoding="utf-8")) == commits
+    assert (run_dir / "scenario.md").read_text(encoding="utf-8") == doc
+
+    scheduler.tick("run-20261118-abcdef12")
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[argv.index("--scenario-doc-file") + 1] == str(run_dir / "scenario.md")
+    assert argv[argv.index("--source-commits-json") + 1] == str(run_dir / "source-commits.json")
+
+
+def test_the_real_capture_accepts_what_the_runner_freezes(tmp_path) -> None:
+    """Cross-repo contract: the sibling testbed-services capture takes the runner's two files as they are."""
+    services = Path(__file__).resolve().parents[2].parent / "testbed-services"
+    capture = services / "scripts" / "capture-eval-case.sh"
+    registry = services / "scripts" / "scenarios" / "registry" / "scenario-metadata.json"
+    if not capture.is_file() or not registry.is_file():
+        pytest.skip("testbed-services is not checked out next to the runner")
+    scenario_id = next(iter(json.loads(registry.read_text(encoding="utf-8"))["scenarios"]))
+    metadata = load_scenario_metadata(registry, scenario_id)
+    run_dir = tmp_path / "runs" / "run-x"
+    run_dir.mkdir(parents=True)
+    freeze_capture_inputs(
+        run_dir, registry_path=registry, contract_root=services / "scripts" / "scenarios",
+        scenario_id=scenario_id, case_id="case-x-v4-1", run_id="run-x",
+        runner_marker=tmp_path / "absent", environ={},
+    )
+    done = subprocess.run(
+        [
+            "bash", str(capture), "--case-id", "case-x-v4-1", "--scenario-id", scenario_id,
+            "--scenario-title", metadata.title, "--scenario-description", metadata.description,
+            "--scenario-cause", metadata.cause, "--scenario-injection-summary", metadata.injection_summary,
+            "--scenario-user-impact", metadata.user_impact,
+            "--scenario-distinguishing-evidence", metadata.distinguishing_evidence,
+            "--scenario-metadata-sha256", metadata.sha256(),
+            "--t1", "2026-07-16T10:00:00Z", "--t2", "2026-07-16T10:20:00Z", "--case-label", "calibration",
+            "--scenario-doc-file", str(run_dir / "scenario.md"),
+            "--source-commits-json", str(run_dir / "source-commits.json"),
+            "--output-root", str(tmp_path / "cases"), "--dry-run",
+        ],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    meta = json.loads(done.stdout)
+    assert meta["source_commits"] == json.loads((run_dir / "source-commits.json").read_text(encoding="utf-8"))
+    assert meta["scenario_doc"] == {"file": "scenario.md", "sha256": file_sha256(run_dir / "scenario.md")}
+    assert meta["source_commits"]["runner"]["status"] == "missing"
 
 
 def test_capture_invoker_can_stream_model_from_fixed_remote_observer(tmp_path) -> None:
