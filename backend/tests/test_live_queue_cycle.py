@@ -2535,6 +2535,49 @@ async def test_cycle_buffer_gate_does_not_inject_while_the_purge_marker_stands(t
 
 
 @pytest.mark.asyncio
+async def test_cycle_buffer_gate_reads_the_same_oracle_signals_as_readiness(tmp_path: Path) -> None:
+    """ORAFIX round 3 (command session decision): the buffer gate blocks on the same Oracle check signals
+    readiness() blocks a v2 injection start on: ALERT and a stale result as well as PURGE_FAILED."""
+    for case in ("alert", "stale", "fresh"):
+        base = tmp_path / case
+        base.mkdir()
+        queue, runner, _, _, clock = make_cycle_queue(base)
+        state_dir = base / "oracle-capacity"
+        state_dir.mkdir()
+
+        def last(at):
+            (state_dir / "last.json").write_text(json.dumps(
+                {"measured_at": at.strftime("%Y-%m-%dT%H:%M:%SZ"), "check_period_hours": 6}), encoding="utf-8")
+
+        last(clock.value)
+        queue.oracle_check_state_dir = state_dir
+        await queue.start()
+        state = await queue.tick()
+        clock.value = state_expected(state)
+        state = await queue.tick()
+        clock.value = state_expected(state)
+        if case == "alert":
+            (state_dir / "ALERT").write_text("2026-07-16T10:07:01Z seed accounts: 1 below 150000\n", encoding="utf-8")
+        elif case == "stale":
+            last(clock.value - timedelta(hours=13, minutes=1))
+        state = await queue.tick()
+        # The gate gives the same verdict readiness() gives for the same directory.
+        readiness = queue.readiness()
+        if case == "fresh":
+            assert readiness.checks["oracle_maintenance_check"] is True
+            assert state.phase == "running" and len(runner.started) == 1
+            continue
+        assert readiness.checks["oracle_maintenance_check"] is False
+        assert state.phase == "paused" and runner.started == [], case
+        assert state.reason == (
+            "operational readiness failed: oracle_maintenance_check "
+            f"(oracle_maintenance_check: {readiness.details['oracle_maintenance_check']})"
+        ), case
+        expected = "ALERT 2026-07-16T10:07:01Z seed accounts: 1 below 150000" if case == "alert" else "stale"
+        assert expected in (state.reason or ""), case
+
+
+@pytest.mark.asyncio
 async def test_cycle_injection_records_the_archive_state_it_started_on(tmp_path: Path) -> None:
     queue, runner, _, _, clock = make_cycle_queue(tmp_path)
     queue.archive_state_dir = _archive_facts(tmp_path, clock.value)

@@ -1608,16 +1608,18 @@ class LiveScenarioQueue:
             f"not Ready for {int(held.total_seconds())}s, limit {int(DOMAIN_PODS_GRACE.total_seconds())}s)"
         )
 
-    def _purge_failed_blocker(self) -> str | None:
-        """Pause reason while oracle-maintenance's PURGE_FAILED marker exists (the cycle queue does not
-        run readiness() between scenarios; review rv-orafix M1). The marker already needs two failed
-        attempts (oracle-maintenance.sh purge retries once), so it pauses without a further grace."""
-        if self.oracle_check_state_dir is None:
+    def _oracle_check_blocker(self) -> str | None:
+        """Pause reason when the banking Oracle check blocks, read right before a cycle injection.
+
+        The cycle queue does not run readiness() between scenarios (review rv-orafix M1), so the
+        buffer gate reads the same signals readiness() reads at a v2 injection start: PURGE_FAILED,
+        ALERT, and a missing, stale or unreadable last.json (_oracle_check_readiness). Same state,
+        same decision in both modes (command session decision, ORAFIX round 3). None of these is
+        transient: PURGE_FAILED already needs two failed attempts and the rest need a person."""
+        checks, details = self._oracle_check_readiness()
+        if not checks or checks.get(ORACLE_CHECK_NAME, True):
             return None
-        if not (self.oracle_check_state_dir / ORACLE_PURGE_FAILED_FILE).exists():
-            return None
-        _, details = self._oracle_check_readiness()
-        detail = details.get(ORACLE_CHECK_NAME, "PURGE_FAILED")
+        detail = details.get(ORACLE_CHECK_NAME, "")
         return f"operational readiness failed: {ORACLE_CHECK_NAME} ({ORACLE_CHECK_NAME}: {detail})"
 
     def _cycle_buffer_gate(
@@ -1636,9 +1638,9 @@ class LiveScenarioQueue:
                 ),
                 None,
             )
-        purge = self._purge_failed_blocker()
-        if purge is not None:
-            return self._pause(state, purge), None
+        oracle = self._oracle_check_blocker()
+        if oracle is not None:
+            return self._pause(state, oracle), None
         # A domain app pod that is not Ready at injection start is a broken testbed, not a scenario
         # effect (none runs yet). Held for the grace first; past it, a person is needed: pause.
         verdict_pods, detail = self._domain_pods_gate()
