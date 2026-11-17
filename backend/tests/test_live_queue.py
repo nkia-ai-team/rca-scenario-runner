@@ -927,6 +927,8 @@ def _archive_facts(
             "archive_runs": [],
             "last_archive_ok": None if last_ok is None else last_ok.strftime("%Y-%m-%dT%H:%M:%SZ"),
         },
+        # Computed at install from the load settings (cap 2,000,000 + 121,824 x 2.5).
+        "rows_limit": {"limit": 2_304_560, "keep_rows": 2_000_000, "design_daily_writes": 121_824, "days": 2.5},
     }
     (state / "last.json").write_text(json.dumps(doc), encoding="utf-8")
     return state
@@ -935,8 +937,8 @@ def _archive_facts(
 def test_archive_state_gates_readiness(tmp_path: Path) -> None:
     """Q22 addendum 2: block before injecting when the civil-petition archive stopped keeping up.
 
-    48h since the last ok (two nightly runs in a row missed) or rows over the cap x 1.1
-    (twice one day's writes) blocks. Facts that are missing, stale or unreadable block too.
+    48h since the last ok (two nightly runs in a row missed) or rows over the limit the db01 line
+    carries (cap + design daily writes x 2.5, Q24) blocks. Facts that are missing, stale or unreadable block too.
     Without a configured directory the check is not part of readiness.
     """
     queue, _, _, _, clock = make_queue(tmp_path)
@@ -963,19 +965,31 @@ def test_archive_state_gates_readiness(tmp_path: Path) -> None:
     _archive_facts(tmp_path, now, last_ok=None)
     assert "no archive batch has ever finished ok" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
 
-    # Rows over the cap x 1.1: 2,200,000 passes, 2,200,001 blocks; both reasons are listed.
-    _archive_facts(tmp_path, now, rows=2_200_000)
+    # Rows over the limit: 2,304,560 passes, 2,304,561 blocks; both reasons are listed. One failed night
+    # (cap + two days of writes, 2,243,648) still passes.
+    _archive_facts(tmp_path, now, rows=2_000_000 + 2 * 121_824)
     assert queue.readiness().checks[ARCHIVE_STATE_CHECK_NAME] is True
-    _archive_facts(tmp_path, now, rows=2_200_001)
-    assert "petition rows 2200001 > 2200000 (cap 2000000 x 1.1)" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
-    _archive_facts(tmp_path, now, rows=2_200_001, last_ok=now - timedelta(hours=60))
+    _archive_facts(tmp_path, now, rows=2_304_560)
+    assert queue.readiness().checks[ARCHIVE_STATE_CHECK_NAME] is True
+    _archive_facts(tmp_path, now, rows=2_304_561)
+    assert (
+        "petition rows 2304561 > 2304560 (cap 2000000 + design daily writes 121824 x 2.5)"
+        in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
+    )
+    _archive_facts(tmp_path, now, rows=2_304_561, last_ok=now - timedelta(hours=60))
     detail = queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
-    assert "60h ago" in detail and "2200001" in detail
-    # The cap follows the configured value (PETITION_ARCHIVE_KEEP_ROWS).
-    queue.archive_state_keep_rows = 1_000_000
-    _archive_facts(tmp_path, now, rows=1_100_001)
+    assert "60h ago" in detail and "2304561" in detail
+    # The limit is the one the line carries (computed from the load settings), not a runner constant.
+    state = tmp_path / "petition-archive" / "last.json"
+    doc = json.loads(state.read_text())
+    doc["rows_limit"]["limit"] = 1_100_000
+    doc["db"]["rows"]["petition"] = 1_100_001
+    state.write_text(json.dumps(doc), encoding="utf-8")
     assert "> 1100000" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
-    queue.archive_state_keep_rows = 2_000_000
+    # A line without the limit cannot be judged and blocks.
+    del doc["rows_limit"]
+    state.write_text(json.dumps(doc), encoding="utf-8")
+    assert "unreadable" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
 
     # Facts older than the limit (default 1h) say nothing about now.
     _archive_facts(tmp_path, now - timedelta(minutes=59))
@@ -994,7 +1008,7 @@ async def test_archive_state_refuses_start_pauses_between_scenarios_and_is_recor
     """Not transient: a stalled archive needs a person. The facts an injection started on are
     left in the run folder (archive_state.json) for the verify skill."""
     queue, runner, _, _, clock = make_queue(tmp_path)
-    queue.archive_state_dir = _archive_facts(tmp_path, clock.value, rows=2_300_000)
+    queue.archive_state_dir = _archive_facts(tmp_path, clock.value, rows=2_400_000)
     with pytest.raises(RuntimeError, match=ARCHIVE_STATE_CHECK_NAME):
         await queue.start()
     assert runner.started == []
@@ -1007,7 +1021,8 @@ async def test_archive_state_refuses_start_pauses_between_scenarios_and_is_recor
     recorded = json.loads((runner.artifact_store.root / run_id / "archive_state.json").read_text())
     assert recorded["passes"] is True
     assert recorded["facts"]["db"]["rows"]["petition"] == 2_080_000
-    assert (recorded["keep_rows"], recorded["rows_factor"], recorded["max_ok_age_hours"]) == (2_000_000, 1.1, 48)
+    assert recorded["rows_limit"] == {"limit": 2_304_560, "keep_rows": 2_000_000, "design_daily_writes": 121_824, "days": 2.5}
+    assert recorded["max_ok_age_hours"] == 48
 
     _wait_in_clean_window(queue, clock)
     started = len(runner.started)
@@ -1026,7 +1041,8 @@ async def test_archive_state_refuses_start_pauses_between_scenarios_and_is_recor
 def test_compose_passes_the_archive_state_settings_and_leaves_the_check_off() -> None:
     compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text(encoding="utf-8")
     assert "- PETITION_ARCHIVE_STATE_DIR=${PETITION_ARCHIVE_STATE_DIR:-}" in compose
-    assert "- PETITION_ARCHIVE_KEEP_ROWS=${PETITION_ARCHIVE_KEEP_ROWS:-2000000}" in compose
+    # The rows limit comes with the db01 line (computed from the load settings), not from runner settings.
+    assert "PETITION_ARCHIVE_KEEP_ROWS" not in compose
 
 
 def test_compose_mounts_the_oracle_check_directory_read_only() -> None:

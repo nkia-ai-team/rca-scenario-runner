@@ -2377,6 +2377,7 @@ def _archive_facts(tmp_path: Path, at: datetime, *, rows: int = 2_080_000) -> Pa
     (state / "last.json").write_text(json.dumps({
         "host": "db01", "at": stamp,
         "db": {"rows": {"petition": rows, "petition_history": rows * 3}, "archive_runs": [], "last_archive_ok": last_ok},
+        "rows_limit": {"limit": 2_304_560, "keep_rows": 2_000_000, "design_daily_writes": 121_824, "days": 2.5},
     }), encoding="utf-8")
     return state
 
@@ -2393,11 +2394,11 @@ async def test_cycle_buffer_gate_does_not_inject_when_the_archive_state_blocks(t
     state = await queue.tick()  # -> cycle_buffer
     assert state.phase == "cycle_buffer"
     clock.value = state_expected(state)
-    _archive_facts(tmp_path, clock.value, rows=2_200_001)
+    _archive_facts(tmp_path, clock.value, rows=2_304_561)
     state = await queue.tick()
     assert state.phase == "paused"
     assert ARCHIVE_STATE_CHECK_NAME in (state.reason or "")
-    assert "2200001 > 2200000" in (state.reason or "")
+    assert "2304561 > 2304560" in (state.reason or "")
     assert runner.started == []
 
 

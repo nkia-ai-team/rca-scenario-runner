@@ -137,7 +137,11 @@ ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 # keeping up, the domain's normal period drifts (the baseline moves), so no injection may start
 # (review-session answer Q22 addendum 2, 2026-11-17: block before the run, not after).
 #   - the last archive result "ok" is more than 48h old: two nightly runs in a row failed,
-#   - the petition rows exceed the cap x 1.1: twice one day's writes (about 5% of the cap each).
+#   - the petition rows exceed the cap + the design daily writes x 2.5 (review-session answer Q24 (c)): one
+#     failed night still passes (at most cap + 2 days of writes before the next run), two in a row block
+#     the next day, the same "two in a row" meaning as the 48h condition. The limit is not written here:
+#     the db01 line carries it ("rows_limit"), computed at install from the load settings
+#     (civil-petition/deploy/tools/design_load.py), and the runner records it with each run.
 # Input: a light db01 read on a fixed 30-minute timer that runs from normal operation on, unrelated to
 # injections (civil-petition/deploy/templates/db/pg-table-stats: the statistics estimate n_live_tup and
 # the last ok archive time, lock_timeout 200ms below deadlock_timeout, statement_timeout 1s, no table scan
@@ -149,9 +153,6 @@ ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 # the check cannot say anything and blocks. Off unless the directory is configured.
 ARCHIVE_STATE_CHECK_NAME = "petition_archive_state"
 ARCHIVE_STATE_MAX_OK_AGE = timedelta(hours=48)
-ARCHIVE_STATE_ROWS_FACTOR = 1.1
-# Same default as the app's petition.archive.keep-rows (civil-petition application.properties).
-ARCHIVE_STATE_DEFAULT_KEEP_ROWS = 2_000_000
 ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE = timedelta(hours=1)
 
 
@@ -165,7 +166,6 @@ def archive_state_verdict(
     facts: Mapping[str, Any],
     now: datetime,
     *,
-    keep_rows: int = ARCHIVE_STATE_DEFAULT_KEEP_ROWS,
     max_facts_age: timedelta = ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE,
 ) -> tuple[bool, str]:
     """(passes, detail) for one db-facts.sh line. Raises on an unreadable document."""
@@ -174,6 +174,10 @@ def archive_state_verdict(
     rows = db["rows"]["petition"]
     if not isinstance(rows, int) or isinstance(rows, bool):
         raise ValueError(f"rows.petition is not an integer: {rows!r}")
+    limit_doc = facts["rows_limit"]
+    limit = limit_doc["limit"]
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise ValueError(f"rows_limit.limit is not a positive integer: {limit!r}")
     now = now.astimezone(timezone.utc)
     facts_age = now - at
     if facts_age > max_facts_age:
@@ -192,9 +196,11 @@ def archive_state_verdict(
                 f"last archive ok at {last_ok}, {int(ok_age.total_seconds() // 3600)}h ago > "
                 f"{int(ARCHIVE_STATE_MAX_OK_AGE.total_seconds() // 3600)}h (two nightly runs in a row did not finish)"
             )
-    limit = int(keep_rows * ARCHIVE_STATE_ROWS_FACTOR)
     if rows > limit:
-        reasons.append(f"petition rows {rows} > {limit} (cap {keep_rows} x {ARCHIVE_STATE_ROWS_FACTOR})")
+        reasons.append(
+            f"petition rows {rows} > {limit} (cap {limit_doc.get('keep_rows')} + design daily writes "
+            f"{limit_doc.get('design_daily_writes')} x {limit_doc.get('days')})"
+        )
     if reasons:
         return False, "; ".join(reasons)
     return True, f"petition rows {rows} <= {limit}, last archive ok {last_ok}"
@@ -478,7 +484,6 @@ class LiveScenarioQueue:
         oracle_check_state_dir: Path | None = None,
         oracle_check_max_age: timedelta | None = None,
         archive_state_dir: Path | None = None,
-        archive_state_keep_rows: int = ARCHIVE_STATE_DEFAULT_KEEP_ROWS,
         archive_state_max_facts_age: timedelta = ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE,
     ) -> None:
         self.runner = runner
@@ -488,7 +493,6 @@ class LiveScenarioQueue:
         self.oracle_check_max_age = oracle_check_max_age
         # Where the civil-petition db01 facts (last.json) land. None leaves the check out.
         self.archive_state_dir = archive_state_dir
-        self.archive_state_keep_rows = archive_state_keep_rows
         self.archive_state_max_facts_age = archive_state_max_facts_age
         # v3 continuous-cycle mode (off by default; v2 behaviour preserved).
         self.cycle_mode = cycle_mode
@@ -670,7 +674,6 @@ class LiveScenarioQueue:
             passes, detail = archive_state_verdict(
                 facts,
                 self.clock.now(),
-                keep_rows=self.archive_state_keep_rows,
                 max_facts_age=self.archive_state_max_facts_age,
             )
             return facts, passes, detail
@@ -697,8 +700,8 @@ class LiveScenarioQueue:
             "facts": facts,
             "passes": passes,
             "detail": detail,
-            "keep_rows": self.archive_state_keep_rows,
-            "rows_factor": ARCHIVE_STATE_ROWS_FACTOR,
+            # The rows limit this injection was judged against (cap + design daily writes x 2.5).
+            "rows_limit": (facts or {}).get("rows_limit"),
             "max_ok_age_hours": int(ARCHIVE_STATE_MAX_OK_AGE.total_seconds() // 3600),
         }
         path = self.runner.artifact_store.root / run_id / "archive_state.json"
@@ -3159,9 +3162,6 @@ def get_live_queue() -> LiveScenarioQueue:
                 Path(os.environ["PETITION_ARCHIVE_STATE_DIR"])
                 if os.environ.get("PETITION_ARCHIVE_STATE_DIR", "").strip()
                 else None
-            ),
-            archive_state_keep_rows=int(
-                os.environ.get("PETITION_ARCHIVE_KEEP_ROWS", "").strip() or ARCHIVE_STATE_DEFAULT_KEEP_ROWS
             ),
             archive_state_max_facts_age=(
                 timedelta(seconds=int(os.environ["PETITION_ARCHIVE_STATE_MAX_AGE_SEC"]))
