@@ -943,9 +943,14 @@ def test_a_purge_failure_blocks_readiness_at_once(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_domain_pod_not_ready_pauses_before_the_injection_only(tmp_path: Path) -> None:
-    """v4 ORAFIX (Q25 answer 2): every testbed app pod Ready is judged right before an injection
-    starts, not in readiness() (read while an injection may hold a pod down on purpose)."""
+async def test_a_domain_pod_not_ready_holds_then_pauses_before_the_injection_only(tmp_path: Path) -> None:
+    """v4 ORAFIX (Q25 answer 2, review rv-orafix H1): every testbed app pod Ready is judged right
+    before an injection starts, not in readiness() (read while an injection may hold a pod down on
+    purpose). A not-Ready answer first holds the injection and is asked again at most every 30s; only
+    when it stays not Ready for the grace (3 minutes) does the queue pause."""
+    from app.live_queue import DOMAIN_PODS_GRACE, DOMAIN_PODS_RECHECK
+
+    assert (DOMAIN_PODS_GRACE, DOMAIN_PODS_RECHECK) == (timedelta(minutes=3), timedelta(seconds=30))
     queue, runner, _, _, clock = make_queue(tmp_path)
     answers = ["1 of 7 app pods not Ready: rca-testbed-banking/testbed-oracle-0(CrashLoopBackOff)"]
     calls = []
@@ -959,29 +964,53 @@ async def test_a_domain_pod_not_ready_pauses_before_the_injection_only(tmp_path:
     assert DOMAIN_PODS_CHECK_NAME not in readiness.checks and calls == []
     await queue.start()
     state = await queue.tick()
-    assert state.phase == "paused" and runner.started == []
+    assert state.phase != "paused" and runner.started == [] and len(calls) == 1
+    state = await queue.tick()  # within 30s: no new look, still held
+    assert state.phase != "paused" and len(calls) == 1
+    clock.value += timedelta(seconds=31)
+    state = await queue.tick()
+    assert state.phase != "paused" and len(calls) == 2 and runner.started == []
+    clock.value += timedelta(minutes=3)
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == [] and len(calls) == 3
     assert state.reason == (
         f"operational readiness failed: {DOMAIN_PODS_CHECK_NAME} ({DOMAIN_PODS_CHECK_NAME}: "
-        "1 of 7 app pods not Ready: rca-testbed-banking/testbed-oracle-0(CrashLoopBackOff))"
+        "1 of 7 app pods not Ready: rca-testbed-banking/testbed-oracle-0(CrashLoopBackOff); "
+        "not Ready for 211s, limit 180s)"
     )
-    assert len(calls) == 1
     answers[0] = None
     await queue.resume()
     state = await queue.tick()
     assert runner.started == [("F01-R", "run")]
-    assert len(calls) == 2
-    # A probe that raises blocks too (it cannot say the pods are fine); no probe, no check.
 
-    def broken():
-        raise RuntimeError("kubectl missing")
 
-    queue.domain_pods_probe = broken
-    assert queue._domain_pods_blocker() == (
-        f"operational readiness failed: {DOMAIN_PODS_CHECK_NAME} "
-        f"({DOMAIN_PODS_CHECK_NAME}: probe failed: RuntimeError: kubectl missing)"
-    )
+@pytest.mark.asyncio
+async def test_a_brief_not_ready_or_a_failed_list_does_not_pause(tmp_path: Path) -> None:
+    """One liveness restart, one failed readiness period or one API timeout passes (review H1)."""
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    answers = iter([RuntimeError("Unable to connect to the server: net/http: TLS handshake timeout"),
+                    "1 of 31 app pods not Ready: rca-testbed-commerce/testbed-cart-1(Running)", None])
+
+    def probe():
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    queue.domain_pods_probe = probe
+    await queue.start()
+    state = await queue.tick()
+    assert state.phase != "paused" and runner.started == []
+    assert queue._domain_pods_detail.startswith("probe failed: RuntimeError: Unable to connect")
+    for _ in range(2):
+        clock.value += timedelta(seconds=40)
+        state = await queue.tick()
+    assert state.phase != "paused"
+    assert runner.started == [("F01-R", "run")]
+    # The hold is forgotten once the pods were Ready: a later not-Ready starts a new grace.
+    assert queue._domain_pods_since is None
     queue.domain_pods_probe = None
-    assert queue._domain_pods_blocker() is None
+    assert queue._domain_pods_gate() == ("go", None)
 
 
 def test_compose_turns_the_domain_pods_check_on() -> None:

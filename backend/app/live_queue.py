@@ -130,8 +130,13 @@ ORACLE_CHECK_NAME = "oracle_maintenance_check"
 ORACLE_PURGE_FAILED_FILE = "PURGE_FAILED"
 # Every app pod of the testbed namespaces Ready (app.live_probes.testbed_pods_not_ready). Judged only
 # at injection start, where no scenario holds a pod down on purpose; never in readiness(), which is
-# also read while an injection runs.
+# also read while an injection runs. Like the readiness probe grace above (review rv-orafix H1): the
+# first not-Ready answer (or a list that failed) only holds the injection; the queue stays where it is
+# and looks again at most every DOMAIN_PODS_RECHECK, and pauses only when the pods stayed not Ready for
+# DOMAIN_PODS_GRACE. A liveness restart, one failed readiness period or one API timeout passes.
 DOMAIN_PODS_CHECK_NAME = "domain_pods_ready"
+DOMAIN_PODS_GRACE = READINESS_PROBE_GRACE
+DOMAIN_PODS_RECHECK = timedelta(seconds=30)
 ORACLE_CHECK_DEFAULT_PERIOD = timedelta(hours=6)
 
 
@@ -559,6 +564,10 @@ class LiveScenarioQueue:
         # None while every testbed app pod is Ready, else what is not. None (no probe) leaves the
         # check out (unit tests, older deployments). Called only right before an injection starts.
         self.domain_pods_probe = domain_pods_probe
+        # First time the pods were seen not Ready in the current hold, the last look, and what it said.
+        self._domain_pods_since: datetime | None = None
+        self._domain_pods_looked: datetime | None = None
+        self._domain_pods_detail: str | None = None
         # Where oracle-maintenance.sh check leaves last.json and ALERT (mounted read-only).
         # None leaves the check out of readiness (unit tests, older deployments).
         self.oracle_check_state_dir = oracle_check_state_dir
@@ -1207,9 +1216,11 @@ class LiveScenarioQueue:
             return deferred, None, None
         # Every domain app pod Ready before this injection (v4 ORAFIX); the previous scenario's
         # cleanup and recovery are done by now, so a pod down here is a broken testbed.
-        blocker = self._domain_pods_blocker()
-        if blocker is not None:
-            return self._pause(state, blocker), None, None
+        verdict_pods, detail = self._domain_pods_gate()
+        if verdict_pods == "hold":
+            return state, None, None
+        if verdict_pods == "pause":
+            return self._pause(state, detail or DOMAIN_PODS_CHECK_NAME), None, None
         # R6 preflight gate: prove [t1-10m, t1] is clean before injecting.
         short_circuit, verdict = self._preflight_gate(state, scenario_id)
         if short_circuit is not None:
@@ -1563,20 +1574,51 @@ class LiveScenarioQueue:
             self.injection_reserved = False
         return await asyncio.to_thread(self._enter_cycle_running, state, run, verdict)
 
-    def _domain_pods_blocker(self) -> str | None:
-        """Pause reason when a testbed app pod is not Ready at injection start, else None."""
+    def _domain_pods_gate(self) -> tuple[str, str | None]:
+        """("go", None), ("hold", detail) or ("pause", reason) for the testbed app pods right before an
+        injection (DOMAIN_PODS_* above). Hold keeps the queue in its phase; the next tick asks again."""
         if self.domain_pods_probe is None:
-            return None
+            return "go", None
+        now = self.clock.now()
+        if (
+            self._domain_pods_since is not None
+            and self._domain_pods_looked is not None
+            and now - self._domain_pods_looked < DOMAIN_PODS_RECHECK
+        ):
+            return "hold", self._domain_pods_detail
         try:
             detail = self.domain_pods_probe()
         except Exception as error:
             detail = f"probe failed: {type(error).__name__}: {error}"
         if detail is None:
-            return None
-        return (
-            f"operational readiness failed: {DOMAIN_PODS_CHECK_NAME} "
-            f"({DOMAIN_PODS_CHECK_NAME}: {str(detail)[:600]})"
+            self._domain_pods_since = self._domain_pods_looked = self._domain_pods_detail = None
+            return "go", None
+        detail = str(detail)[:600]
+        if self._domain_pods_since is None:
+            self._domain_pods_since = now
+        self._domain_pods_looked = now
+        self._domain_pods_detail = detail
+        held = now - self._domain_pods_since
+        if held < DOMAIN_PODS_GRACE:
+            logger.warning("injection held %ds: %s: %s", int(held.total_seconds()), DOMAIN_PODS_CHECK_NAME, detail)
+            return "hold", detail
+        self._domain_pods_since = self._domain_pods_looked = self._domain_pods_detail = None
+        return "pause", (
+            f"operational readiness failed: {DOMAIN_PODS_CHECK_NAME} ({DOMAIN_PODS_CHECK_NAME}: {detail}; "
+            f"not Ready for {int(held.total_seconds())}s, limit {int(DOMAIN_PODS_GRACE.total_seconds())}s)"
         )
+
+    def _purge_failed_blocker(self) -> str | None:
+        """Pause reason while oracle-maintenance's PURGE_FAILED marker exists (the cycle queue does not
+        run readiness() between scenarios; review rv-orafix M1). The marker already needs two failed
+        attempts (oracle-maintenance.sh purge retries once), so it pauses without a further grace."""
+        if self.oracle_check_state_dir is None:
+            return None
+        if not (self.oracle_check_state_dir / ORACLE_PURGE_FAILED_FILE).exists():
+            return None
+        _, details = self._oracle_check_readiness()
+        detail = details.get(ORACLE_CHECK_NAME, "PURGE_FAILED")
+        return f"operational readiness failed: {ORACLE_CHECK_NAME} ({ORACLE_CHECK_NAME}: {detail})"
 
     def _cycle_buffer_gate(
         self, state: LiveQueueState, scenario_id: str
@@ -1594,11 +1636,16 @@ class LiveScenarioQueue:
                 ),
                 None,
             )
+        purge = self._purge_failed_blocker()
+        if purge is not None:
+            return self._pause(state, purge), None
         # A domain app pod that is not Ready at injection start is a broken testbed, not a scenario
-        # effect (none runs yet): needs a person, so pause rather than spend the cycle.
-        blocker = self._domain_pods_blocker()
-        if blocker is not None:
-            return self._pause(state, blocker), None
+        # effect (none runs yet). Held for the grace first; past it, a person is needed: pause.
+        verdict_pods, detail = self._domain_pods_gate()
+        if verdict_pods == "hold":
+            return state, None
+        if verdict_pods == "pause":
+            return self._pause(state, detail or DOMAIN_PODS_CHECK_NAME), None
         # None = decoys off; a list (possibly empty) = decoys on for this cycle.
         decoys = state.cycle_decoys if state.cycle_decoy_seed is not None else None
         if self.preflight_probe is not None:

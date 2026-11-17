@@ -637,8 +637,9 @@ async def test_a_hand_written_testbed_fault_marks_only_the_scenarios_on_its_path
         ], case
         assert [f["id"] for f in window["faults_counted"]] == ["bank-stall"]
         assert window["origins"]["manual"]["keys"] == ["outage_cells", "outages_counted", "fault_cells",
-                                                       "faults_counted"]
-        assert window["origins"]["runner"]["keys"] == ["injection_cells", "runs_counted"]
+                                                       "faults_counted", "outage_overlap_cells",
+                                                       "fault_overlap_cells", "scenario_faults"]
+        assert window["origins"]["runner"]["keys"] == ["injection_cells", "runs_counted", "injection_overlap_cells"]
         assert window["origins"]["manual"]["from"] == str(queue.observation_outages_path)
         if expected is None:
             assert window["scenario_faults"] == [] and window["fault_overlap_cells"] == [], case
@@ -2457,8 +2458,9 @@ async def test_cycle_buffer_gate_does_not_inject_when_the_archive_state_blocks(t
 
 @pytest.mark.asyncio
 async def test_cycle_buffer_gate_does_not_inject_while_a_domain_pod_is_not_ready(tmp_path: Path) -> None:
-    """v4 ORAFIX (Q25 answer 2): judged once, at the buffer gate right before the injection (the
-    normal lead-in may roll decoys; the injection itself takes pods down on purpose)."""
+    """v4 ORAFIX (Q25 answer 2, review H1): judged at the buffer gate right before the injection (the
+    normal lead-in may roll decoys; the injection itself takes pods down on purpose). The buffer is
+    held while the pods are not Ready and the queue pauses only past the grace."""
     queue, runner, _, _, clock = make_cycle_queue(tmp_path)
     answers = ["1 of 7 app pods not Ready: rca-testbed-banking/testbed-oracle-0(CrashLoopBackOff)"]
     calls = []
@@ -2470,9 +2472,12 @@ async def test_cycle_buffer_gate_does_not_inject_while_a_domain_pod_is_not_ready
     assert state.phase == "cycle_buffer" and calls == []
     clock.value = state_expected(state)
     state = await queue.tick()
-    assert state.phase == "paused" and runner.started == [] and len(calls) == 1
+    assert state.phase == "cycle_buffer" and runner.started == [] and len(calls) == 1
+    clock.value += timedelta(minutes=3, seconds=1)
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == [] and len(calls) == 2
     assert DOMAIN_PODS_CHECK_NAME in (state.reason or "")
-    assert "testbed-oracle-0(CrashLoopBackOff)" in (state.reason or "")
+    assert "testbed-oracle-0(CrashLoopBackOff)" in (state.reason or "") and "limit 180s" in (state.reason or "")
     answers[0] = None
     await queue.resume()
     state = await queue.tick()
@@ -2482,6 +2487,51 @@ async def test_cycle_buffer_gate_does_not_inject_while_a_domain_pod_is_not_ready
         clock.value = state_expected(state)
         state = await queue.tick()
     assert state.phase == "running" and len(runner.started) == 1
+
+
+@pytest.mark.asyncio
+async def test_cycle_buffer_gate_holds_through_a_brief_not_ready(tmp_path: Path) -> None:
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    answers = iter(["1 of 31 app pods not Ready: rca-testbed-commerce/testbed-order-1(Running)", None])
+    queue.domain_pods_probe = lambda: next(answers)
+    await queue.start()
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "cycle_buffer" and runner.started == []
+    clock.value += timedelta(seconds=31)
+    state = await queue.tick()
+    assert state.phase == "running" and len(runner.started) == 1
+
+
+@pytest.mark.asyncio
+async def test_cycle_buffer_gate_does_not_inject_while_the_purge_marker_stands(tmp_path: Path) -> None:
+    """Review rv-orafix M1: the cycle queue does not run readiness() between scenarios, so the buffer
+    gate reads oracle-maintenance's PURGE_FAILED itself."""
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    state_dir = tmp_path / "oracle-capacity"
+    state_dir.mkdir()
+    (state_dir / "last.json").write_text(json.dumps(
+        {"measured_at": clock.value.strftime("%Y-%m-%dT%H:%M:%SZ"), "check_period_hours": 6}), encoding="utf-8")
+    queue.oracle_check_state_dir = state_dir
+    await queue.start()
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    (state_dir / "PURGE_FAILED").write_text(
+        "2026-07-16T10:23:01Z purge failed: in testbed-oracle-0: error: container not found (\"oracle\") "
+        "(2 attempts)\n", encoding="utf-8")
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == []
+    assert "oracle_maintenance_check" in (state.reason or "")
+    assert "PURGE_FAILED 2026-07-16T10:23:01Z purge failed" in (state.reason or "")
+    with pytest.raises(RuntimeError, match="oracle_maintenance_check"):
+        await queue.resume()
+    (state_dir / "PURGE_FAILED").unlink()
+    assert (await queue.resume()).phase != "paused"
 
 
 @pytest.mark.asyncio

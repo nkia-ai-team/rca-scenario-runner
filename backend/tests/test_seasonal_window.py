@@ -285,6 +285,21 @@ def test_overlap_counts_a_fault_only_on_its_path() -> None:
     assert on_path["overlap_cells"] == on_path["fault_overlap_cells"] == [{"cell": fri, "kst": "금 09시"}]
     assert on_path["scenario_faults"] == [{"id": "bank", "start": "2026-11-12T22:20:14Z", "end": "2026-11-13T01:51:40Z",
                                            "target": "t", "matched_by": "service commerce-payment"}]
+    # Overlap by source (review L5): the fault cell is not a runner or outage cell, and origins name the
+    # derived keys; the report's own origins are not changed.
+    assert on_path["injection_overlap_cells"] == [] and on_path["outage_overlap_cells"] == []
+    assert on_path["origins"]["runner"]["keys"] == ["injection_cells", "runs_counted", "injection_overlap_cells"]
+    assert on_path["origins"]["manual"]["keys"][-3:] == ["outage_overlap_cells", "fault_overlap_cells", "scenario_faults"]
+    assert report["origins"]["runner"]["keys"] == ["injection_cells", "runs_counted"]
+    mixed = sw.with_overlap(_report([{"run_id": "R", "t1": "2026-11-13T00:05:00Z", "end": "2026-11-13T00:15:00Z"}],
+                                    [fault, {"id": "o", "start": "2026-11-12T23:30:00Z", "end": "2026-11-12T23:40:00Z",
+                                             "source": "s"}]),
+                            t1, t2, scenario={"domain": "core-banking"})
+    assert [c["cell"] for c in mixed["injection_overlap_cells"]] == [fri]
+    # The outage's start edge runs from 23:30 into the next hour, so it dirties the same cell.
+    assert [c["cell"] for c in mixed["outage_overlap_cells"]] == [fri]
+    assert [c["cell"] for c in mixed["fault_overlap_cells"]] == [fri]
+    assert [c["cell"] for c in mixed["overlap_cells"]] == [fri]
     # Without a scenario (older callers) the fault counts.
     assert sw.with_overlap(report, t1, t2)["scenario_faults"][0]["matched_by"] == "scenario unknown"
     # A path scenario whose injection cell is clean still carries the fault in scenario_faults.

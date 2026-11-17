@@ -2297,6 +2297,19 @@ def test_testbed_pods_not_ready_names_every_pod_that_is_not() -> None:
         "2 of 3 app pods not Ready: rca-testbed-banking/testbed-ledger-1(Running) "
         "rca-testbed-banking/testbed-oracle-0(CrashLoopBackOff)"
     )
+    # Being deleted (the old pod of a rollout in its grace period) and Failed (an evicted pod its
+    # controller already replaced) are not counted; Failed ones are named when the answer blocks.
+    old = _testbed_pod("rca-testbed-banking", "testbed-oracle-0-old", ready=False, owner="StatefulSet")
+    old["metadata"]["deletionTimestamp"] = "2026-11-17T09:00:00Z"
+    evicted = _testbed_pod("rca-testbed-commerce", "testbed-cart-x", ready=False, phase="Failed")
+    evicted["status"]["reason"] = "Evicted"
+    run, _ = _kubectl_pods_answer([old, evicted, _testbed_pod("rca-testbed-banking", "testbed-api-1")])
+    assert testbed_pods_not_ready(run) is None
+    run, _ = _kubectl_pods_answer([evicted, _testbed_pod("rca-testbed-banking", "testbed-ledger-1", ready=False)])
+    assert testbed_pods_not_ready(run) == (
+        "1 of 1 app pods not Ready: rca-testbed-banking/testbed-ledger-1(Running); "
+        "Failed, not counted: rca-testbed-commerce/testbed-cart-x(Evicted)"
+    )
     run, _ = _kubectl_pods_answer([_testbed_pod("kube-system", "coredns-a")])
     assert testbed_pods_not_ready(run) == "no app pods in namespaces rca-testbed-*"
 

@@ -58,6 +58,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -420,13 +421,26 @@ def with_overlap(report: dict[str, Any], t1: datetime, t2: datetime,
     fault_dirty = {row["cell"] for row in report.get("fault_cells", [])
                    if mine_faults.intersection(row["faults"])}
     overlap = [c for c in mine if c in dirty or c in fault_dirty]
+    injected = {row["cell"] for row in report.get("injection_cells", [])}
+    stopped = {row["cell"] for row in report.get("outage_cells", [])}
+    rows = lambda cells: [{"cell": c, "kst": kst_label(c)} for c in mine if c in cells]  # noqa: E731
+    # overlap_cells is the union; the three per-source lists say which record made each cell dirty
+    # (review rv-orafix L5): the runner's runs, or the hand-written outages and faults.
+    origins = copy.deepcopy(report.get("origins") or {})
+    if origins:
+        origins.setdefault("runner", {}).setdefault("keys", []).append("injection_overlap_cells")
+        origins.setdefault("manual", {}).setdefault("keys", []).extend(
+            ["outage_overlap_cells", "fault_overlap_cells", "scenario_faults"])
     return {
         **report,
+        "origins": origins,
         "this_injection_cells": [{"cell": c, "kst": kst_label(c)} for c in mine],
         "overlap_cells": [{"cell": c, "kst": kst_label(c)} for c in overlap],
         "overlap": bool(overlap),
+        "injection_overlap_cells": rows(injected),
+        "outage_overlap_cells": rows(stopped),
         "scenario_faults": faults,
-        "fault_overlap_cells": [{"cell": c, "kst": kst_label(c)} for c in mine if c in fault_dirty],
+        "fault_overlap_cells": rows(fault_dirty),
     }
 
 

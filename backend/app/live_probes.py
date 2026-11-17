@@ -8,6 +8,7 @@ keeps unit tests side-effect free.
 from __future__ import annotations
 
 import base64
+import logging
 import json
 import math
 import os
@@ -33,6 +34,7 @@ from app.observations import (
 
 
 KUBECONFIG = "/root/tb-kubeconfig"
+logger = logging.getLogger(__name__)
 EXPECTED_KUBE_CONTEXT = "kubernetes-admin@kubernetes"
 EXPECTED_KUBE_NODES = frozenset({"tb-cp", "tb-w1", "tb-w2", "tb-w3"})
 LOADGEN_HOST = "192.168.122.206"
@@ -2783,6 +2785,12 @@ def _response_json(response: Mapping[str, Any]) -> Mapping[str, Any]:
 # stayed in CrashLoopBackOff for 30 hours and nothing between scenarios looked at the pods. App pods are
 # the ones a controller owns (ReplicaSet, StatefulSet, DaemonSet): a standalone pod is a client an
 # executor started and is not part of the domain. Read with one kubectl get (no exec, nothing on a node).
+# Not counted (review rv-orafix H1): a pod being deleted (deletionTimestamp: the old pod of a rollout or a
+# restore still in its grace period; its controller's replacement is counted instead), a Succeeded pod
+# (finished work), and a Failed pod (an evicted pod stays Failed until someone deletes it, and its
+# controller has already made a replacement that is counted). Failed pods are named in the answer when it
+# blocks and logged otherwise, never a reason to block on their own. The caller (live_queue) looks again
+# for a grace period before it blocks.
 TESTBED_NAMESPACE_PREFIX = "rca-testbed-"
 APP_POD_OWNERS = frozenset({"ReplicaSet", "StatefulSet", "DaemonSet"})
 
@@ -2805,6 +2813,7 @@ def testbed_pods_not_ready(
         return f"could not list the testbed pods: {type(error).__name__}: {str(detail).strip()[:200]}"
     seen = 0
     not_ready = []
+    failed = []
     for item in items:
         meta = item.get("metadata") or {}
         namespace = meta.get("namespace") or ""
@@ -2813,8 +2822,13 @@ def testbed_pods_not_ready(
         owners = {o.get("kind") for o in meta.get("ownerReferences") or []}
         if not owners & APP_POD_OWNERS:
             continue
+        if meta.get("deletionTimestamp"):
+            continue
         status = item.get("status") or {}
         if status.get("phase") == "Succeeded":
+            continue
+        if status.get("phase") == "Failed":
+            failed.append(f"{namespace}/{meta.get('name')}({status.get('reason') or 'Failed'})")
             continue
         seen += 1
         if any(c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions") or []):
@@ -2824,10 +2838,13 @@ def testbed_pods_not_ready(
             for c in status.get("containerStatuses") or []
         } - {None})
         not_ready.append(f"{namespace}/{meta.get('name')}({','.join(waiting) or status.get('phase') or 'NotReady'})")
+    also = f"; Failed, not counted: {' '.join(sorted(failed))}" if failed else ""
     if seen == 0:
-        return f"no app pods in namespaces {prefix}*"
+        return f"no app pods in namespaces {prefix}*{also}"
     if not_ready:
-        return f"{len(not_ready)} of {seen} app pods not Ready: " + " ".join(sorted(not_ready))
+        return f"{len(not_ready)} of {seen} app pods not Ready: " + " ".join(sorted(not_ready)) + also
+    if failed:
+        logger.warning("testbed app pods Failed (not counted, delete them by hand): %s", " ".join(sorted(failed)))
     return None
 
 
