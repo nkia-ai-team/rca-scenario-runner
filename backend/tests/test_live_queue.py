@@ -930,7 +930,7 @@ def _archive_facts(
         },
         # Computed at install from the load settings (cap 2,000,000 + 121,824 x 2.5).
         "rows_limit": {"limit": 2_304_560, "keep_rows": 2_000_000, "design_daily_writes": 121_824, "days": 2.5},
-        "archive_schedule": {"timer": "02:20", "window_end": "05:00", "zone": "Asia/Seoul"},
+        "archive_schedule": {"timer": "02:20", "window_end": "05:00", "zone": "Asia/Seoul", "timer_zone": "Asia/Seoul"},
     }
     (state / "last.json").write_text(json.dumps(doc), encoding="utf-8")
     return state
@@ -998,11 +998,24 @@ def test_archive_state_gates_readiness(tmp_path: Path) -> None:
         state.write_text(json.dumps(broken_doc), encoding="utf-8")
         assert "unreadable" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME], key
 
-    # Facts older than the limit (default 1h) say nothing about now.
-    _archive_facts(tmp_path, now - timedelta(minutes=59))
+    # Facts older than the limit (default 75 min = two missed 30-minute timer runs) say nothing about now.
+    _archive_facts(tmp_path, now - timedelta(minutes=74))
     assert queue.readiness().checks[ARCHIVE_STATE_CHECK_NAME] is True
-    _archive_facts(tmp_path, now - timedelta(minutes=61))
+    _archive_facts(tmp_path, now - timedelta(minutes=76))
     assert "stale" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
+
+    # Review L15: a timer zone that differs from the app window zone cannot be counted and blocks with why.
+    state = tmp_path / "petition-archive" / "last.json"
+    _archive_facts(tmp_path, now)
+    doc = json.loads(state.read_text())
+    doc["archive_schedule"]["timer_zone"] = "UTC"
+    state.write_text(json.dumps(doc), encoding="utf-8")
+    readiness = queue.readiness()
+    assert readiness.checks[ARCHIVE_STATE_CHECK_NAME] is False
+    assert "archive timer zone 'UTC' != app window zone 'Asia/Seoul'" in readiness.details[ARCHIVE_STATE_CHECK_NAME]
+    del doc["archive_schedule"]["timer_zone"]
+    state.write_text(json.dumps(doc), encoding="utf-8")
+    assert "archive timer zone None" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
 
     (tmp_path / "petition-archive" / "last.json").write_text('{"at": "2026-07-16T08:00:00Z"}', encoding="utf-8")
     readiness = queue.readiness()
@@ -1046,14 +1059,15 @@ def test_archive_state_counts_missed_nightly_windows_not_hours(tmp_path: Path) -
         if not passes:
             assert "2 nightly windows" in readiness.details[ARCHIVE_STATE_CHECK_NAME]
 
-    # Staleness: the last line before the day-2 window end (04:35, one window missed) passes for up to
-    # an hour; when no line comes after it, the check blocks as stale (61 min).
+    # Staleness (review L14): one missed timer run plus the fetch delay (up to about 65 min) still passes,
+    # two missed runs block (limit 75 min). The 04:35 line is the last before the day-2 window end.
     line_at = datetime(2026, 11, 18, 4, 35, tzinfo=kst)
     _archive_facts(tmp_path, line_at.astimezone(timezone.utc), last_ok=first_ok.astimezone(timezone.utc))
-    clock.value = (line_at + timedelta(minutes=59)).astimezone(timezone.utc)
-    assert queue.readiness().checks[ARCHIVE_STATE_CHECK_NAME] is True
-    clock.value = (line_at + timedelta(minutes=61)).astimezone(timezone.utc)
-    assert "stale" in queue.readiness().details[ARCHIVE_STATE_CHECK_NAME]
+    for minutes, passes in ((35, True), (65, True), (74, True), (76, False)):
+        clock.value = (line_at + timedelta(minutes=minutes)).astimezone(timezone.utc)
+        readiness = queue.readiness()
+        assert readiness.checks[ARCHIVE_STATE_CHECK_NAME] is passes, (minutes, readiness.details)
+    assert "stale" in readiness.details[ARCHIVE_STATE_CHECK_NAME] and "limit 75m" in readiness.details[ARCHIVE_STATE_CHECK_NAME]
 
 
 @pytest.mark.asyncio
@@ -1076,7 +1090,7 @@ async def test_archive_state_refuses_start_pauses_between_scenarios_and_is_recor
     assert recorded["facts"]["db"]["rows"]["petition"] == 2_080_000
     assert recorded["rows_limit"] == {"limit": 2_304_560, "keep_rows": 2_000_000, "design_daily_writes": 121_824, "days": 2.5}
     assert recorded["missed_windows_limit"] == 2
-    assert recorded["archive_schedule"] == {"timer": "02:20", "window_end": "05:00", "zone": "Asia/Seoul"}
+    assert recorded["archive_schedule"] == {"timer": "02:20", "window_end": "05:00", "zone": "Asia/Seoul", "timer_zone": "Asia/Seoul"}
 
     _wait_in_clean_window(queue, clock)
     started = len(runner.started)

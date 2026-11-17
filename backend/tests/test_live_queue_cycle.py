@@ -2378,7 +2378,7 @@ def _archive_facts(tmp_path: Path, at: datetime, *, rows: int = 2_080_000) -> Pa
         "host": "db01", "at": stamp,
         "db": {"rows": {"petition": rows, "petition_history": rows * 3}, "archive_runs": [], "last_archive_ok": last_ok},
         "rows_limit": {"limit": 2_304_560, "keep_rows": 2_000_000, "design_daily_writes": 121_824, "days": 2.5},
-        "archive_schedule": {"timer": "02:20", "window_end": "05:00", "zone": "Asia/Seoul"},
+        "archive_schedule": {"timer": "02:20", "window_end": "05:00", "zone": "Asia/Seoul", "timer_zone": "Asia/Seoul"},
     }), encoding="utf-8")
     return state
 

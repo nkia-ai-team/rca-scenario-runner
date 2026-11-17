@@ -157,11 +157,14 @@ ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 # db01 server-log lines minutes before every injection. The runner fetches that one JSON line with its
 # periodic read over the always-open ssh connection (a file read, no database session) into last.json.
 # This check only reads that file, so readiness() may run as often as the queue polls without touching
-# db01. The line's own read time ("at") must be recent (max age, default 1h = two missed timer runs), or
-# the check cannot say anything and blocks. Off unless the directory is configured.
+# db01. The line's own read time ("at") must be recent, or the check cannot say anything and blocks. The
+# limit means "two timer runs missed" (review rv-t2c L14): lines come every 30 minutes and the runner
+# fetches every 5, so a normal age is up to about 35 minutes and one missed run makes it up to about 65;
+# 75 minutes blocks only once a second run is also missing (and stays under the 90 of a third).
+# Default 75 minutes, PETITION_ARCHIVE_STATE_MAX_AGE_SEC overrides. Off unless the directory is configured.
 ARCHIVE_STATE_CHECK_NAME = "petition_archive_state"
 ARCHIVE_STATE_MISSED_WINDOWS_LIMIT = 2
-ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE = timedelta(hours=1)
+ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE = timedelta(minutes=75)
 
 
 def _parse_z(value: object, field: str) -> datetime:
@@ -170,10 +173,21 @@ def _parse_z(value: object, field: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
+class ArchiveScheduleMismatch(ValueError):
+    """The db01 line's schedule is self-contradictory (timer zone vs window zone)."""
+
+
 def missed_archive_windows(last_ok: datetime, observed_at: datetime, schedule: Mapping[str, Any]) -> int:
     """Nightly archive windows whose timer time is after ``last_ok`` and whose end is at or before
     ``observed_at`` (the db01 read time): runs that should have ended with an ok and did not."""
     zone = ZoneInfo(str(schedule["zone"]))
+    timer_zone = schedule.get("timer_zone")
+    if timer_zone != schedule["zone"]:
+        # Review rv-t2c L15: the timer unit runs on its own calendar zone; if it differs from the app's
+        # window zone the windows counted here are not the ones the batch runs in.
+        raise ArchiveScheduleMismatch(
+            f"archive timer zone {timer_zone!r} != app window zone {schedule['zone']!r}: missed windows cannot be counted"
+        )
     timer = dt_time.fromisoformat(str(schedule["timer"]))
     end = dt_time.fromisoformat(str(schedule["window_end"]))
     day = last_ok.astimezone(zone).date() - timedelta(days=1)
@@ -227,7 +241,12 @@ def archive_state_verdict(
         )
     reasons: list[str] = []
     last_ok = db.get("last_archive_ok")
-    if last_ok is None:
+    if schedule.get("timer_zone") != schedule["zone"]:
+        reasons.append(
+            f"archive timer zone {schedule.get('timer_zone')!r} != app window zone {schedule['zone']!r} "
+            "(the nightly windows cannot be counted)"
+        )
+    elif last_ok is None:
         reasons.append("no archive batch has ever finished ok")
     else:
         missed = missed_archive_windows(_parse_z(last_ok, "last_archive_ok"), at, schedule)
