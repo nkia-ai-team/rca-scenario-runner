@@ -138,9 +138,13 @@ ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 # (review-session answer Q22 addendum 2, 2026-11-17: block before the run, not after).
 #   - the last archive result "ok" is more than 48h old: two nightly runs in a row failed,
 #   - the petition rows exceed the cap x 1.1: twice one day's writes (about 5% of the cap each).
-# Input: the db01 read the runner keeps doing anyway (civil-petition/deploy/tools/db-facts.sh, one
-# JSON line) left as last.json in a directory. The facts must be recent (max age, default 1h), or the
-# check cannot say anything and blocks. Off unless the directory is configured.
+# Input: one light db01 read per recording preflight (civil-petition/deploy/tools/archive-state.sh: the
+# statistics estimate n_live_tup and the last ok archive time, lock_timeout 200ms below deadlock_timeout,
+# statement_timeout 1s, no table scan and no lock on the petition table; review rv-t2c M2), left as one
+# JSON line in last.json. This check only reads that file, so readiness() may run as often as the queue
+# polls (every QUEUE_POLL_INTERVAL_SEC while it waits) without touching db01; the db01 read itself
+# happens once before each injection. The facts must be recent (max age, default 1h), or the check
+# cannot say anything and blocks. Off unless the directory is configured.
 ARCHIVE_STATE_CHECK_NAME = "petition_archive_state"
 ARCHIVE_STATE_MAX_OK_AGE = timedelta(hours=48)
 ARCHIVE_STATE_ROWS_FACTOR = 1.1
