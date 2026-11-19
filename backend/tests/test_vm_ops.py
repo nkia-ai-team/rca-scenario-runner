@@ -115,12 +115,14 @@ HELPER_SHA = {name: __import__("hashlib").sha256(body).hexdigest() for name, bod
 
 
 @pytest.fixture(autouse=True)
-def _helper_sources(tmp_path, monkeypatch):
+def _helper_checksums(tmp_path, monkeypatch):
+    """The repository's expected checksums file (T4S: civil-petition/deploy/hypervisor/t4-hv-exec.sha256.json)."""
     source = tmp_path / "deploy" / "hypervisor"
     source.mkdir(parents=True)
-    for name, body in HELPER_SOURCES.items():
-        (source / name).write_bytes(body)
-    monkeypatch.setattr(vm_ops, "HELPER_SOURCE_DIR", source)
+    path = source / "t4-hv-exec.sha256.json"
+    path.write_text(json.dumps({"files": HELPER_SHA}, indent=2))
+    monkeypatch.setattr(vm_ops, "HELPER_CHECKSUMS", path)
+    return path
 
 
 def _ops(tmp_path: Path, remote: FakeRemote, clock: Clock | None = None, **kwargs) -> VmOps:
@@ -391,6 +393,17 @@ def test_drift_detail_names_what_differs_and_leaves_stale_reads_to_preflight(tmp
     assert f"hypervisor t4-hv-exec installed cccccccccccc != repository {HELPER_SHA['t4-hv-exec'][:12]}" in detail
     # A WAR record is required only on the WAS pair (web01 has none and passes).
     assert "web01" not in detail
+
+    # The expected file is read as JSON (spacing does not matter); a file without an entry stops with why.
+    path = vm_ops.HELPER_CHECKSUMS
+    path.write_text(json.dumps({"files": {"t4-hv-exec": HELPER_SHA["t4-hv-exec"]}}))
+    with pytest.raises(VmOpsError, match="lack \\['t4-hv-exec-root'\\]"):
+        ops.drift_detail()
+    path.write_text(json.dumps({"files": HELPER_SHA}, separators=(",", ":")))
+    remote.hypervisor = _hypervisor()
+    remote.outputs = FakeRemote().outputs
+    ops.read_all()
+    assert ops.drift_detail() is None
 
     # Stale reads say nothing here (preflight refuses them with the read error).
     clock.value += timedelta(seconds=vm_ops.FACTS_MAX_AGE_SEC + 1)

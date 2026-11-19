@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -86,11 +85,12 @@ STATE_DIR = Path(os.environ.get("VM_OPS_STATE_DIR", "/app/state/vm-ops"))
 
 # 66 as tb-ops reaches it (vmbr1), the helper account (T4S contract 6). Empty turns the 66 reads off.
 HYPERVISOR_TARGET = os.environ.get("VM_OPS_HYPERVISOR_TARGET", "hvjob@192.168.122.1")
-# The installed helper is the repository source byte for byte (T4S contract 7): its expected checksums are the
-# source files' own, read from the testbed-services deploy directory mounted into the runner.
-HELPER_SOURCE_DIR = Path(
+# The helper is rendered from the inventory at apply time (no file with addresses lives in the repository), so the
+# repository keeps its expected checksums in one file (T4S): {"files": {"t4-hv-exec": "<sha256>", ...}}, the same
+# shape the helper's `version` verb prints. Read from the testbed-services deploy directory mounted into the runner.
+HELPER_CHECKSUMS = Path(
     os.environ.get("CIVIL_PETITION_DEPLOY_DIR", "/opt/lucida/civil-petition-deploy")
-) / "hypervisor"
+) / "hypervisor" / "t4-hv-exec.sha256.json"
 HELPER_FILES = ("t4-hv-exec", "t4-hv-exec-root")
 
 
@@ -710,15 +710,16 @@ class VmOps:
         return document
 
     def expected_helper_sha256(self) -> dict[str, str]:
-        """The repository source's checksums of the 66 helper files (the installed files are the source as is)."""
-        expected: dict[str, str] = {}
-        for name in HELPER_FILES:
-            path = HELPER_SOURCE_DIR / name
-            try:
-                expected[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError as error:
-                raise VmOpsError(f"helper source unreadable at {path}: {error}") from None
-        return expected
+        """The 66 helper checksums the repository expects (HELPER_CHECKSUMS), compared as JSON values."""
+        try:
+            document = json.loads(HELPER_CHECKSUMS.read_text(encoding="utf-8"))
+            files = document["files"]
+        except Exception as error:
+            raise VmOpsError(f"helper checksums unreadable at {HELPER_CHECKSUMS}: {type(error).__name__}: {error}") from None
+        missing = [name for name in HELPER_FILES if not isinstance(files.get(name), str)]
+        if missing:
+            raise VmOpsError(f"helper checksums at {HELPER_CHECKSUMS} lack {missing}")
+        return {name: files[name] for name in HELPER_FILES}
 
     def drift_detail(self) -> str | None:
         """What differs from the install on the VMs and 66, or None (live_queue VM_DOMAIN_STATE_CHECK_NAME).
