@@ -160,7 +160,7 @@ class ProductionPreflightProbe:
 #   table of civil-petition/loadgen/entrypoint.sh with the PEAK_RPS and TROUGH_RPS the unit runs with). A dead or
 #   degenerate generator falls far below it; a healthy one sits at its target.
 # - alarms and incidents: the same global views as the other domains (ProductionPreflightProbe).
-# - tunnel: 66's helper `facts`, read now (handshake age, 10 pings to the monitoring end) plus the WireGuard byte
+# - tunnel: 66's helper (`tunnel`, `guards`, `version`), read now (handshake age, 10 pings to the monitoring end) plus the WireGuard byte
 #   counters of the periodic reads for the 10-minute average.
 # - monitoring freshness: 119 VictoriaMetrics (sms.cpu.utilization, sms.server.icmp_status by the agents' host_name,
 #   nms.network.snmp_status of the router's target from the target table).
@@ -181,7 +181,7 @@ ROUTER_CPU_WINDOW_MIN_SEC = 240
 ROUTER_CPU_WINDOW_MAX_SEC = 660
 FRESHNESS_LOOKBACK_SEC = 900
 VM_DOMAIN_TARGETS_PATH = Path(
-    os.environ.get("CIVIL_PETITION_TARGETS_PATH", "/opt/lucida/civil-petition-inventory/t.targets.json")
+    os.environ.get("CIVIL_PETITION_TARGETS_PATH", "/opt/lucida/civil-petition-deploy/inventory/t.targets.json")
 )
 
 
@@ -266,7 +266,9 @@ class VmDomainPreflightProbe:
         if sent < TUNNEL_PING_COUNT:
             raise _vm_ops.VmOpsError(f"hypervisor sent {sent} pings, expected {TUNNEL_PING_COUNT}")
         max_ms = ping.get("max_ms")
-        masters = self.ops.supervisor.snapshot()
+        # The six VMs only: 66 is not an SMS target, so its master is not part of this check.
+        vm_names = {host.name for host in self.ops.hosts}
+        masters = {name: status for name, status in self.ops.supervisor.snapshot().items() if name in vm_names}
         down = sum(1 for status in masters.values() if not status.get("alive"))
         settle = 0.0
         if not down:

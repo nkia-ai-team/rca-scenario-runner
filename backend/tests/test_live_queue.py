@@ -1863,11 +1863,14 @@ async def test_vm_domain_drift_pauses_before_the_injection_with_what_differs(tmp
 def test_compose_carries_the_vm_testbed_settings_and_leaves_them_off() -> None:
     compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text(encoding="utf-8")
     assert "- CIVIL_PETITION_OPS=${CIVIL_PETITION_OPS:-}" in compose
-    assert "- VM_OPS_HYPERVISOR_TARGET=${VM_OPS_HYPERVISOR_TARGET:-}" in compose
+    assert "- VM_OPS_HYPERVISOR_TARGET=${VM_OPS_HYPERVISOR_TARGET:-hvjob@192.168.122.1}" in compose
     assert "- VM_OPS_STATE_DIR=/app/state/vm-ops" in compose
-    # Keys through one directory (a missing single file would become a directory on the host).
+    # The socket directory the executors read from the same variable (T4 contract 3), on the state volume.
+    assert "- CIVIL_PETITION_SSH_CONTROL_DIR=/app/state/ssh-control" in compose
+    # Keys and known_hosts through one directory (a missing single file would become a directory on the host).
     assert "- ${VM_OPS_KEY_HOST_DIR:-/root/.ssh/vm-ops}:/root/.ssh/vm-ops:ro" in compose
     assert (
-        "- ${CIVIL_PETITION_INVENTORY_HOST_PATH:-../testbed-services/civil-petition/deploy/inventory}"
-        ":/opt/lucida/civil-petition-inventory:ro"
+        "- ${CIVIL_PETITION_DEPLOY_HOST_PATH:-../testbed-services/civil-petition/deploy}"
+        ":/opt/lucida/civil-petition-deploy:ro"
     ) in compose
+    assert "- CIVIL_PETITION_TARGETS_PATH=/opt/lucida/civil-petition-deploy/inventory/t.targets.json" in compose

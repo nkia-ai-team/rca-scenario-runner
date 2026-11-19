@@ -177,7 +177,7 @@ class _VmDomainRemote(_VmRemote):
 
     def __call__(self, argv, **kwargs):
         stdin = kwargs.get("input") or b""
-        if b"systemctl show -p Environment" in stdin:
+        if isinstance(stdin, bytes) and b"systemctl show -p Environment" in stdin:
             self.calls.append((list(argv), stdin))
             live = self.live if self.live is not None else self.live_document()
             payload = _base64.b64encode(json.dumps(live).encode()).decode()
@@ -246,7 +246,7 @@ def _vm_probe(tmp_path: _Path, *, answers=None, reads: int = 3, settle_min: int 
     targets.write_text(json.dumps({"network_devices": [{"name": "rt-core01", "address": "192.168.123.254",
                                                         "target_id": _ROUTER_ID}]}))
     ops = _vm_ops.VmOps(
-        process_runner=remote, clock=clock, state_dir=tmp_path / "vm-ops", hypervisor_target="opsview@192.168.122.1",
+        process_runner=remote, clock=clock, state_dir=tmp_path / "vm-ops", hypervisor_target="hvjob@192.168.122.1",
         supervisor=_vm_ops.MasterSupervisor(process_runner=remote, clock=clock, state_dir=tmp_path / "vm-ops",
                                             control_dir=tmp_path / "cm", popen=lambda *a, **k: None),
     )
@@ -295,7 +295,7 @@ def test_vm_domain_probe_reads_every_signal_and_passes_a_healthy_testbed(tmp_pat
     verdict = _vm_gate(observations, clock.value)
     assert verdict.verdict == "clean", [c for c in verdict.checks if c.status != "pass"]
     # The loadgen read and every VM read go over the shared socket as the executor account.
-    loadgen_calls = [argv for argv, stdin in remote.calls if b"systemctl show -p Environment" in (stdin or b"")]
+    loadgen_calls = [argv for argv, stdin in remote.calls if isinstance(stdin, bytes) and b"systemctl show -p Environment" in stdin]
     assert loadgen_calls and all("opsjob@192.168.127.10" in argv and "ControlMaster=no" in argv for argv in loadgen_calls)
 
 

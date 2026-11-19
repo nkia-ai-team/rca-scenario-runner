@@ -71,17 +71,26 @@ class FakeRemote:
     def __init__(self) -> None:
         self.outputs: dict[str, str | Exception] = {host.address: _read_output(host) for host in HOSTS}
         self.hypervisor: dict | Exception = _hypervisor()
-        self.helper_expected = {"t4-hv-exec": "a" * 64, "t4-hv-exec-root": "b" * 64}
         self.calls: list[tuple[list[str], bytes | None]] = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append((list(argv), kwargs.get("input")))
-        if "--expected-sha256" in argv:
-            return subprocess.CompletedProcess(argv, 0, json.dumps(self.helper_expected), "")
-        if argv[-1] == "facts":
+        if argv[-1].startswith("hvjob@"):
             if isinstance(self.hypervisor, Exception):
-                return subprocess.CompletedProcess(argv, 255, "", str(self.hypervisor))
-            return subprocess.CompletedProcess(argv, 0, json.dumps(self.hypervisor) + "\n", "")
+                return subprocess.CompletedProcess(argv, 3, "", str(self.hypervisor))
+            verb = kwargs["input"].strip()
+            hv = self.hypervisor
+            answer = {
+                "tunnel": {key: hv[key] for key in ("at", "wg_rx_bytes", "wg_tx_bytes") if key in hv}
+                | {"handshake_age_s": hv.get("handshake_age_sec"),
+                   "ping": {"sent": hv["ping"]["sent"], "lost": hv["ping"]["sent"] - hv["ping"]["received"],
+                            "max_ms": hv["ping"]["max_ms"]}},
+                "guards": {"armed": hv.get("guards_active", 0), "jobs": []},
+                "version": {"files": hv.get("helper_sha256", {})} if "helper_sha256" in hv else {},
+            }[verb]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(answer) + "\n", "")
+        if "-O" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
         target = next(item for item in argv if item.startswith("opsjob@"))
         output = self.outputs[target.split("@", 1)[1]]
         if isinstance(output, Exception):
@@ -97,8 +106,21 @@ def _hypervisor(at: datetime = NOW, *, rx: int = 0, tx: int = 0, sha: dict | Non
         "wg_rx_bytes": rx,
         "wg_tx_bytes": tx,
         "guards_active": guards,
-        "helper_sha256": sha or {"t4-hv-exec": "a" * 64, "t4-hv-exec-root": "b" * 64},
+        "helper_sha256": sha or dict(HELPER_SHA),
     }
+
+
+HELPER_SOURCES = {"t4-hv-exec": b"#!/bin/bash\n# helper\n", "t4-hv-exec-root": b"#!/bin/bash\n# root helper\n"}
+HELPER_SHA = {name: __import__("hashlib").sha256(body).hexdigest() for name, body in HELPER_SOURCES.items()}
+
+
+@pytest.fixture(autouse=True)
+def _helper_sources(tmp_path, monkeypatch):
+    source = tmp_path / "deploy" / "hypervisor"
+    source.mkdir(parents=True)
+    for name, body in HELPER_SOURCES.items():
+        (source / name).write_bytes(body)
+    monkeypatch.setattr(vm_ops, "HELPER_SOURCE_DIR", source)
 
 
 def _ops(tmp_path: Path, remote: FakeRemote, clock: Clock | None = None, **kwargs) -> VmOps:
@@ -108,7 +130,7 @@ def _ops(tmp_path: Path, remote: FakeRemote, clock: Clock | None = None, **kwarg
         clock=clock,
         state_dir=tmp_path / "vm-ops",
         archive_state_dir=tmp_path / "petition-archive",
-        hypervisor_target="opsview@192.168.122.1",
+        hypervisor_target="hvjob@192.168.122.1",
         supervisor=MasterSupervisor(process_runner=remote, clock=clock, state_dir=tmp_path / "vm-ops",
                                     control_dir=tmp_path / "cm", popen=lambda *a, **k: None),
         **kwargs,
@@ -121,12 +143,22 @@ def test_executor_form_is_the_shared_contract() -> None:
     argv = executor_argv(HOSTS_BY_NAME["db01"])
     assert argv[0] == "/usr/bin/ssh"
     assert argv[-5:] == ["opsjob@192.168.127.41", "sudo", "-n", "bash", "-s"]
-    assert ["-i", "/root/.ssh/vm-ops/t4-executor"] == argv[1:3]
-    assert "ControlMaster=no" in argv and "ControlPath=/run/opsjob-ssh/%r@%h:%p" in argv
-    assert "BatchMode=yes" in argv and "StrictHostKeyChecking=yes" in argv
+    # T4S contract 3: the same common options on both sides.
+    common = [
+        "-F", "none", "-i", "/root/.ssh/vm-ops/t4-executor", "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=/root/.ssh/vm-ops/known_hosts_civil-petition",
+        "-o", "ConnectTimeout=10", "-o", "ControlPath=/app/state/ssh-control/%r@%h:%p",
+    ]
+    assert argv[1:1 + len(common)] == common
+    assert argv[1 + len(common):-5] == ["-o", "ControlMaster=no"]
     master = master_argv(HOSTS_BY_NAME["db01"])
-    assert "-M" in master and "-N" in master and "ServerAliveInterval=30" in master
-    assert "ControlPath=/run/opsjob-ssh/%r@%h:%p" in master and master[-1] == "opsjob@192.168.127.41"
+    assert master[1:1 + len(common)] == common
+    assert master[1 + len(common):] == [
+        "-o", "ControlMaster=yes", "-o", "ControlPersist=yes", "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3", "-N", "-f", "opsjob@192.168.127.41",
+    ]
+    hypervisor = vm_ops.hypervisor_host("hvjob@192.168.122.1")
+    assert master_argv(hypervisor)[-1] == "hvjob@192.168.122.1" and "/root/.ssh/vm-ops/t4-hv" in master_argv(hypervisor)
     # Every VM is reached on its management address only (§3-5 rule 4), the router on its management NIC.
     assert {host.name: host.address for host in HOSTS} == {
         "rt-core01": "192.168.127.2", "web01": "192.168.127.21", "was01": "192.168.127.31",
@@ -228,8 +260,14 @@ def test_supervisor_opens_dead_masters_records_the_time_and_reopens_after_a_drop
         processes.append(process)
         return process
 
+    exits: list[str] = []
+
     def check(argv, **kwargs):
         address = argv[-1].split("@", 1)[1]
+        if argv[-2:-1] == ["exit"]:
+            exits.append(address)
+            alive.discard(address)
+            return subprocess.CompletedProcess(argv, 0, "", "")
         return subprocess.CompletedProcess(argv, 0 if address in alive else 255, "", "")
 
     supervisor = MasterSupervisor(popen=popen, process_runner=check, clock=clock, state_dir=tmp_path / "s",
@@ -250,17 +288,16 @@ def test_supervisor_opens_dead_masters_records_the_time_and_reopens_after_a_drop
     assert supervisor.snapshot()["db01"]["opened_at"] == "2026-11-20T06:40:00Z"
     assert supervisor.snapshot()["web01"]["opened_at"] == "2026-11-20T06:00:00Z"
 
-    supervisor.stop()  # ends the six live masters it started (the dropped one had already ended)
-    assert alive == set()
-    assert [process.terminated for process in processes].count(True) == 6
-    assert processes[4].address == "192.168.127.41" and processes[4].terminated is False
+    supervisor.stop()  # -O exit on every socket (with -f the master is not the runner's child), no pattern kill
+    assert alive == set() and sorted(exits) == sorted(host.address for host in HOSTS)
+    assert all(not item["alive"] for item in supervisor.snapshot().values())
     assert all(not item["alive"] for item in supervisor.snapshot().values())
 
 
 def test_supervisor_reports_why_a_master_did_not_open(tmp_path: Path) -> None:
     class Dead:
         def poll(self):
-            return 255
+            return 255  # -f exits 0 only after the master forked
 
         def terminate(self):
             pass
@@ -319,12 +356,15 @@ def test_hypervisor_history_is_capped_and_its_errors_are_recorded(tmp_path: Path
         clock.value += timedelta(minutes=5)
     history = ops.load()["hypervisor"]["history"]
     assert len(history) == vm_ops.HYPERVISOR_HISTORY and history[-1]["wg_rx_bytes"] == vm_ops.HYPERVISOR_HISTORY + 2
-    remote.hypervisor = RuntimeError("refused: unknown verb")
+    remote.hypervisor = RuntimeError("unknown request")
     document = ops.read_all()
-    assert "refused: unknown verb" in document["hypervisor"]["last_error"]["detail"]
+    assert "hypervisor: tunnel refused: unknown request" in document["hypervisor"]["last_error"]["detail"]
     remote.hypervisor = {k: v for k, v in _hypervisor().items() if k != "helper_sha256"}
-    with pytest.raises(VmOpsError, match="lacks helper_sha256"):
+    with pytest.raises(VmOpsError, match="lacks 'files'"):
         ops.hypervisor_facts()
+    # The helper takes its request on stdin's first line; the ssh command line names nothing.
+    argv, stdin = remote.calls[-1]
+    assert stdin == "version\n" and argv[-1] == "hvjob@192.168.122.1" and "ControlMaster=no" in argv
 
 
 def test_drift_detail_names_what_differs_and_leaves_stale_reads_to_preflight(tmp_path: Path) -> None:
@@ -341,14 +381,14 @@ def test_drift_detail_names_what_differs_and_leaves_stale_reads_to_preflight(tmp
     remote.outputs["192.168.127.2"] = _read_output(
         HOSTS_BY_NAME["rt-core01"], sums={"/var/lib/petition-deploy/expected.sha256": "missing"},
     )
-    remote.hypervisor = _hypervisor(sha={"t4-hv-exec": "c" * 64, "t4-hv-exec-root": "b" * 64})
+    remote.hypervisor = _hypervisor(sha={**HELPER_SHA, "t4-hv-exec": "c" * 64})
     ops.read_all()
     detail = ops.drift_detail()
     assert "was01 tomcat10.service inactive" in detail
     assert "was01 /var/lib/petition-deploy/war.sha256 rc=1" in detail
     assert "was01 changed since install: petition.war" in detail
     assert "rt-core01 /var/lib/petition-deploy/expected.sha256 missing" in detail
-    assert "hypervisor t4-hv-exec installed cccccccccccc != repository aaaaaaaaaaaa" in detail
+    assert f"hypervisor t4-hv-exec installed cccccccccccc != repository {HELPER_SHA['t4-hv-exec'][:12]}" in detail
     # A WAR record is required only on the WAS pair (web01 has none and passes).
     assert "web01" not in detail
 

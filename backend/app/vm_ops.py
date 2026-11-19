@@ -11,11 +11,12 @@ executors (testbed-services profiles) and this module's reads. The supervisor ch
 dead one; the time it opened is what preflight's 30-minute settle reads (§6-4 "관리망 도달"), so the new
 connection a reopen leaves in ``host_connections`` never sits at the front of a recording.
 
-Contract with the executors (agreed with testbed-services T4S, both result files carry the same table): the
-executors call ``ssh ... -o ControlMaster=no -o ControlPath=<CONTROL_PATH> opsjob@<management address> sudo -n
-bash -s``. With ``ControlMaster=no`` ssh multiplexes over the socket when the master is alive and otherwise
-connects on its own, so a cleanup always reaches the VM (that login is filtered by the VM's rsyslog first rule,
-and preflight sees the master down). Only this module opens masters.
+Contract with the executors (agreed with testbed-services T4S, both result files carry the same table): both
+sides use ``ssh_options`` (``-F none``, the executor key, IdentitiesOnly, the domain's known_hosts file, the shared
+ControlPath under ``CIVIL_PETITION_SSH_CONTROL_DIR``). The executors call with ``-o ControlMaster=no``: ssh
+multiplexes over the socket when the master is alive and otherwise connects on its own. A T4S executor's ``run``
+refuses when the master is down; its cleanup and recovery go anyway (that login is filtered by the VM's rsyslog
+first rule). Only this module opens masters (``ControlMaster=yes``, ``ControlPersist=yes``, ``-N -f``).
 
 Periodic read (§6-2, process sample row (3)). The SMS process sample (``process_snapshot``, every 60s) carries the
 executor account's ``sshd``, ``sudo`` and ``bash`` whenever an executor call is running at sample time. That
@@ -27,15 +28,17 @@ the db01 archive facts line). The read writes nothing on the VM and finishes wel
 archive-state readiness (app.live_queue ARCHIVE_STATE_*): the db01 line (pg-table-stats ``last.json``) is copied
 as it is into ``PETITION_ARCHIVE_STATE_DIR/last.json``, a file read with no database session.
 
-Hypervisor (66). The executor account there runs one forced command (the T4S helper); its read verb ``facts``
-returns one JSON line (tunnel handshake age, ping to the monitoring end, WireGuard byte counters, armed guards,
-installed helper checksums). The runner reads it with the periodic read and again right before an injection.
-66's own rsyslog filter keeps that account's lines away from 119 (§6-2, 66 row).
+Hypervisor (66). The account there (``hvjob``) runs one forced command, the T4S helper ``t4-hv-exec``, which takes
+its request on stdin's first line. The runner uses its three read verbs (``tunnel``, ``guards``, ``version``,
+each one JSON line) with the periodic read and again right before an injection, and keeps one master to 66 as
+well (fewer login lines; 66's rsyslog filter keeps that account's lines away from 119, §6-2 66 row). 66 is not an
+SMS target, so its master is not part of the six-connection preflight check.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -59,10 +62,10 @@ EXECUTOR_USER = "opsjob"
 KEY_DIR = Path(os.environ.get("VM_OPS_KEY_DIR", "/root/.ssh/vm-ops"))
 EXECUTOR_KEY = KEY_DIR / "t4-executor"
 HYPERVISOR_KEY = KEY_DIR / "t4-hv"
-KNOWN_HOSTS = Path("/root/.ssh/known_hosts")
+KNOWN_HOSTS = KEY_DIR / "known_hosts_civil-petition"
 # Shared with the executors (contract). ssh expands %r, %h and %p to user, host and port, so both sides name the
 # same socket from the same target. Inside the runner container only.
-CONTROL_DIR = Path(os.environ.get("VM_OPS_CONTROL_DIR", "/run/opsjob-ssh"))
+CONTROL_DIR = Path(os.environ.get("CIVIL_PETITION_SSH_CONTROL_DIR", "/app/state/ssh-control"))
 CONTROL_PATH = str(CONTROL_DIR / "%r@%h:%p")
 CONNECT_TIMEOUT_SEC = 10
 # One remote call stays well inside one SMS process-sample interval (60s, §6-2 (2)).
@@ -81,9 +84,14 @@ HYPERVISOR_HISTORY = 12
 ROUTER_CPU_HISTORY = 4
 STATE_DIR = Path(os.environ.get("VM_OPS_STATE_DIR", "/app/state/vm-ops"))
 
-# 66 as tb-ops reaches it, the executor account's forced command reads SSH_ORIGINAL_COMMAND. Agreed with T4S.
-HYPERVISOR_TARGET = os.environ.get("VM_OPS_HYPERVISOR_TARGET", "")
-HYPERVISOR_FACTS_VERB = "facts"
+# 66 as tb-ops reaches it (vmbr1), the helper account (T4S contract 6). Empty turns the 66 reads off.
+HYPERVISOR_TARGET = os.environ.get("VM_OPS_HYPERVISOR_TARGET", "hvjob@192.168.122.1")
+# The installed helper is the repository source byte for byte (T4S contract 7): its expected checksums are the
+# source files' own, read from the testbed-services deploy directory mounted into the runner.
+HELPER_SOURCE_DIR = Path(
+    os.environ.get("CIVIL_PETITION_DEPLOY_DIR", "/opt/lucida/civil-petition-deploy")
+) / "hypervisor"
+HELPER_FILES = ("t4-hv-exec", "t4-hv-exec-root")
 
 
 @dataclass(frozen=True)
@@ -96,6 +104,8 @@ class VmHost:
     units: tuple[str, ...]
     # (label, absolute path) read whole and carried back base64-encoded.
     files: tuple[tuple[str, str], ...] = ()
+    user: str = EXECUTOR_USER
+    key: Path = EXECUTOR_KEY
 
 
 # Inventory civil-petition/deploy/inventory/t.json (hosts, management NIC addresses) and the role units the T2
@@ -114,6 +124,16 @@ HOSTS: tuple[VmHost, ...] = (
     VmHost("loadgen", "192.168.127.10", "loadgen", ("loadgen.service",), (("loadgen_live", LOADGEN_LIVE_PATH),)),
 )
 HOSTS_BY_NAME = {host.name: host for host in HOSTS}
+
+
+def hypervisor_host(target: str = HYPERVISOR_TARGET) -> VmHost | None:
+    """66 as a master target (no periodic VM read runs there: its reads are the helper verbs)."""
+    if not target or "@" not in target:
+        return None
+    user, address = target.split("@", 1)
+    return VmHost("pve66", address, "hypervisor", (), (), user, HYPERVISOR_KEY)
+
+
 # The address each SMS agent reports as (LUCIDA_HOST, the business address; the 119 series label host_name) and the
 # router's polled address (its NMS target is found by this address in the target table, §4).
 SERVER_AGENT_HOSTS = {"web01": "192.168.124.11", "was01": "192.168.125.11", "was02": "192.168.125.12", "db01": "192.168.126.11"}
@@ -124,10 +144,6 @@ REQUIRED_RECORDS_BY_ROLE: dict[str, tuple[str, ...]] = {
     "was": ("/var/lib/petition-deploy/war.sha256",),
 }
 REQUIRED_RECORDS_ALL: tuple[str, ...] = ("/var/lib/petition-deploy/expected.sha256",)
-# Prints {"<helper file>": "<sha256>", ...} for the helper as the repository renders it (T4S contract item 5).
-HELPER_EXPECTED_ARGV: tuple[str, ...] = (
-    "python3", "/opt/lucida/scenario-contracts/profiles/hypervisor_helper.py", "--expected-sha256",
-)
 
 # What the periodic read compares on the VM (the install leaves both records; T4S contract item 6).
 # war.sha256 names the WAR relative to the Tomcat webapps directory, expected.sha256 names absolute paths.
@@ -135,7 +151,8 @@ CHECKSUM_RECORDS = (
     ("/var/lib/petition-deploy/war.sha256", "/var/lib/tomcat10/webapps"),
     ("/var/lib/petition-deploy/expected.sha256", "/"),
 )
-# The executor guard's state root (testbed-services executor_common GUARD_FUNCTIONS: <job>.undo while armed).
+# The executor guard's state root (testbed-services executor_common GUARD_FUNCTIONS: <job>.unit while armed;
+# T4S contract 8: no *.unit and no run-r* timer = no residue).
 GUARD_STATE_ROOT = "/var/lib/opsjobs"
 
 # The read body. The runner sends `set -- <units> -- <label=path>...` in front of it on stdin, so the node's auth
@@ -156,8 +173,8 @@ check_sums() {
 }
 '''.replace("\r", "") + "".join(
     f"check_sums {shlex.quote(record)} {shlex.quote(base)}\n" for record, base in CHECKSUM_RECORDS
-) + r'''undo=$(find ''' + GUARD_STATE_ROOT + r''' -maxdepth 1 -name '*.undo' 2>/dev/null | wc -l)
-timers=$(systemctl list-units --all --plain --no-legend 'run-r*.timer' 2>/dev/null | wc -l)
+) + r'''undo=$(find ''' + GUARD_STATE_ROOT + r''' -maxdepth 1 -name '*.unit' 2>/dev/null | wc -l)
+timers=$(systemctl list-timers --all --no-legend 'run-r*' 2>/dev/null | wc -l)
 echo "@@ guards $undo $timers"
 echo "@@ chrony $(chronyc -c tracking 2>/dev/null | head -1)"
 echo "@@ procstat $(head -1 /proc/stat)"
@@ -204,43 +221,47 @@ def _environment() -> dict[str, str]:
 
 
 def ssh_options(*, key: Path = EXECUTOR_KEY) -> list[str]:
+    """The common options both sides use (T4S contract 3)."""
     return [
+        "-F", "none",
         "-i", str(key),
+        "-o", "IdentitiesOnly=yes",
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=yes",
         "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
         "-o", f"ConnectTimeout={CONNECT_TIMEOUT_SEC}",
+        "-o", f"ControlPath={CONTROL_PATH}",
     ]
 
 
 def executor_argv(host: VmHost) -> list[str]:
     """The executor-call form over the shared socket (the same argv the testbed-services executors build)."""
     return [
-        "/usr/bin/ssh", *ssh_options(),
+        "/usr/bin/ssh", *ssh_options(key=host.key),
         "-o", "ControlMaster=no",
-        "-o", f"ControlPath={CONTROL_PATH}",
-        f"{EXECUTOR_USER}@{host.address}",
+        f"{host.user}@{host.address}",
         "sudo", "-n", "bash", "-s",
     ]
 
 
 def master_argv(host: VmHost) -> list[str]:
     return [
-        "/usr/bin/ssh", *ssh_options(),
-        "-M", "-N",
-        "-o", f"ControlPath={CONTROL_PATH}",
-        "-o", "ControlPersist=no",
+        "/usr/bin/ssh", *ssh_options(key=host.key),
+        "-o", "ControlMaster=yes",
+        "-o", "ControlPersist=yes",
         "-o", f"ServerAliveInterval={SERVER_ALIVE_INTERVAL_SEC}",
         "-o", f"ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}",
-        f"{EXECUTOR_USER}@{host.address}",
+        "-N", "-f",
+        f"{host.user}@{host.address}",
     ]
 
 
 def master_check_argv(host: VmHost) -> list[str]:
-    return [
-        "/usr/bin/ssh", "-o", f"ControlPath={CONTROL_PATH}", "-O", "check",
-        f"{EXECUTOR_USER}@{host.address}",
-    ]
+    return ["/usr/bin/ssh", *ssh_options(key=host.key), "-O", "check", f"{host.user}@{host.address}"]
+
+
+def master_exit_argv(host: VmHost) -> list[str]:
+    return ["/usr/bin/ssh", *ssh_options(key=host.key), "-O", "exit", f"{host.user}@{host.address}"]
 
 
 def read_stdin(host: VmHost) -> bytes:
@@ -422,7 +443,10 @@ class MasterSupervisor:
                 self.status[host.name] = {"alive": True, "opened_at": _format(self.clock()), "detail": ""}
                 logger.warning("management ssh to %s (%s) opened", host.name, host.address)
                 return
-            if process.poll() is not None:
+            # With -f the first process exits 0 once it has authenticated and forked the master; anything else
+            # that ends it is a failure to open.
+            code = process.poll()
+            if code is not None and code != 0:
                 break
             self._sleep(1.0)
             waited += 1.0
@@ -462,17 +486,21 @@ class MasterSupervisor:
             return {name: dict(value) for name, value in self.status.items()}
 
     def stop(self) -> None:
-        """End only the masters this process started (never a pattern kill)."""
+        """End the masters (``ssh -O exit`` on each socket: with -f the master is not our child) and any opening
+        process still running. Never a pattern kill."""
         with self._lock:
-            for name, process in list(self._processes.items()):
-                if process.poll() is None:
+            for host in self.hosts:
+                process = self._processes.pop(host.name, None)
+                if process is not None and process.poll() is None:
                     process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except Exception:
-                        process.kill()
-                self._processes.pop(name, None)
-                self.status[name] = {"alive": False, "opened_at": None, "detail": "stopped"}
+                try:
+                    self.process_runner(
+                        master_exit_argv(host), capture_output=True, text=True, timeout=REMOTE_TIMEOUT_SEC,
+                        env=_environment(), check=False,
+                    )
+                except Exception as error:
+                    logger.warning("could not end the master to %s: %s", host.name, error)
+                self.status[host.name] = {"alive": False, "opened_at": None, "detail": "stopped"}
 
 
 class VmOps:
@@ -495,8 +523,10 @@ class VmOps:
         self.state_dir = state_dir
         self.archive_state_dir = archive_state_dir
         self.hypervisor_target = hypervisor_target
+        hypervisor = hypervisor_host(hypervisor_target)
         self.supervisor = supervisor or MasterSupervisor(
-            hosts, process_runner=process_runner, clock=clock, state_dir=state_dir
+            (*hosts, *([hypervisor] if hypervisor else [])),
+            process_runner=process_runner, clock=clock, state_dir=state_dir,
         )
         self._lock = threading.Lock()
 
@@ -551,31 +581,55 @@ class VmOps:
             raise VmOpsError("loadgen: live summary is not an object")
         return state.strip() == "active", document, env
 
-    def hypervisor_facts(self) -> dict[str, Any]:
-        """One ``facts`` answer from the 66 helper (T4S contract), recorded in the 66 history."""
-        if not self.hypervisor_target:
-            raise VmOpsError("hypervisor target is not configured (VM_OPS_HYPERVISOR_TARGET)")
-        argv = ["/usr/bin/ssh", *ssh_options(key=HYPERVISOR_KEY), self.hypervisor_target, HYPERVISOR_FACTS_VERB]
+    def _helper(self, verb: str) -> dict[str, Any]:
+        """One read verb of the 66 helper (T4S contract 6, 7): the request on stdin's first line, one JSON line back,
+        exit 3 refused, 1 failed."""
+        argv = ["/usr/bin/ssh", *ssh_options(key=HYPERVISOR_KEY), "-o", "ControlMaster=no", self.hypervisor_target]
         try:
             result = self.process_runner(
-                argv, capture_output=True, text=True, timeout=REMOTE_TIMEOUT_SEC + 20, env=_environment(), check=False,
+                argv, input=f"{verb}\n", capture_output=True, text=True, timeout=REMOTE_TIMEOUT_SEC + 20,
+                env=_environment(), check=False,
             )
         except subprocess.TimeoutExpired:
-            raise VmOpsError("hypervisor: no answer to facts") from None
+            raise VmOpsError(f"hypervisor: no answer to {verb}") from None
         if result.returncode != 0:
-            raise VmOpsError(f"hypervisor: facts exited {result.returncode}: {_tail(result.stderr or result.stdout)}")
+            what = "refused" if result.returncode == 3 else f"exited {result.returncode}"
+            raise VmOpsError(f"hypervisor: {verb} {what}: {_tail(result.stderr or result.stdout)}")
         lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
         if len(lines) != 1:
-            raise VmOpsError(f"hypervisor: facts is not one line: {_tail(result.stdout)}")
+            raise VmOpsError(f"hypervisor: {verb} is not one line: {_tail(result.stdout)}")
         document = json.loads(lines[0])
         if not isinstance(document, dict):
-            raise VmOpsError("hypervisor: facts is not an object")
-        for key in ("at", "handshake_age_sec", "ping", "wg_rx_bytes", "wg_tx_bytes", "guards_active", "helper_sha256"):
-            if key not in document:
-                raise VmOpsError(f"hypervisor: facts lacks {key}")
-        _parse(document["at"])
-        self._record_hypervisor(document)
+            raise VmOpsError(f"hypervisor: {verb} is not an object")
         return document
+
+    def hypervisor_facts(self) -> dict[str, Any]:
+        """66's tunnel, guards and installed helper checksums read now, recorded in the 66 history.
+
+        Kept in one record: at, handshake_age_sec (None = never), ping {sent, received, max_ms}, wg_rx_bytes,
+        wg_tx_bytes, guards_active, helper_sha256 {file: hex}."""
+        if not self.hypervisor_target:
+            raise VmOpsError("hypervisor target is not configured (VM_OPS_HYPERVISOR_TARGET)")
+        tunnel = self._helper("tunnel")
+        guards = self._helper("guards")
+        version = self._helper("version")
+        try:
+            ping = tunnel["ping"]
+            sent, lost = int(ping["sent"]), int(ping["lost"])
+            record = {
+                "at": tunnel["at"],
+                "handshake_age_sec": tunnel["handshake_age_s"],
+                "ping": {"sent": sent, "received": sent - lost, "max_ms": ping.get("max_ms")},
+                "wg_rx_bytes": int(tunnel["wg_rx_bytes"]),
+                "wg_tx_bytes": int(tunnel["wg_tx_bytes"]),
+                "guards_active": int(guards["armed"]),
+                "helper_sha256": dict(version["files"]),
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise VmOpsError(f"hypervisor: answer lacks {error}") from None
+        _parse(record["at"])
+        self._record_hypervisor(record)
+        return record
 
     # ------------------------------------------------------------------ state
 
@@ -656,19 +710,15 @@ class VmOps:
         return document
 
     def expected_helper_sha256(self) -> dict[str, str]:
-        """The 66 helper checksums the repository's source gives (T4S contract item 5)."""
-        try:
-            result = self.process_runner(
-                list(HELPER_EXPECTED_ARGV), capture_output=True, text=True, timeout=60, env=_environment(), check=False,
-            )
-        except Exception as error:
-            raise VmOpsError(f"cannot compute the helper checksums: {type(error).__name__}: {error}") from None
-        if result.returncode != 0:
-            raise VmOpsError(f"helper checksum command exited {result.returncode}: {_tail(result.stderr or result.stdout)}")
-        document = json.loads(result.stdout)
-        if not isinstance(document, dict) or not document:
-            raise VmOpsError("helper checksum command printed no checksums")
-        return {str(name): str(value) for name, value in document.items()}
+        """The repository source's checksums of the 66 helper files (the installed files are the source as is)."""
+        expected: dict[str, str] = {}
+        for name in HELPER_FILES:
+            path = HELPER_SOURCE_DIR / name
+            try:
+                expected[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as error:
+                raise VmOpsError(f"helper source unreadable at {path}: {error}") from None
+        return expected
 
     def drift_detail(self) -> str | None:
         """What differs from the install on the VMs and 66, or None (live_queue VM_DOMAIN_STATE_CHECK_NAME).

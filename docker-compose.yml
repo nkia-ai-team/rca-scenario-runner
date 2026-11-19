@@ -59,11 +59,13 @@ services:
       # 은행 Oracle 점검(testbed-services scripts/oracle-maintenance.sh check, tb-ops root 크론)의
       # last.json 과 ALERT. readiness 가 읽어 ALERT 나 오래된 결과면 큐를 막는다.
       - ${ORACLE_CHECK_HOST_PATH:-/var/lib/lucida/oracle-capacity}:/var/lib/lucida/oracle-capacity:ro
-      # 전통 3계층(civil-petition) 관리망 접속 키 폴더(실행기 계정 t4-executor, 66 도우미 t4-hv). 파일 하나씩 붙이면
-      # 아직 없는 키 자리에 docker 가 빈 폴더를 만들어 버려 폴더째 붙인다(backend/app/vm_ops.py).
+      # 전통 3계층(civil-petition) 관리망 접속 폴더(실행기 계정 키 t4-executor, 66 도우미 키 t4-hv,
+      # known_hosts_civil-petition). 파일 하나씩 붙이면 아직 없는 파일 자리에 docker 가 빈 폴더를 만들어 버려
+      # 폴더째 붙인다. 실행기(testbed-services)와 러너가 같은 경로를 쓴다(backend/app/vm_ops.py, T4 계약).
       - ${VM_OPS_KEY_HOST_DIR:-/root/.ssh/vm-ops}:/root/.ssh/vm-ops:ro
-      # 같은 도메인의 인벤토리와 대상 번호 표(t.targets.json, 라우터 NMS 대상 번호를 preflight 가 읽음).
-      - ${CIVIL_PETITION_INVENTORY_HOST_PATH:-../testbed-services/civil-petition/deploy/inventory}:/opt/lucida/civil-petition-inventory:ro
+      # 같은 도메인의 배포 폴더: inventory/t.targets.json(라우터 NMS 대상 번호, preflight)과 hypervisor/(66 도우미
+      # 소스, 설치본 체크섬의 기대값).
+      - ${CIVIL_PETITION_DEPLOY_HOST_PATH:-../testbed-services/civil-petition/deploy}:/opt/lucida/civil-petition-deploy:ro
 
       # 호스트 docker daemon socket. scenario-02 가 pg-mock 컨테이너를
       # start/stop 하는 데 사용. 보안: 컨테이너가 호스트의 모든 docker
@@ -94,11 +96,14 @@ services:
       # 읽기(backend/app/vm_ops.py)가 db01 의 last.json 을 그 폴더에 그대로 옮긴다.
       - PETITION_ARCHIVE_STATE_DIR=${PETITION_ARCHIVE_STATE_DIR:-}
       # 전통 3계층 관리망 운영(VM 6대 늘 열린 ssh 연결, 5분 평시 점검 읽기, 도메인 preflight, 버전 표류 게이트).
-      # 비우면 꺼짐(이 도메인 시나리오는 preflight 가 실패해 주입되지 않는다). 66 도우미 접속 대상은 user@주소.
+      # 비우면 꺼짐(이 도메인 시나리오는 preflight 가 실패해 주입되지 않는다). 66 도우미 접속 대상은 계정@주소.
       - CIVIL_PETITION_OPS=${CIVIL_PETITION_OPS:-}
-      - VM_OPS_HYPERVISOR_TARGET=${VM_OPS_HYPERVISOR_TARGET:-}
+      - VM_OPS_HYPERVISOR_TARGET=${VM_OPS_HYPERVISOR_TARGET:-hvjob@192.168.122.1}
       - VM_OPS_STATE_DIR=/app/state/vm-ops
-      - CIVIL_PETITION_TARGETS_PATH=/opt/lucida/civil-petition-inventory/t.targets.json
+      # 늘 열린 연결의 소켓 폴더. 실행기도 같은 변수를 읽는다(T4 계약 3).
+      - CIVIL_PETITION_SSH_CONTROL_DIR=/app/state/ssh-control
+      - CIVIL_PETITION_DEPLOY_DIR=/opt/lucida/civil-petition-deploy
+      - CIVIL_PETITION_TARGETS_PATH=/opt/lucida/civil-petition-deploy/inventory/t.targets.json
       # 주입 시작 직전 테스트베드 앱 파드(rca-testbed-*, 컨트롤러 소유) 전부 Ready 검사(v4 ORAFIX). 0 이면 꺼짐.
       - DOMAIN_PODS_CHECK=${DOMAIN_PODS_CHECK:-1}
       # 모델 스냅샷 평면. 비우면 auto(워크로드 실재 여부로 판별).
