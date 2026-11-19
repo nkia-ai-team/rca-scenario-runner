@@ -228,9 +228,32 @@ def test_window_end_must_be_timezone_aware(tmp_path: Path) -> None:
         collector.set_window_end(datetime(2026, 7, 16, 9, 0))
 
 
+# The collector as it was before the window end (origin/main 5471b79), frozen as
+# a fixture so the byte comparison below runs against the real old code. The git
+# blob id pins the copy to that commit's backend/app/topology_collector.py.
+_OLD_COLLECTOR = Path(__file__).parent / "fixtures" / "topology_collector_5471b79.py"
+_OLD_COLLECTOR_BLOB = "f3a0688ed73450c8b960c2c10c7f9b35cf294e17"
+
+
+def _old_collector_class():
+    import importlib.util
+
+    data = _OLD_COLLECTOR.read_bytes()
+    blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    assert blob == _OLD_COLLECTOR_BLOB, "old collector fixture is not the 5471b79 file"
+    spec = importlib.util.spec_from_file_location("old_topology_collector_5471b79", _OLD_COLLECTOR)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert not hasattr(module.TopologyCollector, "set_window_end")
+    return module.TopologyCollector
+
+
 def test_window_end_keeps_in_window_bundle_byte_identical(tmp_path: Path) -> None:
-    """The same responses at the same tick times give the same files and
-    manifest entries up to the window end; only the tail after it is gone."""
+    """Against the pre-change collector (origin/main 5471b79): the same responses
+    at the same tick times give the same files and manifest entries up to the
+    window end; only the tail after it is gone."""
+    old_class = _old_collector_class()
+
     def run(bundle: Path, window_end) -> None:
         clock = FakeClock()
         tick = {"n": 0}
@@ -239,7 +262,8 @@ def test_window_end_keeps_in_window_bundle_byte_identical(tmp_path: Path) -> Non
             kind = "graph" if "topology/graph" in url else "tree"
             return 200, json.dumps({"kind": kind, "tick": tick["n"]}).encode()
 
-        collector = TopologyCollector(bundle_dir=bundle, fetch=fetch, clock=clock)
+        cls = old_class if window_end is None else TopologyCollector
+        collector = cls(bundle_dir=bundle, fetch=fetch, clock=clock)
         if window_end is not None:
             collector.set_window_end(window_end)
         for _ in range(8):

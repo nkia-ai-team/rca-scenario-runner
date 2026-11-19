@@ -955,6 +955,62 @@ async def test_cycle_injection_writes_topology_bundle_marker(tmp_path: Path) -> 
     assert created[0].stopped is True
 
 
+@pytest.mark.parametrize("hook", ["raises", "missing"])
+@pytest.mark.asyncio
+async def test_topology_window_end_binding_is_fail_open(tmp_path: Path, hook: str) -> None:
+    """v4 TOPO: a collector whose window-end hook fails, or that has none, must not
+    stop the cycle: cooldown is entered, phases.json is written, the collector
+    keeps running until the capture completes as before."""
+
+    class Raising(FakeTopologyCollector):
+        def set_window_end(self, window_end) -> None:
+            raise RuntimeError("hook broke")
+
+    class Missing:  # a collector from before the hook existed
+        def __init__(self, bundle_dir: Path) -> None:
+            self.bundle_dir = Path(bundle_dir)
+            self.started = self.stopped = False
+            self.run_id = self.window_end = None
+
+        def start(self) -> None:
+            self.started = True
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def set_run_id(self, run_id: str) -> None:
+            self.run_id = run_id
+
+    created: list = []
+
+    def factory(bundle_dir):
+        collector = (Raising if hook == "raises" else Missing)(bundle_dir)
+        created.append(collector)
+        return collector
+
+    queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
+    queue.topology_collector_factory = factory
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+    _complete_injection(runner, scheduler, clock, run_id,
+                        t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    state = await queue.tick()  # -> cooldown despite the hook
+    assert state.phase == "cycle_cooldown"
+    phases = json.loads((runner.artifact_store.root / run_id / "phases.json").read_text())
+    assert phases["capture_end"] == "2026-07-16T10:45:00Z"
+    assert created[0].window_end is None and created[0].stopped is False
+    assert queue._topology_collector is created[0]
+    clock.value = state_expected(state)
+    state = await queue.tick()  # -> waiting_capture
+    assert state.phase == "waiting_capture"
+    scheduler.jobs[run_id].status = "completed"
+    (runner.artifact_store.root / run_id / "capture-complete.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    await queue.tick()  # capture done
+    assert created[0].stopped is True
+
+
 @pytest.mark.asyncio
 async def test_v2_path_never_writes_topology_bundle_marker(tmp_path: Path) -> None:
     from tests.test_live_queue import make_queue
