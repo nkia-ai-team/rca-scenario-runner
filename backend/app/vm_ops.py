@@ -1,0 +1,799 @@
+"""Management-network operations for the VM testbed (civil-petition).
+
+testbed-services docs/spec-testbed-vm-3tier.md §6-2 (executor plumbing traces), §6-4 (preflight), §6-6 (the
+runner's ssh common part). Nothing here changes a VM: every remote call is a read.
+
+Always-open connection (§6-2, ssh row). Every login opens an sshd login line, a logind session, a session scope
+and a ``user@<uid>`` unit on the VM, and a new row in the SMS connection sample (``host_connections``). So the
+runner keeps one OpenSSH ControlMaster connection per VM, opened once and multiplexed by every later call: the
+executors (testbed-services profiles) and this module's reads. The supervisor checks each master every
+``MASTER_CHECK_INTERVAL_SEC`` with ``ssh -O check`` (a local socket call, nothing reaches the VM) and reopens a
+dead one; the time it opened is what preflight's 30-minute settle reads (§6-4 "관리망 도달"), so the new
+connection a reopen leaves in ``host_connections`` never sits at the front of a recording.
+
+Contract with the executors (agreed with testbed-services T4S, both result files carry the same table): the
+executors call ``ssh ... -o ControlMaster=no -o ControlPath=<CONTROL_PATH> opsjob@<management address> sudo -n
+bash -s``. With ``ControlMaster=no`` ssh multiplexes over the socket when the master is alive and otherwise
+connects on its own, so a cleanup always reaches the VM (that login is filtered by the VM's rsyslog first rule,
+and preflight sees the master down). Only this module opens masters.
+
+Periodic read (§6-2, process sample row (3)). The SMS process sample (``process_snapshot``, every 60s) carries the
+executor account's ``sshd``, ``sudo`` and ``bash`` whenever an executor call is running at sample time. That
+cannot be filtered, so the same rows must appear at the same rate when nothing is injected: every
+``PERIODIC_READ_INTERVAL_SEC`` the runner reads each VM through the same account and the same ``sudo -n bash -s``
+form (service state, checksums, guard residue, clock offset, the router's CPU counters, the loadgen summary and
+the db01 archive facts line). The read writes nothing on the VM and finishes well inside ``REMOTE_TIMEOUT_SEC``
+(one SMS process sample is 60s). Its result is the input of the domain preflight (app.preflight_probe) and of the
+archive-state readiness (app.live_queue ARCHIVE_STATE_*): the db01 line (pg-table-stats ``last.json``) is copied
+as it is into ``PETITION_ARCHIVE_STATE_DIR/last.json``, a file read with no database session.
+
+Hypervisor (66). The executor account there runs one forced command (the T4S helper); its read verb ``facts``
+returns one JSON line (tunnel handshake age, ping to the monitoring end, WireGuard byte counters, armed guards,
+installed helper checksums). The runner reads it with the periodic read and again right before an injection.
+66's own rsyslog filter keeps that account's lines away from 119 (§6-2, 66 row).
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import tempfile
+import threading
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger("scenario_runner.vm_ops")
+
+DOMAIN = "civil-petition"
+EXECUTOR_USER = "opsjob"
+# Keys come in through one read-only directory mount (a single-file bind mount of a key that does not exist yet
+# makes docker create a directory at the host path).
+KEY_DIR = Path(os.environ.get("VM_OPS_KEY_DIR", "/root/.ssh/vm-ops"))
+EXECUTOR_KEY = KEY_DIR / "t4-executor"
+HYPERVISOR_KEY = KEY_DIR / "t4-hv"
+KNOWN_HOSTS = Path("/root/.ssh/known_hosts")
+# Shared with the executors (contract). ssh expands %r, %h and %p to user, host and port, so both sides name the
+# same socket from the same target. Inside the runner container only.
+CONTROL_DIR = Path(os.environ.get("VM_OPS_CONTROL_DIR", "/run/opsjob-ssh"))
+CONTROL_PATH = str(CONTROL_DIR / "%r@%h:%p")
+CONNECT_TIMEOUT_SEC = 10
+# One remote call stays well inside one SMS process-sample interval (60s, §6-2 (2)).
+REMOTE_TIMEOUT_SEC = 10
+# §6-2 ssh row: ServerAliveInterval 30s keeps the master's NAT entry on 66 and notices a dead peer.
+SERVER_ALIVE_INTERVAL_SEC = 30
+SERVER_ALIVE_COUNT_MAX = 3
+MASTER_CHECK_INTERVAL_SEC = 30
+MASTER_OPEN_WAIT_SEC = 15
+PERIODIC_READ_INTERVAL_SEC = 300
+# A read result older than two periods plus a minute means the periodic read stopped (or a VM did not answer
+# twice): preflight does not judge on it.
+FACTS_MAX_AGE_SEC = 2 * PERIODIC_READ_INTERVAL_SEC + 60
+# How many 66 counter samples to keep (the tunnel load is a 10-minute average over them).
+HYPERVISOR_HISTORY = 12
+ROUTER_CPU_HISTORY = 4
+STATE_DIR = Path(os.environ.get("VM_OPS_STATE_DIR", "/app/state/vm-ops"))
+
+# 66 as tb-ops reaches it, the executor account's forced command reads SSH_ORIGINAL_COMMAND. Agreed with T4S.
+HYPERVISOR_TARGET = os.environ.get("VM_OPS_HYPERVISOR_TARGET", "")
+HYPERVISOR_FACTS_VERB = "facts"
+
+
+@dataclass(frozen=True)
+class VmHost:
+    """One VM of the domain as the runner reaches it (management address only, §3-5 rule 4)."""
+
+    name: str
+    address: str
+    role: str
+    units: tuple[str, ...]
+    # (label, absolute path) read whole and carried back base64-encoded.
+    files: tuple[tuple[str, str], ...] = ()
+
+
+# Inventory civil-petition/deploy/inventory/t.json (hosts, management NIC addresses) and the role units the T2
+# install starts. Fixed here like every other runner allowlist: a scenario cannot name another host.
+LOADGEN_LIVE_PATH = f"/tmp/k6-{DOMAIN}-live.json"
+ARCHIVE_FACTS_PATH = "/var/lib/pg-table-stats/last.json"
+HOSTS: tuple[VmHost, ...] = (
+    VmHost("rt-core01", "192.168.127.2", "router", ("snmpd.service", "nftables.service")),
+    VmHost("web01", "192.168.127.21", "web", ("apache2.service", "lucida-agent.service")),
+    VmHost("was01", "192.168.127.31", "was", ("tomcat10.service", "lucida-agent.service")),
+    VmHost("was02", "192.168.127.32", "was", ("tomcat10.service", "lucida-agent.service")),
+    VmHost(
+        "db01", "192.168.127.41", "db", ("postgresql@16-main.service", "lucida-agent.service"),
+        (("archive_state", ARCHIVE_FACTS_PATH),),
+    ),
+    VmHost("loadgen", "192.168.127.10", "loadgen", ("loadgen.service",), (("loadgen_live", LOADGEN_LIVE_PATH),)),
+)
+HOSTS_BY_NAME = {host.name: host for host in HOSTS}
+# The address each SMS agent reports as (LUCIDA_HOST, the business address; the 119 series label host_name) and the
+# router's polled address (its NMS target is found by this address in the target table, §4).
+SERVER_AGENT_HOSTS = {"web01": "192.168.124.11", "was01": "192.168.125.11", "was02": "192.168.125.12", "db01": "192.168.126.11"}
+ROUTER_NAME = "rt-core01"
+ROUTER_POLL_ADDRESS = "192.168.123.254"
+# Checksum records a role must have and pass (the WAR on the WAS pair; the install's file list on every VM).
+REQUIRED_RECORDS_BY_ROLE: dict[str, tuple[str, ...]] = {
+    "was": ("/var/lib/petition-deploy/war.sha256",),
+}
+REQUIRED_RECORDS_ALL: tuple[str, ...] = ("/var/lib/petition-deploy/expected.sha256",)
+# Prints {"<helper file>": "<sha256>", ...} for the helper as the repository renders it (T4S contract item 5).
+HELPER_EXPECTED_ARGV: tuple[str, ...] = (
+    "python3", "/opt/lucida/scenario-contracts/profiles/hypervisor_helper.py", "--expected-sha256",
+)
+
+# What the periodic read compares on the VM (the install leaves both records; T4S contract item 6).
+# war.sha256 names the WAR relative to the Tomcat webapps directory, expected.sha256 names absolute paths.
+CHECKSUM_RECORDS = (
+    ("/var/lib/petition-deploy/war.sha256", "/var/lib/tomcat10/webapps"),
+    ("/var/lib/petition-deploy/expected.sha256", "/"),
+)
+# The executor guard's state root (testbed-services executor_common GUARD_FUNCTIONS: <job>.undo while armed).
+GUARD_STATE_ROOT = "/var/lib/opsjobs"
+
+# The read body. The runner sends `set -- <units> -- <label=path>...` in front of it on stdin, so the node's auth
+# log only ever records `bash -s` (and the VM's rsyslog first rule keeps that line local anyway). Pure bash and
+# coreutils: no interpreter process of its own shows up in a process sample. It writes nothing.
+READ_BODY = r'''units=() files=()
+while (($#)); do if [[ "$1" == -- ]]; then shift; break; fi; units+=("$1"); shift; done
+files=("$@")
+echo "@@ at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "@@ host $(hostname)"
+for u in "${units[@]}"; do echo "@@ unit $u $(systemctl is-active "$u" 2>/dev/null || true)"; done
+check_sums() {
+  local record=$1 base=$2 out rc
+  if [[ ! -r "$record" ]]; then echo "@@ sums $record missing"; return; fi
+  out=$(cd "$base" && sha256sum -c --quiet "$record" 2>/dev/null) && rc=0 || rc=$?
+  echo "@@ sums $record rc=$rc"
+  while IFS= read -r line; do [[ -n "$line" ]] && echo "@@ drift ${line%%: *}"; done <<<"$out"
+}
+'''.replace("\r", "") + "".join(
+    f"check_sums {shlex.quote(record)} {shlex.quote(base)}\n" for record, base in CHECKSUM_RECORDS
+) + r'''undo=$(find ''' + GUARD_STATE_ROOT + r''' -maxdepth 1 -name '*.undo' 2>/dev/null | wc -l)
+timers=$(systemctl list-units --all --plain --no-legend 'run-r*.timer' 2>/dev/null | wc -l)
+echo "@@ guards $undo $timers"
+echo "@@ chrony $(chronyc -c tracking 2>/dev/null | head -1)"
+echo "@@ procstat $(head -1 /proc/stat)"
+for spec in "${files[@]}"; do
+  label=${spec%%=*} path=${spec#*=}
+  if [[ -r "$path" ]]; then echo "@@ file $label $(base64 -w0 <"$path")"; else echo "@@ file $label -"; fi
+done
+echo "@@ end"
+'''
+
+
+class VmOpsError(RuntimeError):
+    """A management-network read failed; the message carries the remote's own words (U3)."""
+
+
+ProcessRunner = Callable[..., subprocess.CompletedProcess]
+Clock = Callable[[], datetime]
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _format(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse(value: Any) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise VmOpsError(f"bad timestamp {value!r}")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise VmOpsError(f"timestamp without zone {value!r}")
+    return parsed.astimezone(timezone.utc)
+
+
+def _tail(text: str, limit: int = 300) -> str:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return " | ".join(lines[-3:])[:limit] if lines else "no output"
+
+
+def _environment() -> dict[str, str]:
+    return {"PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"), "HOME": "/root", "LC_ALL": "C"}
+
+
+def ssh_options(*, key: Path = EXECUTOR_KEY) -> list[str]:
+    return [
+        "-i", str(key),
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+        "-o", f"ConnectTimeout={CONNECT_TIMEOUT_SEC}",
+    ]
+
+
+def executor_argv(host: VmHost) -> list[str]:
+    """The executor-call form over the shared socket (the same argv the testbed-services executors build)."""
+    return [
+        "/usr/bin/ssh", *ssh_options(),
+        "-o", "ControlMaster=no",
+        "-o", f"ControlPath={CONTROL_PATH}",
+        f"{EXECUTOR_USER}@{host.address}",
+        "sudo", "-n", "bash", "-s",
+    ]
+
+
+def master_argv(host: VmHost) -> list[str]:
+    return [
+        "/usr/bin/ssh", *ssh_options(),
+        "-M", "-N",
+        "-o", f"ControlPath={CONTROL_PATH}",
+        "-o", "ControlPersist=no",
+        "-o", f"ServerAliveInterval={SERVER_ALIVE_INTERVAL_SEC}",
+        "-o", f"ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}",
+        f"{EXECUTOR_USER}@{host.address}",
+    ]
+
+
+def master_check_argv(host: VmHost) -> list[str]:
+    return [
+        "/usr/bin/ssh", "-o", f"ControlPath={CONTROL_PATH}", "-O", "check",
+        f"{EXECUTOR_USER}@{host.address}",
+    ]
+
+
+def read_stdin(host: VmHost) -> bytes:
+    arguments = [*host.units, "--", *(f"{label}={path}" for label, path in host.files)]
+    return ("set -- " + " ".join(shlex.quote(item) for item in arguments) + "\n" + READ_BODY).encode()
+
+
+@dataclass
+class HostFacts:
+    host: str
+    at: str
+    hostname: str
+    units: dict[str, str] = field(default_factory=dict)
+    sums: dict[str, str] = field(default_factory=dict)
+    drift: list[str] = field(default_factory=list)
+    guards_armed: int = 0
+    guard_timers: int = 0
+    chrony: str = ""
+    procstat: list[int] = field(default_factory=list)
+    files: dict[str, str | None] = field(default_factory=dict)
+
+
+_LINE = re.compile(r"^@@ (\S+)(?: (.*))?$")
+
+
+def parse_read(host: VmHost, text: str) -> HostFacts:
+    """Parse one periodic read. A read that did not reach its end marker is a failed read, not partial facts."""
+    values: dict[str, Any] = {"units": {}, "sums": {}, "drift": [], "files": {}}
+    ended = False
+    at = hostname = ""
+    for raw in text.splitlines():
+        match = _LINE.match(raw.rstrip())
+        if not match:
+            continue
+        key, rest = match.group(1), match.group(2) or ""
+        if key == "at":
+            at = rest.strip()
+        elif key == "host":
+            hostname = rest.strip()
+        elif key == "unit":
+            unit, _, state = rest.partition(" ")
+            values["units"][unit] = state.strip() or "unknown"
+        elif key == "sums":
+            record, _, verdict = rest.partition(" ")
+            values["sums"][record] = verdict.strip()
+        elif key == "drift":
+            values["drift"].append(rest.strip())
+        elif key == "guards":
+            parts = rest.split()
+            values["guards"] = (int(parts[0]), int(parts[1]))
+        elif key == "chrony":
+            values["chrony"] = rest.strip()
+        elif key == "procstat":
+            parts = rest.split()
+            if not parts or parts[0] != "cpu":
+                raise VmOpsError(f"{host.name}: unexpected /proc/stat line {rest[:80]!r}")
+            values["procstat"] = [int(item) for item in parts[1:]]
+        elif key == "file":
+            label, _, payload = rest.partition(" ")
+            payload = payload.strip()
+            values["files"][label] = None if payload in ("", "-") else base64.b64decode(payload).decode("utf-8")
+        elif key == "end":
+            ended = True
+    if not ended:
+        raise VmOpsError(f"{host.name}: the read did not finish: {_tail(text)}")
+    if hostname != host.name:
+        raise VmOpsError(f"{host.name}: answered as {hostname!r} (wrong VM behind {host.address})")
+    _parse(at)
+    guards = values.get("guards", (0, 0))
+    return HostFacts(
+        host=host.name,
+        at=at,
+        hostname=hostname,
+        units=values["units"],
+        sums=values["sums"],
+        drift=values["drift"],
+        guards_armed=guards[0],
+        guard_timers=guards[1],
+        chrony=values.get("chrony", ""),
+        procstat=values.get("procstat", []),
+        files=values["files"],
+    )
+
+
+def chrony_offset_ms(line: str) -> float:
+    """|System time| from ``chronyc -c tracking`` (field 5, seconds) in ms; raises when not synchronised."""
+    fields = line.split(",")
+    if len(fields) < 14:
+        raise VmOpsError(f"chronyc tracking unreadable: {line[:120]!r}")
+    if fields[13].strip() not in {"Normal"}:
+        raise VmOpsError(f"chrony not synchronised (leap status {fields[13].strip()!r})")
+    return abs(float(fields[4])) * 1000.0
+
+
+def cpu_busy_percent(older: Sequence[int], newer: Sequence[int]) -> float:
+    """Average CPU busy share between two ``/proc/stat`` ``cpu`` lines (idle and iowait count as not busy)."""
+    if len(older) < 8 or len(newer) < 8:
+        raise VmOpsError("short /proc/stat sample")
+    # user nice system idle iowait irq softirq steal; guest and guest_nice are already inside user and nice.
+    older, newer = older[:8], newer[:8]
+    total = sum(newer) - sum(older)
+    idle = (newer[3] + newer[4]) - (older[3] + older[4])
+    if total <= 0 or idle < 0:
+        raise VmOpsError("CPU counters went backwards (the router restarted between reads)")
+    return 100.0 * (total - idle) / total
+
+
+def _atomic_write(path: Path, text: str, *, mode: int = 0o640) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(raw)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class MasterSupervisor:
+    """One ControlMaster per VM, reopened when it dies; remembers when each was opened."""
+
+    def __init__(
+        self,
+        hosts: Sequence[VmHost] = HOSTS,
+        *,
+        popen: Callable[..., Any] = subprocess.Popen,
+        process_runner: ProcessRunner = subprocess.run,
+        clock: Clock = _utc_now,
+        state_dir: Path = STATE_DIR,
+        control_dir: Path = CONTROL_DIR,
+        open_wait_sec: float = MASTER_OPEN_WAIT_SEC,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        self.hosts = tuple(hosts)
+        self.popen = popen
+        self.process_runner = process_runner
+        self.clock = clock
+        self.state_dir = state_dir
+        self.control_dir = control_dir
+        self.open_wait_sec = open_wait_sec
+        self._sleep = sleep or (lambda seconds: threading.Event().wait(seconds))
+        self._processes: dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self.status: dict[str, dict[str, Any]] = {
+            host.name: {"alive": False, "opened_at": None, "detail": "not opened yet"} for host in self.hosts
+        }
+
+    def _alive(self, host: VmHost) -> bool:
+        try:
+            result = self.process_runner(
+                master_check_argv(host), capture_output=True, text=True, timeout=REMOTE_TIMEOUT_SEC,
+                env=_environment(), check=False,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0
+
+    def _open(self, host: VmHost) -> None:
+        previous = self._processes.pop(host.name, None)
+        if previous is not None and previous.poll() is None:
+            previous.terminate()
+        self.control_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.control_dir, 0o700)
+        log_path = self.state_dir / f"{host.name}.master.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as log:
+            process = self.popen(
+                master_argv(host), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
+                env=_environment(), close_fds=True, start_new_session=True,
+            )
+        self._processes[host.name] = process
+        waited = 0.0
+        while waited < self.open_wait_sec:
+            if self._alive(host):
+                self.status[host.name] = {"alive": True, "opened_at": _format(self.clock()), "detail": ""}
+                logger.warning("management ssh to %s (%s) opened", host.name, host.address)
+                return
+            if process.poll() is not None:
+                break
+            self._sleep(1.0)
+            waited += 1.0
+        detail = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
+        if process.poll() is None:
+            process.terminate()
+        self._processes.pop(host.name, None)
+        self.status[host.name] = {
+            "alive": False,
+            "opened_at": None,
+            "detail": f"could not open: {_tail(detail) if detail.strip() else 'no answer within the wait'}",
+        }
+        logger.warning("management ssh to %s (%s) failed: %s", host.name, host.address, self.status[host.name]["detail"])
+
+    def ensure(self) -> dict[str, dict[str, Any]]:
+        """Check every master and reopen the dead ones. Returns the status (also written to masters.json)."""
+        with self._lock:
+            for host in self.hosts:
+                if self._alive(host):
+                    current = self.status.get(host.name) or {}
+                    if current.get("opened_at") is None:
+                        # A live socket this process did not open (left by an earlier runner process in the same
+                        # container): its open time is unknown, so the 30-minute settle starts now.
+                        current = {"alive": True, "opened_at": _format(self.clock()), "detail": "found open"}
+                    self.status[host.name] = {**current, "alive": True, "detail": current.get("detail", "")}
+                    continue
+                self._open(host)
+            snapshot = {name: dict(value) for name, value in self.status.items()}
+        try:
+            _atomic_write(self.state_dir / "masters.json", json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+        except OSError as error:
+            logger.warning("cannot record master status: %s", error)
+        return snapshot
+
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {name: dict(value) for name, value in self.status.items()}
+
+    def stop(self) -> None:
+        """End only the masters this process started (never a pattern kill)."""
+        with self._lock:
+            for name, process in list(self._processes.items()):
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except Exception:
+                        process.kill()
+                self._processes.pop(name, None)
+                self.status[name] = {"alive": False, "opened_at": None, "detail": "stopped"}
+
+
+class VmOps:
+    """Reads over the management network and the facts they leave (state_dir/facts.json)."""
+
+    def __init__(
+        self,
+        hosts: Sequence[VmHost] = HOSTS,
+        *,
+        process_runner: ProcessRunner = subprocess.run,
+        clock: Clock = _utc_now,
+        state_dir: Path = STATE_DIR,
+        archive_state_dir: Path | None = None,
+        hypervisor_target: str = HYPERVISOR_TARGET,
+        supervisor: MasterSupervisor | None = None,
+    ) -> None:
+        self.hosts = tuple(hosts)
+        self.process_runner = process_runner
+        self.clock = clock
+        self.state_dir = state_dir
+        self.archive_state_dir = archive_state_dir
+        self.hypervisor_target = hypervisor_target
+        self.supervisor = supervisor or MasterSupervisor(
+            hosts, process_runner=process_runner, clock=clock, state_dir=state_dir
+        )
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------ remote calls
+
+    def _remote_read(self, host: VmHost, stdin: bytes) -> str:
+        try:
+            result = self.process_runner(
+                executor_argv(host), input=stdin, capture_output=True, timeout=REMOTE_TIMEOUT_SEC,
+                env=_environment(), check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise VmOpsError(f"{host.name}: no answer within {REMOTE_TIMEOUT_SEC}s") from None
+        stdout = result.stdout.decode("utf-8", "replace") if isinstance(result.stdout, bytes) else (result.stdout or "")
+        stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else (result.stderr or "")
+        if result.returncode != 0:
+            raise VmOpsError(f"{host.name}: read exited {result.returncode}: {_tail(stderr or stdout)}")
+        return stdout
+
+    def read_host(self, host: VmHost) -> HostFacts:
+        return parse_read(host, self._remote_read(host, read_stdin(host)))
+
+    def read_loadgen_live(self) -> tuple[bool, dict[str, Any], str]:
+        """(loadgen unit active, live summary document, raw unit environment line) read now.
+
+        The loadgen sends nothing to 119 and is not an SMS target (§2-4), so a fresh read per preflight leaves no
+        trace in a recording; it still goes over the same socket and the same form."""
+        host = HOSTS_BY_NAME["loadgen"]
+        body = (
+            "echo \"@@ host $(hostname)\"\n"
+            "echo \"@@ unit loadgen.service $(systemctl is-active loadgen.service 2>/dev/null || true)\"\n"
+            "echo \"@@ env $(systemctl show -p Environment --value loadgen.service 2>/dev/null)\"\n"
+            f"if [[ -r {LOADGEN_LIVE_PATH} ]]; then echo \"@@ file loadgen_live $(base64 -w0 <{LOADGEN_LIVE_PATH})\"; "
+            "else echo '@@ file loadgen_live -'; fi\n"
+            "echo '@@ end'\n"
+        ).encode()
+        text = self._remote_read(host, body)
+        if "@@ end" not in text:
+            raise VmOpsError(f"loadgen: the read did not finish: {_tail(text)}")
+        state = env = payload = ""
+        for line in text.splitlines():
+            if line.startswith("@@ unit "):
+                state = line.split(" ", 3)[3] if line.count(" ") >= 3 else ""
+            elif line.startswith("@@ env "):
+                env = line[len("@@ env "):]
+            elif line.startswith("@@ file loadgen_live "):
+                payload = line[len("@@ file loadgen_live "):].strip()
+        if payload in ("", "-"):
+            raise VmOpsError(f"loadgen: no live summary at {LOADGEN_LIVE_PATH} (unit {state or 'unknown'})")
+        document = json.loads(base64.b64decode(payload).decode("utf-8"))
+        if not isinstance(document, dict):
+            raise VmOpsError("loadgen: live summary is not an object")
+        return state.strip() == "active", document, env
+
+    def hypervisor_facts(self) -> dict[str, Any]:
+        """One ``facts`` answer from the 66 helper (T4S contract), recorded in the 66 history."""
+        if not self.hypervisor_target:
+            raise VmOpsError("hypervisor target is not configured (VM_OPS_HYPERVISOR_TARGET)")
+        argv = ["/usr/bin/ssh", *ssh_options(key=HYPERVISOR_KEY), self.hypervisor_target, HYPERVISOR_FACTS_VERB]
+        try:
+            result = self.process_runner(
+                argv, capture_output=True, text=True, timeout=REMOTE_TIMEOUT_SEC + 20, env=_environment(), check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise VmOpsError("hypervisor: no answer to facts") from None
+        if result.returncode != 0:
+            raise VmOpsError(f"hypervisor: facts exited {result.returncode}: {_tail(result.stderr or result.stdout)}")
+        lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+        if len(lines) != 1:
+            raise VmOpsError(f"hypervisor: facts is not one line: {_tail(result.stdout)}")
+        document = json.loads(lines[0])
+        if not isinstance(document, dict):
+            raise VmOpsError("hypervisor: facts is not an object")
+        for key in ("at", "handshake_age_sec", "ping", "wg_rx_bytes", "wg_tx_bytes", "guards_active", "helper_sha256"):
+            if key not in document:
+                raise VmOpsError(f"hypervisor: facts lacks {key}")
+        _parse(document["at"])
+        self._record_hypervisor(document)
+        return document
+
+    # ------------------------------------------------------------------ state
+
+    @property
+    def facts_path(self) -> Path:
+        return self.state_dir / "facts.json"
+
+    def load(self) -> dict[str, Any]:
+        path = self.facts_path
+        if not path.is_file():
+            return {"hosts": {}, "hypervisor": {"history": []}}
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document.setdefault("hosts", {})
+        document.setdefault("hypervisor", {"history": []})
+        return document
+
+    def _save(self, document: Mapping[str, Any]) -> None:
+        _atomic_write(self.facts_path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+
+    def _record_hypervisor(self, sample: Mapping[str, Any]) -> None:
+        with self._lock:
+            document = self.load()
+            history = list(document["hypervisor"].get("history", []))
+            history.append(dict(sample))
+            document["hypervisor"] = {
+                "history": history[-HYPERVISOR_HISTORY:],
+                "last_error": None,
+                "read_at": _format(self.clock()),
+            }
+            self._save(document)
+
+    def read_all(self) -> dict[str, Any]:
+        """The periodic read: every VM, then 66. One failure does not stop the others; it is recorded as is."""
+        results: dict[str, HostFacts | Exception] = {}
+        for host in self.hosts:
+            try:
+                results[host.name] = self.read_host(host)
+            except Exception as error:
+                results[host.name] = error
+        hypervisor_error: str | None = None
+        if self.hypervisor_target:
+            try:
+                self.hypervisor_facts()
+            except Exception as error:
+                hypervisor_error = f"{type(error).__name__}: {error}"
+        now = _format(self.clock())
+        with self._lock:
+            document = self.load()
+            for name, result in results.items():
+                entry = dict(document["hosts"].get(name) or {})
+                if isinstance(result, Exception):
+                    entry["last_error"] = {"at": now, "detail": f"{type(result).__name__}: {result}"[:600]}
+                else:
+                    cpu = list(entry.get("cpu_history") or [])
+                    if result.procstat:
+                        cpu.append({"at": result.at, "procstat": result.procstat})
+                    entry.update(
+                        {
+                            "facts": {
+                                "at": result.at,
+                                "read_at": now,
+                                "units": result.units,
+                                "sums": result.sums,
+                                "drift": result.drift,
+                                "guards_armed": result.guards_armed,
+                                "guard_timers": result.guard_timers,
+                                "chrony": result.chrony,
+                            },
+                            "cpu_history": cpu[-ROUTER_CPU_HISTORY:],
+                            "last_error": None,
+                        }
+                    )
+                    self._deliver_files(name, result)
+                document["hosts"][name] = entry
+            if hypervisor_error is not None:
+                document["hypervisor"]["last_error"] = {"at": now, "detail": hypervisor_error[:600]}
+            self._save(document)
+        return document
+
+    def expected_helper_sha256(self) -> dict[str, str]:
+        """The 66 helper checksums the repository's source gives (T4S contract item 5)."""
+        try:
+            result = self.process_runner(
+                list(HELPER_EXPECTED_ARGV), capture_output=True, text=True, timeout=60, env=_environment(), check=False,
+            )
+        except Exception as error:
+            raise VmOpsError(f"cannot compute the helper checksums: {type(error).__name__}: {error}") from None
+        if result.returncode != 0:
+            raise VmOpsError(f"helper checksum command exited {result.returncode}: {_tail(result.stderr or result.stdout)}")
+        document = json.loads(result.stdout)
+        if not isinstance(document, dict) or not document:
+            raise VmOpsError("helper checksum command printed no checksums")
+        return {str(name): str(value) for name, value in document.items()}
+
+    def drift_detail(self) -> str | None:
+        """What differs from the install on the VMs and 66, or None (live_queue VM_DOMAIN_STATE_CHECK_NAME).
+
+        Judged on the latest periodic read. A host whose read is missing or stale is left to preflight, which
+        refuses to judge on stale facts and waits (then pauses) with the read error."""
+        document = self.load()
+        now = self.clock()
+        problems: list[str] = []
+        for host in self.hosts:
+            facts = (document["hosts"].get(host.name) or {}).get("facts")
+            if facts is None or (now - _parse(facts["read_at"])).total_seconds() > FACTS_MAX_AGE_SEC:
+                continue
+            for unit, state in sorted(facts["units"].items()):
+                if state != "active":
+                    problems.append(f"{host.name} {unit} {state}")
+            for record in (*REQUIRED_RECORDS_BY_ROLE.get(host.role, ()), *REQUIRED_RECORDS_ALL):
+                verdict = facts["sums"].get(record, "not read")
+                if verdict != "rc=0":
+                    problems.append(f"{host.name} {record} {verdict}")
+            for path in facts["drift"]:
+                problems.append(f"{host.name} changed since install: {path}")
+        history = document["hypervisor"].get("history") or []
+        if self.hypervisor_target and history:
+            latest = history[-1]
+            if (now - _parse(latest["at"])).total_seconds() <= FACTS_MAX_AGE_SEC:
+                expected = self.expected_helper_sha256()
+                installed = latest.get("helper_sha256") or {}
+                for name, digest in sorted(expected.items()):
+                    if installed.get(name) != digest:
+                        problems.append(
+                            f"hypervisor {name} installed {str(installed.get(name))[:12]} != repository {digest[:12]}"
+                        )
+        return "; ".join(problems) if problems else None
+
+    def _deliver_files(self, name: str, facts: HostFacts) -> None:
+        """db01's archive facts line goes where the archive-state readiness reads it, unchanged."""
+        if name != "db01" or self.archive_state_dir is None:
+            return
+        text = facts.files.get("archive_state")
+        if text is None:
+            return
+        try:
+            json.loads(text)
+        except ValueError:
+            logger.warning("db01 archive facts line is not JSON; last.json left as it was")
+            return
+        _atomic_write(self.archive_state_dir / "last.json", text if text.endswith("\n") else text + "\n")
+
+
+class VmOpsService:
+    """Background loop: master check every 30s, periodic read every 5 minutes. Started from the app lifespan."""
+
+    def __init__(
+        self,
+        ops: VmOps,
+        *,
+        check_interval_sec: float = MASTER_CHECK_INTERVAL_SEC,
+        read_interval_sec: float = PERIODIC_READ_INTERVAL_SEC,
+        monotonic: Callable[[], float] | None = None,
+    ) -> None:
+        self.ops = ops
+        self.check_interval_sec = check_interval_sec
+        self.read_interval_sec = read_interval_sec
+        self._monotonic = monotonic or (lambda: asyncio.get_running_loop().time())
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task | None = None
+
+    async def run(self) -> None:
+        next_read = self._monotonic()
+        while not self._stop.is_set():
+            try:
+                await asyncio.to_thread(self.ops.supervisor.ensure)
+            except Exception:
+                logger.exception("management ssh check failed")
+            if self._monotonic() >= next_read:
+                next_read = self._monotonic() + self.read_interval_sec
+                try:
+                    await asyncio.to_thread(self.ops.read_all)
+                except Exception:
+                    logger.exception("periodic management read failed")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.check_interval_sec)
+            except asyncio.TimeoutError:
+                pass
+
+    def ensure_started(self) -> None:
+        if self._task is None or self._task.done():
+            self._stop = asyncio.Event()
+            self._task = asyncio.create_task(self.run())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=30)
+            except Exception:
+                self._task.cancel()
+        await asyncio.to_thread(self.ops.supervisor.stop)
+
+
+_ops: VmOps | None = None
+_service: VmOpsService | None = None
+
+
+def enabled() -> bool:
+    return os.environ.get("CIVIL_PETITION_OPS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_vm_ops() -> VmOps | None:
+    """The process-wide VmOps when CIVIL_PETITION_OPS is on, else None (off by default)."""
+    global _ops
+    if not enabled():
+        return None
+    if _ops is None:
+        archive = os.environ.get("PETITION_ARCHIVE_STATE_DIR", "").strip()
+        _ops = VmOps(archive_state_dir=Path(archive) if archive else None)
+    return _ops
+
+
+def get_vm_ops_service() -> VmOpsService | None:
+    global _service
+    ops = get_vm_ops()
+    if ops is None:
+        return None
+    if _service is None:
+        _service = VmOpsService(ops)
+    return _service

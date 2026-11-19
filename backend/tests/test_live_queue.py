@@ -1728,3 +1728,146 @@ async def test_restore_failure_pauses_queue(tmp_path: Path, monkeypatch) -> None
     assert state.phase == "paused"
     assert "golden restore failed" in state.reason
     assert runner.started == []
+
+
+# --- VM testbed (civil-petition): domain preflight and drift gate (spec-testbed-vm-3tier §6-4, §6-6) -----------
+
+from tests.test_preflight import VM_CLEAN
+
+
+def _make_vm_domain(runner, *scenario_ids: str) -> None:
+    """Mark scenarios as civil-petition in the scenario metadata the queue reads."""
+    document = json.loads(runner.scenario_metadata_path.read_text())
+    for scenario_id in scenario_ids:
+        document["scenarios"][scenario_id]["domain"] = "civil-petition"
+    runner.scenario_metadata_path.write_text(json.dumps(document), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_a_vm_domain_scenario_is_judged_on_its_own_signals_and_the_others_keep_r6(tmp_path: Path) -> None:
+    from app.live_queue import VM_DOMAIN_STATE_CHECK_NAME
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    _make_vm_domain(runner, "F01-R")
+    default = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    vm_probe = FakePreflightProbe(VM_CLEAN)
+    queue.preflight_probe = default
+    queue.domain_preflight_probes = {"civil-petition": vm_probe}
+    pods = []
+    queue.domain_pods_probe = lambda: pods.append(1) or "1 of 31 app pods not Ready: rca-testbed-commerce/x(Running)"
+    queue.vm_domain_state = lambda: None
+    await queue.start()
+    calls_before = default.calls  # readiness proved the default probe once
+    state = await queue.tick()
+    assert runner.started == [("F01-R", "run")], state.reason
+    assert vm_probe.calls == 1 and default.calls == calls_before
+    # Kubernetes pods are not this domain's gate (their alarms still count in active_alarms).
+    assert pods == []
+    verdict = json.loads((runner.artifact_store.root / "run-F01-R" / "preflight.json").read_text())
+    names = {check["name"] for check in verdict["checks"]}
+    assert {"tunnel_handshake_age_sec", "mgmt_ssh_settle_sec", "residual_guards", "router_cpu_pct"} <= names
+    assert "prev_pool_pending" not in names
+    assert VM_DOMAIN_STATE_CHECK_NAME not in names
+
+    # A scenario of another domain still goes through the R6 probe and the pods gate.
+    assert queue._preflight_probe_for("F01-H") == (default, None)
+    assert queue._domain_pods_gate("F01-H")[0] == "hold" and pods == [1]
+
+
+@pytest.mark.asyncio
+async def test_a_vm_domain_scenario_without_its_probe_is_never_judged_on_r6(tmp_path: Path) -> None:
+    """CIVIL_PETITION_OPS off: the gate has no probe for the domain, waits like a broken probe and then pauses
+    with why; it never falls back to the commerce signals."""
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    _make_vm_domain(runner, "F01-R")
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    await queue.start()
+    for attempt in range(1, PREFLIGHT_MAX_ATTEMPTS):
+        state = await queue.tick()
+        assert state.phase == "running" and state.preflight_attempts == attempt
+        assert "no preflight probe for domain civil-petition" in (state.reason or "")
+        clock.value += timedelta(minutes=5)
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == []
+    assert "no preflight probe for domain civil-petition" in (state.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_a_vm_domain_dirty_gate_waits_and_names_the_failing_signal(tmp_path: Path) -> None:
+    """A tunnel cut on purpose: dirty, rechecked every 5 minutes with the failing values in the reason."""
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    _make_vm_domain(runner, "F01-R")
+    vm_probe = FakePreflightProbe({**VM_CLEAN, "tunnel_handshake_age_sec": 1_000_000, "tunnel_ping_lost": 10})
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    queue.domain_preflight_probes = {"civil-petition": vm_probe}
+    await queue.start()
+    state = await queue.tick()
+    assert runner.started == [] and state.preflight_attempts == 1
+    assert "tunnel_handshake_age_sec=1e+06 (fail, lte 150)" in (state.reason or "")
+    assert "tunnel_ping_lost=10 (fail, eq 0)" in (state.reason or "")
+    vm_probe.obs = dict(VM_CLEAN)
+    clock.value += timedelta(minutes=5)
+    await queue.tick()
+    assert runner.started == [("F01-R", "run")]
+
+
+@pytest.mark.asyncio
+async def test_vm_domain_drift_pauses_before_the_injection_with_what_differs(tmp_path: Path) -> None:
+    """§6-4 버전 표류 (§6-6 live_queue row): a VM that does not run what the install left needs a person, so the
+    queue pauses at once with the list (raw text, U3). Only this domain's scenarios are gated by it."""
+    from app.live_queue import VM_DOMAIN_STATE_CHECK_NAME
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    _make_vm_domain(runner, "F01-R")
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    vm_probe = FakePreflightProbe(VM_CLEAN)
+    queue.domain_preflight_probes = {"civil-petition": vm_probe}
+    answers = ["was01 /var/lib/petition-deploy/war.sha256 rc=1; was01 changed since install: petition.war"]
+    queue.vm_domain_state = lambda: answers[0]
+    await queue.start()
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == [] and vm_probe.calls == 0
+    assert state.reason == (
+        f"operational readiness failed: {VM_DOMAIN_STATE_CHECK_NAME} ({VM_DOMAIN_STATE_CHECK_NAME}: "
+        "was01 /var/lib/petition-deploy/war.sha256 rc=1; was01 changed since install: petition.war)"
+    )
+    answers[0] = None
+    await queue.resume()
+    await queue.tick()
+    assert runner.started == [("F01-R", "run")]
+
+    # A state read that raises also stops the injection, with its words.
+    (tmp_path / "b").mkdir()
+    queue, runner, _, _, clock = make_queue(tmp_path / "b")
+    _make_vm_domain(runner, "F01-R")
+    queue.domain_preflight_probes = {"civil-petition": FakePreflightProbe(VM_CLEAN)}
+
+    def broken():
+        raise RuntimeError("helper checksum command exited 2: no such module")
+
+    queue.vm_domain_state = broken
+    await queue.start()
+    state = await queue.tick()
+    assert state.phase == "paused" and "helper checksum command exited 2: no such module" in (state.reason or "")
+
+    # A commerce scenario is not gated by the VM state.
+    (tmp_path / "c").mkdir()
+    queue, runner, _, _, clock = make_queue(tmp_path / "c")
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    queue.vm_domain_state = lambda: "rt-core01 snmpd.service inactive"
+    await queue.start()
+    await queue.tick()
+    assert runner.started == [("F01-R", "run")]
+
+
+def test_compose_carries_the_vm_testbed_settings_and_leaves_them_off() -> None:
+    compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "- CIVIL_PETITION_OPS=${CIVIL_PETITION_OPS:-}" in compose
+    assert "- VM_OPS_HYPERVISOR_TARGET=${VM_OPS_HYPERVISOR_TARGET:-}" in compose
+    assert "- VM_OPS_STATE_DIR=/app/state/vm-ops" in compose
+    # Keys through one directory (a missing single file would become a directory on the host).
+    assert "- ${VM_OPS_KEY_HOST_DIR:-/root/.ssh/vm-ops}:/root/.ssh/vm-ops:ro" in compose
+    assert (
+        "- ${CIVIL_PETITION_INVENTORY_HOST_PATH:-../testbed-services/civil-petition/deploy/inventory}"
+        ":/opt/lucida/civil-petition-inventory:ro"
+    ) in compose

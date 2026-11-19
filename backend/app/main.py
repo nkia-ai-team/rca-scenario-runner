@@ -20,6 +20,7 @@ from app.watchdog import WatchdogDecision, WatchdogRequest, decide_watchdog
 from app.live_queue import LiveQueueState, OperationalReadiness, get_live_queue
 from app.pass_mode import isolation_checks_enabled
 from app.restart_recovery import recover_after_restart
+from app.vm_ops import get_vm_ops_service
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,10 @@ async def lifespan(_: FastAPI):
     runner.cleanup_retry_hold = lambda: get_live_queue().injection_reserved
     runner.ensure_capture_worker()
     runner.ensure_watchdog_worker()
+    # VM testbed management connections and periodic read (off unless CIVIL_PETITION_OPS is on).
+    vm_ops_service = get_vm_ops_service()
+    if vm_ops_service is not None:
+        vm_ops_service.ensure_started()
     get_live_queue().ensure_worker()
     try:
         yield
@@ -56,6 +61,8 @@ async def lifespan(_: FastAPI):
         await get_live_queue().stop_worker()
         await runner.stop_capture_worker()
         await runner.stop_watchdog_worker()
+        if vm_ops_service is not None:
+            await vm_ops_service.stop()
 
 
 app = FastAPI(

@@ -224,17 +224,73 @@ R6_REQUIRED_SIGNALS: frozenset[str] = frozenset(
 )
 
 
-def build_preflight_checks(observations: Mapping[str, float]) -> list[PreflightCheckInput]:
+# Traditional VM testbed (testbed-services docs/spec-testbed-vm-3tier.md §6-4). The R6 categories are filled
+# with this domain's values (its own loadgen on the VM network, the same alarm and incident views), the previous
+# run's residue is the executors' armed guards on the six VMs and 66 (there is no commerce pool here), and the
+# design adds the tunnel, the monitoring freshness, the router load, the always-open management connections and
+# the clock. Each value comes from app.preflight_probe.VmDomainPreflightProbe.
+VM_DOMAIN = "civil-petition"
+TUNNEL_HANDSHAKE_MAX_SEC = 150.0
+TUNNEL_PING_MAX_MS = 20.0
+# Mbit/s averaged over the last 10 minutes (§3-6 tunnel row: the 1-minute peak budget of both T and S).
+TUNNEL_LOAD_MAX_MBPS = 20.0
+SMS_SAMPLE_MAX_AGE_SEC = 90.0
+ROUTER_SNMP_MAX_AGE_SEC = 180.0
+ROUTER_CPU_MAX_PCT = 50.0
+# §6-4 "관리망 도달": a reopened connection leaves a new row in host_connections, so no recording starts within
+# 30 minutes of a reopen.
+MGMT_SSH_SETTLE_SEC = 1800.0
+CLOCK_OFFSET_MAX_MS = 50.0
+VM_DOMAIN_REQUIRED_SIGNALS: frozenset[str] = frozenset(
+    {
+        "baseline_loadgen_alive",
+        "achieved_rps",
+        "diurnal_rps_floor",
+        "user_5xx_rate",
+        "entry_p95_sec",
+        "active_alarms",
+        "open_incidents",
+        "residual_guards",
+        "tunnel_handshake_age_sec",
+        "tunnel_ping_lost",
+        "tunnel_ping_max_ms",
+        "tunnel_load_mbps",
+        "sms_cpu_sample_age_sec",
+        "sms_icmp_down",
+        "sms_icmp_sample_age_sec",
+        "router_snmp_down",
+        "router_snmp_sample_age_sec",
+        "router_cpu_pct",
+        "mgmt_ssh_down",
+        "mgmt_ssh_settle_sec",
+        "clock_offset_ms",
+    }
+)
+DOMAIN_REQUIRED_SIGNALS: dict[str, frozenset[str]] = {VM_DOMAIN: VM_DOMAIN_REQUIRED_SIGNALS}
+
+
+def required_signals(domain: str | None = None) -> frozenset[str]:
+    """The signal set a domain's preflight must supply; the R6 set for the Kubernetes domains."""
+    return DOMAIN_REQUIRED_SIGNALS.get(domain or "", R6_REQUIRED_SIGNALS)
+
+
+def build_preflight_checks(
+    observations: Mapping[str, float], *, domain: str | None = None
+) -> list[PreflightCheckInput]:
     """Map the six R6 signal categories to deterministic check inputs.
 
     Pure: the queue's probe fetches these values from the existing observation
     adapters (loadgen_summary / http_probe / prometheus / database / alarm) and
     hands them here. Raises if any required signal is missing so a partial poll
-    fails closed rather than silently passing.
+    fails closed rather than silently passing. ``domain`` selects the domain's
+    set (DOMAIN_REQUIRED_SIGNALS); without one it is the R6 set as before.
     """
-    missing = R6_REQUIRED_SIGNALS - set(observations)
+    required = required_signals(domain)
+    missing = required - set(observations)
     if missing:
         raise ValueError(f"preflight is missing required signals: {sorted(missing)}")
+    if domain in DOMAIN_REQUIRED_SIGNALS:
+        return _vm_domain_checks(observations)
     return [
         # baseline loadgen must be alive (1 = present).
         PreflightCheckInput(
@@ -288,4 +344,40 @@ def build_preflight_checks(observations: Mapping[str, float]) -> list[PreflightC
             threshold=0.0,
             op="eq",
         ),
+    ]
+
+
+def _vm_domain_checks(observations: Mapping[str, float]) -> list[PreflightCheckInput]:
+    def check(name: str, threshold: float, op: Op, *, key: str | None = None, tolerance: float = 0.0) -> PreflightCheckInput:
+        return PreflightCheckInput(
+            name=name, value=float(observations[key or name]), threshold=threshold, op=op, tolerance=tolerance
+        )
+
+    return [
+        check("baseline_loadgen_alive", 1.0, "gte"),
+        PreflightCheckInput(
+            name="diurnal_band_rps",
+            value=float(observations["achieved_rps"]),
+            threshold=float(observations["diurnal_rps_floor"]),
+            op="gte",
+        ),
+        check("user_5xx_rate", R6_5XX_NOISE_FLOOR, "lte", tolerance=R6_5XX_TOLERANCE),
+        check("entry_p95_sec", R6_ENTRY_P95_SEC, "lte", tolerance=R6_ENTRY_P95_TOLERANCE),
+        check("active_alarms", 0.0, "eq"),
+        check("open_incidents", 0.0, "eq"),
+        # The previous run's residue on this domain: armed executor guards on the VMs and 66 (§6-4 "남은 가드").
+        check("residual_guards", 0.0, "eq"),
+        check("tunnel_handshake_age_sec", TUNNEL_HANDSHAKE_MAX_SEC, "lte"),
+        check("tunnel_ping_lost", 0.0, "eq"),
+        check("tunnel_ping_max_ms", TUNNEL_PING_MAX_MS, "lte"),
+        check("tunnel_load_mbps", TUNNEL_LOAD_MAX_MBPS, "lte"),
+        check("sms_cpu_sample_age_sec", SMS_SAMPLE_MAX_AGE_SEC, "lte"),
+        check("sms_icmp_down", 0.0, "eq"),
+        check("sms_icmp_sample_age_sec", SMS_SAMPLE_MAX_AGE_SEC, "lte"),
+        check("router_snmp_down", 0.0, "eq"),
+        check("router_snmp_sample_age_sec", ROUTER_SNMP_MAX_AGE_SEC, "lte"),
+        check("router_cpu_pct", ROUTER_CPU_MAX_PCT, "lte"),
+        check("mgmt_ssh_down", 0.0, "eq"),
+        check("mgmt_ssh_settle_sec", MGMT_SSH_SETTLE_SEC, "gte"),
+        check("clock_offset_ms", CLOCK_OFFSET_MAX_MS, "lte"),
     ]

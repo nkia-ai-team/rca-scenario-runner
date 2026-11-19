@@ -138,3 +138,254 @@ def test_queue_filter_removes_decoy_alarms_and_keeps_the_rest(monkeypatch):
     probe.set_alarm_filter(only_decoys)
     assert probe.collect(now=datetime.now(timezone.utc))["active_alarms"] == 1.0
     assert probe.last_excused_alarms == [{"decoy_id": "d1"}]
+
+
+# --- VM testbed (civil-petition): testbed-services docs/spec-testbed-vm-3tier.md §6-4 ----------------------------
+
+import base64 as _base64
+import urllib.parse as _urlparse
+from datetime import timedelta as _timedelta
+from pathlib import Path as _Path
+
+import pytest as _pytest
+
+from app import vm_ops as _vm_ops
+from app.preflight_probe import VmDomainPreflightProbe, vm_domain_rps_floor, vm_domain_target_rps
+from tests.test_vm_ops import NOW as _VM_NOW, Clock as _VmClock, FakeRemote as _VmRemote, _hypervisor, _read_output
+
+_ROUTER_ID = "65b4ab9c-d1b4-42f6-be5c-7efb5c34cb3c"
+_LOADGEN_ENV = "PEAK_RPS=30 TROUGH_RPS=5 LOADGEN_SEED=42 ENTRY_URL=http://192.168.124.11:80/petition"
+
+
+class _VmDomainRemote(_VmRemote):
+    """The periodic read and the 66 helper (test_vm_ops.FakeRemote) plus the loadgen's live-summary read."""
+
+    def __init__(self, clock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.loadgen_state = "active"
+        self.live: dict | None = None
+
+    def live_document(self, **overrides) -> dict:
+        document = {
+            "domain": "civil-petition", "unit": "loadgen", "achieved_rps": 17.2, "http_count": 1032,
+            "http_abnormal_rate": 0.0, "http_p95_ms": 8.6,
+            "observed_at": (self.clock.value - _timedelta(seconds=4)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        document.update(overrides)
+        return document
+
+    def __call__(self, argv, **kwargs):
+        stdin = kwargs.get("input") or b""
+        if b"systemctl show -p Environment" in stdin:
+            self.calls.append((list(argv), stdin))
+            live = self.live if self.live is not None else self.live_document()
+            payload = _base64.b64encode(json.dumps(live).encode()).decode()
+            out = (
+                "@@ host loadgen\n"
+                f"@@ unit loadgen.service {self.loadgen_state}\n"
+                f"@@ env {_LOADGEN_ENV}\n"
+                f"@@ file loadgen_live {payload}\n@@ end\n"
+            )
+            return subprocess.CompletedProcess(argv, 0, out.encode(), b"")
+        return super().__call__(argv, **kwargs)
+
+
+def _vm_urlopen(answers: dict):
+    """Fake VictoriaMetrics: the first answer whose key is inside the decoded PromQL."""
+
+    @contextmanager
+    def urlopen(url, timeout=None):
+        class Response:
+            pass
+
+        text = url if isinstance(url, str) else url.full_url
+        query = _urlparse.parse_qs(_urlparse.urlparse(text).query).get("query", [""])[0]
+        for fragment, payload in answers.items():
+            if fragment in query or fragment in text:
+                response = Response()
+                response.read = lambda payload=payload: json.dumps(payload).encode()
+                yield response
+                return
+        raise AssertionError(f"unexpected query: {query or text}")
+
+    return urlopen
+
+
+def _rows(values: dict) -> dict:
+    return {"status": "success", "data": {"result": [
+        {"metric": {"host_name": host} if host else {}, "value": [0, str(value)]} for host, value in values.items()
+    ]}}
+
+
+_SERVERS = ("192.168.124.11", "192.168.125.11", "192.168.125.12", "192.168.126.11")
+
+
+def _vm_answers(*, cpu_age=None, icmp=None, icmp_age=None, snmp=1, snmp_age=30, alerts=()):
+    return {
+        'sms.cpu.utilization': _rows(cpu_age or {host: 15 for host in _SERVERS}),
+        'time() - max by (host_name) (tlast_over_time({__name__="sms.server.icmp_status"': _rows(
+            icmp_age or {host: 20 for host in _SERVERS}),
+        'max by (host_name) (last_over_time({__name__="sms.server.icmp_status"': _rows(
+            icmp or {host: 1 for host in _SERVERS}),
+        f'time() - max(tlast_over_time({{__name__="nms.network.snmp_status",target_id="{_ROUTER_ID}"}}': _rows(
+            {"": snmp_age} if snmp_age is not None else {}),
+        f'max(last_over_time({{__name__="nms.network.snmp_status",target_id="{_ROUTER_ID}"}}': _rows(
+            {"": snmp} if snmp is not None else {}),
+        "/api/v1/alerts": {"data": {"alerts": list(alerts)}},
+    }
+
+
+def _vm_probe(tmp_path: _Path, *, answers=None, reads: int = 3, settle_min: int = 60):
+    """A probe on real VmOps state: `reads` periodic reads five minutes apart (router /proc/stat busy 25% between
+    them, 66 counters 30 MB each way per 5 minutes), all masters opened `settle_min` minutes before the last read."""
+    clock = _VmClock(_VM_NOW - _timedelta(minutes=5 * (reads - 1)))
+    remote = _VmDomainRemote(clock)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    targets = tmp_path / "t.targets.json"
+    targets.write_text(json.dumps({"network_devices": [{"name": "rt-core01", "address": "192.168.123.254",
+                                                        "target_id": _ROUTER_ID}]}))
+    ops = _vm_ops.VmOps(
+        process_runner=remote, clock=clock, state_dir=tmp_path / "vm-ops", hypervisor_target="opsview@192.168.122.1",
+        supervisor=_vm_ops.MasterSupervisor(process_runner=remote, clock=clock, state_dir=tmp_path / "vm-ops",
+                                            control_dir=tmp_path / "cm", popen=lambda *a, **k: None),
+    )
+    for index in range(reads):
+        busy, idle = 100 + 250 * index, 800 + 750 * index
+        remote.outputs["192.168.127.2"] = _read_output(
+            _vm_ops.HOSTS_BY_NAME["rt-core01"], at=clock.value, procstat=f"cpu  {busy} 0 0 {idle} 0 0 0 0 0 0")
+        remote.hypervisor = _hypervisor(clock.value, rx=30_000_000 * index, tx=30_000_000 * index)
+        ops.read_all()
+        if index < reads - 1:
+            clock.value += _timedelta(minutes=5)
+    opened = (clock.value - _timedelta(minutes=settle_min)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ops.supervisor.status = {host.name: {"alive": True, "opened_at": opened, "detail": ""} for host in _vm_ops.HOSTS}
+    clock.value += _timedelta(minutes=5)  # the injection-time fresh 66 read is 5 minutes after the last periodic one
+    remote.hypervisor = _hypervisor(clock.value, rx=30_000_000 * reads, tx=30_000_000 * reads)
+    probe = VmDomainPreflightProbe(
+        ops=ops, vm_url="http://vm", urlopen=_vm_urlopen(answers or _vm_answers()), incident_count=lambda: 0,
+        targets_path=targets,
+    )
+    return probe, ops, remote, clock
+
+
+def _vm_gate(observations, now):
+    return evaluate_preflight(
+        window=("2026-11-20T05:50:00Z", "2026-11-20T06:00:00Z"),
+        checks=build_preflight_checks(observations, domain="civil-petition"),
+        now=now,
+    )
+
+
+def test_vm_domain_probe_reads_every_signal_and_passes_a_healthy_testbed(tmp_path) -> None:
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    observations = probe.collect(now=clock.value)
+    assert observations["baseline_loadgen_alive"] == 1.0
+    assert observations["achieved_rps"] == 17.2
+    # 15:05 KST: hour 15 target 5 + 25*98% = 30 (rounded), hour 14 target 28; floor half the lower.
+    assert observations["diurnal_rps_floor"] == 14.0
+    assert observations["user_5xx_rate"] == 0.0 and observations["entry_p95_sec"] == _pytest.approx(0.0086)
+    assert observations["tunnel_handshake_age_sec"] == 12 and observations["tunnel_ping_lost"] == 0
+    # 10 minutes back: two reads of 30 MB each way = 120 MB over 600 s = 1.6 Mbit/s.
+    assert observations["tunnel_load_mbps"] == _pytest.approx(120_000_000 * 8 / 600 / 1e6)
+    assert observations["router_cpu_pct"] == _pytest.approx(25.0)
+    assert observations["mgmt_ssh_down"] == 0 and observations["mgmt_ssh_settle_sec"] == 65 * 60
+    assert observations["clock_offset_ms"] == _pytest.approx(0.012345)
+    assert observations["sms_cpu_sample_age_sec"] == 15 and observations["router_snmp_down"] == 0
+    verdict = _vm_gate(observations, clock.value)
+    assert verdict.verdict == "clean", [c for c in verdict.checks if c.status != "pass"]
+    # The loadgen read and every VM read go over the shared socket as the executor account.
+    loadgen_calls = [argv for argv, stdin in remote.calls if b"systemctl show -p Environment" in (stdin or b"")]
+    assert loadgen_calls and all("opsjob@192.168.127.10" in argv and "ControlMaster=no" in argv for argv in loadgen_calls)
+
+
+def test_vm_domain_probe_goes_dirty_when_the_tunnel_is_cut(tmp_path) -> None:
+    """§10 T4 preflight: a tunnel cut on purpose makes the gate dirty (no handshake, every ping lost)."""
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    remote.hypervisor = {**_hypervisor(clock.value, rx=90_000_000, tx=90_000_000), "handshake_age_sec": None,
+                         "ping": {"sent": 10, "received": 0, "max_ms": None}}
+    verdict = _vm_gate(probe.collect(now=clock.value), clock.value)
+    assert verdict.verdict == "dirty"
+    assert {c.name for c in verdict.checks if c.status == "fail"} == {
+        "tunnel_handshake_age_sec", "tunnel_ping_lost", "tunnel_ping_max_ms"}
+
+
+def test_vm_domain_probe_goes_dirty_when_a_management_connection_is_down_or_just_reopened(tmp_path) -> None:
+    """§10 T4 preflight: an always-open connection cut on purpose makes the gate dirty; once reopened the gate
+    stays dirty for 30 minutes (the reopen's new connection must not sit at the front of a recording)."""
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    ops.supervisor.status["db01"] = {"alive": False, "opened_at": None, "detail": "could not open: No route to host"}
+    verdict = _vm_gate(probe.collect(now=clock.value), clock.value)
+    assert {c.name for c in verdict.checks if c.status == "fail"} == {"mgmt_ssh_down", "mgmt_ssh_settle_sec"}
+    ops.supervisor.status["db01"] = {"alive": True, "detail": "",
+                                     "opened_at": (clock.value - _timedelta(minutes=29)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    verdict = _vm_gate(probe.collect(now=clock.value), clock.value)
+    assert {c.name for c in verdict.checks if c.status == "fail"} == {"mgmt_ssh_settle_sec"}
+    clock.value += _timedelta(minutes=1, seconds=1)
+    remote.hypervisor = _hypervisor(clock.value, rx=90_000_000, tx=90_000_000)
+    assert _vm_gate(probe.collect(now=clock.value), clock.value).verdict == "clean"
+
+
+def test_vm_domain_probe_counts_guards_clock_freshness_and_router_load(tmp_path) -> None:
+    answers = _vm_answers(cpu_age={host: 15 for host in _SERVERS[:3]}, icmp={**{h: 1 for h in _SERVERS}, _SERVERS[3]: 0},
+                          snmp=0, snmp_age=200)
+    probe, ops, remote, clock = _vm_probe(tmp_path, answers=answers)
+    # A guard still armed on was02 (one undo, its timer) and one on 66.
+    remote.outputs["192.168.127.32"] = _read_output(_vm_ops.HOSTS_BY_NAME["was02"], at=clock.value, guards=(1, 1))
+    remote.outputs["192.168.127.2"] = _read_output(_vm_ops.HOSTS_BY_NAME["rt-core01"], at=clock.value,
+                                                   procstat="cpu  2000 0 0 2300 0 0 0 0 0 0",
+                                                   chrony=vm_ops_chrony(0.0612))
+    ops.read_all()
+    remote.hypervisor = {**_hypervisor(clock.value, rx=90_000_000, tx=90_000_000), "guards_active": 1}
+    observations = probe.collect(now=clock.value)
+    assert observations["residual_guards"] == 2
+    assert observations["clock_offset_ms"] == _pytest.approx(61.2)
+    # db01 (126.11) has no CPU sample in the window: age = lookback + 1, never a pass.
+    assert observations["sms_cpu_sample_age_sec"] == 901
+    assert observations["sms_icmp_down"] == 1
+    assert observations["router_snmp_down"] == 1 and observations["router_snmp_sample_age_sec"] == 200
+    # (2000-600) busy and no idle since the previous read (busy 600, idle 2300).
+    assert observations["router_cpu_pct"] == _pytest.approx(100.0)
+    failing = {c.name for c in _vm_gate(observations, clock.value).checks if c.status == "fail"}
+    assert failing == {"residual_guards", "clock_offset_ms", "sms_cpu_sample_age_sec", "sms_icmp_down",
+                       "router_snmp_down", "router_snmp_sample_age_sec", "router_cpu_pct"}
+
+
+def vm_ops_chrony(offset_sec: float) -> str:
+    return f"7F7F0101,192.168.127.1,3,1795076000.1,{offset_sec:.9f},0,0,0,0,0,0,0,64,Normal"
+
+
+def test_vm_domain_probe_refuses_stale_or_foreign_inputs_with_the_reason(tmp_path) -> None:
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    # The periodic read stopped answering for web01: its last error travels in the reason (U3).
+    remote.outputs["192.168.127.21"] = RuntimeError("ssh: connect to host 192.168.127.21 port 22: Connection timed out")
+    clock.value += _timedelta(seconds=_vm_ops.FACTS_MAX_AGE_SEC)
+    ops.read_all()
+    remote.hypervisor = _hypervisor(clock.value, rx=90_000_000, tx=90_000_000)
+    remote.live = remote.live_document()
+    with _pytest.raises(_vm_ops.VmOpsError, match="web01: last read .* Connection timed out"):
+        probe.collect(now=clock.value)
+
+    probe, ops, remote, clock = _vm_probe(tmp_path / "b")
+    remote.live = remote.live_document(observed_at=(clock.value - _timedelta(seconds=45)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    with _pytest.raises(_vm_ops.VmOpsError, match="45s old"):
+        probe.collect(now=clock.value)
+    remote.live = remote.live_document(domain="commerce")
+    with _pytest.raises(_vm_ops.VmOpsError, match="not this domain"):
+        probe.collect(now=clock.value)
+    remote.live = {k: v for k, v in remote.live_document().items() if k not in ("http_abnormal_rate", "http_p95_ms")}
+    with _pytest.raises(_vm_ops.VmOpsError, match="no requests in its window"):
+        probe.collect(now=clock.value)
+    # A gap in the 66 counter history: no 10-15 minute baseline, no judgement.
+    probe, ops, remote, clock = _vm_probe(tmp_path / "c", reads=1)
+    with _pytest.raises(_vm_ops.VmOpsError, match="no tunnel counter sample 600-900s"):
+        probe.collect(now=clock.value)
+
+
+def test_vm_domain_floor_follows_the_loadgen_hour_table() -> None:
+    # entrypoint.sh: TROUGH + ((PEAK-TROUGH)*pct + 50)/100, KST hour.
+    assert [vm_domain_target_rps(hour, _LOADGEN_ENV) for hour in (4, 10, 16)] == [5, 18, 30]
+    assert vm_domain_rps_floor(datetime(2026, 11, 20, 7, 30, tzinfo=timezone.utc), _LOADGEN_ENV) == 15.0  # 16 KST
+    assert vm_domain_rps_floor(datetime(2026, 11, 19, 19, 30, tzinfo=timezone.utc), _LOADGEN_ENV) == 2.5   # 04 KST
+    with _pytest.raises(_vm_ops.VmOpsError, match="PEAK_RPS"):
+        vm_domain_target_rps(3, "LOADGEN_SEED=42")

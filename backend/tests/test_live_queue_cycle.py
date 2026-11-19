@@ -2685,3 +2685,79 @@ async def test_cycle_injection_records_the_archive_state_it_started_on(tmp_path:
     assert state.phase == "running"
     recorded = json.loads((runner.artifact_store.root / state.current_run_id / "archive_state.json").read_text())
     assert recorded["passes"] is True and recorded["facts"]["host"] == "db01"
+
+
+# --- VM testbed (civil-petition) at the buffer gate (spec-testbed-vm-3tier §6-4, §6-6) ---------------------------
+
+class _ObsProbe:
+    def __init__(self, obs: dict) -> None:
+        self.obs = dict(obs)
+        self.calls = 0
+
+    def collect(self, *, now):
+        self.calls += 1
+        return dict(self.obs)
+
+
+def _vm_cycle_queue(tmp_path: Path):
+    queue, runner, coordinator, scheduler, clock = make_cycle_queue(tmp_path)
+    document = json.loads(runner.scenario_metadata_path.read_text())
+    for entry in document["scenarios"].values():
+        entry["domain"] = "civil-petition"
+    runner.scenario_metadata_path.write_text(json.dumps(document), encoding="utf-8")
+    return queue, runner, coordinator, scheduler, clock
+
+
+@pytest.mark.asyncio
+async def test_cycle_buffer_gate_judges_a_vm_domain_scenario_on_its_own_signals(tmp_path: Path) -> None:
+    from tests.test_preflight import VM_CLEAN
+
+    queue, runner, _, _, clock = _vm_cycle_queue(tmp_path)
+    default = _ObsProbe({})  # would raise in build_preflight_checks if it were used
+    vm_probe = _ObsProbe(VM_CLEAN)
+    queue.preflight_probe = default
+    queue.domain_preflight_probes = {"civil-petition": vm_probe}
+    pods = []
+    queue.domain_pods_probe = lambda: pods.append(1) or "1 of 31 app pods not Ready: x"
+    queue.vm_domain_state = lambda: None
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    assert vm_probe.calls == 1 and default.calls == 0 and pods == []
+    verdict = json.loads((runner.artifact_store.root / state.current_run_id / "preflight.json").read_text())
+    assert verdict["verdict"] == "clean"
+    assert "tunnel_load_mbps" in {check["name"] for check in verdict["checks"]}
+
+
+@pytest.mark.asyncio
+async def test_cycle_buffer_gate_pauses_on_vm_drift_and_restarts_on_a_dirty_vm_gate(tmp_path: Path) -> None:
+    from app.live_queue import VM_DOMAIN_STATE_CHECK_NAME
+    from tests.test_preflight import VM_CLEAN
+
+    queue, runner, _, _, clock = _vm_cycle_queue(tmp_path)
+    vm_probe = _ObsProbe(VM_CLEAN)
+    queue.domain_preflight_probes = {"civil-petition": vm_probe}
+    answers = ["loadgen loadgen.service inactive"]
+    queue.vm_domain_state = lambda: answers[0]
+    await queue.start()
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "cycle_buffer"
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == [] and vm_probe.calls == 0
+    assert f"{VM_DOMAIN_STATE_CHECK_NAME}: loadgen loadgen.service inactive" in (state.reason or "")
+
+    # A dirty VM gate (a management connection reopened 10 minutes ago) restarts the cycle like any dirty gate.
+    answers[0] = None
+    vm_probe.obs = {**VM_CLEAN, "mgmt_ssh_settle_sec": 600}
+    await queue.resume()
+    reasons = []
+    for _ in range(8):
+        state = await queue.tick()
+        reasons.append(state.reason or "")
+        if vm_probe.calls:
+            break
+        clock.value = max(clock.value, state_expected(state))
+    assert vm_probe.calls == 1 and runner.started == []
+    assert state.phase == "cycle_reset", state.phase
+    assert "mgmt_ssh_settle_sec=600 (fail, gte 1800)" in reasons[-1], reasons

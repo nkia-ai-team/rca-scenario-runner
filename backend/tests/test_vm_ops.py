@@ -1,0 +1,398 @@
+"""app.vm_ops: the runner's management-network ssh common part for the VM testbed (spec-testbed-vm-3tier §6-2,
+§6-4, §6-6). New module, so a new suite: the always-open connections, the periodic read, the 66 facts, the db01
+archive line hand-off and the drift verdict."""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import shutil
+import subprocess
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from app import vm_ops
+from app.vm_ops import (
+    HOSTS,
+    HOSTS_BY_NAME,
+    MasterSupervisor,
+    VmOps,
+    VmOpsError,
+    chrony_offset_ms,
+    cpu_busy_percent,
+    executor_argv,
+    master_argv,
+    parse_read,
+    read_stdin,
+)
+
+NOW = datetime(2026, 11, 20, 6, 0, tzinfo=timezone.utc)
+CHRONY_OK = "7F7F0101,192.168.127.1,3,1795076000.1,-0.000012345,0.000001,0.00002,-3.1,0.001,0.02,0.0003,0.0001,64.2,Normal"
+
+
+class Clock:
+    def __init__(self, value: datetime = NOW) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
+
+
+def _read_output(host, *, at: datetime = NOW, units: dict | None = None, sums: dict | None = None,
+                 drift: tuple = (), guards: tuple = (0, 0), chrony: str = CHRONY_OK,
+                 procstat: str = "cpu  100 0 100 800 0 0 0 0 0 0", files: dict | None = None,
+                 hostname: str | None = None, end: bool = True) -> str:
+    lines = [f"@@ at {at.strftime('%Y-%m-%dT%H:%M:%SZ')}", f"@@ host {hostname or host.name}"]
+    for unit in host.units:
+        lines.append(f"@@ unit {unit} {(units or {}).get(unit, 'active')}")
+    default_sums = {"/var/lib/petition-deploy/war.sha256": "rc=0" if host.role == "was" else "missing",
+                    "/var/lib/petition-deploy/expected.sha256": "rc=0"}
+    for record, verdict in {**default_sums, **(sums or {})}.items():
+        lines.append(f"@@ sums {record} {verdict}")
+    lines += [f"@@ drift {path}" for path in drift]
+    lines.append(f"@@ guards {guards[0]} {guards[1]}")
+    lines.append(f"@@ chrony {chrony}")
+    lines.append(f"@@ procstat {procstat}")
+    for label, _ in host.files:
+        content = (files or {}).get(label)
+        payload = "-" if content is None else base64.b64encode(content.encode()).decode()
+        lines.append(f"@@ file {label} {payload}")
+    if end:
+        lines.append("@@ end")
+    return "\n".join(lines) + "\n"
+
+
+class FakeRemote:
+    """Answers executor-form ssh calls by management address and the 66 helper call."""
+
+    def __init__(self) -> None:
+        self.outputs: dict[str, str | Exception] = {host.address: _read_output(host) for host in HOSTS}
+        self.hypervisor: dict | Exception = _hypervisor()
+        self.helper_expected = {"t4-hv-exec": "a" * 64, "t4-hv-exec-root": "b" * 64}
+        self.calls: list[tuple[list[str], bytes | None]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((list(argv), kwargs.get("input")))
+        if "--expected-sha256" in argv:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.helper_expected), "")
+        if argv[-1] == "facts":
+            if isinstance(self.hypervisor, Exception):
+                return subprocess.CompletedProcess(argv, 255, "", str(self.hypervisor))
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.hypervisor) + "\n", "")
+        target = next(item for item in argv if item.startswith("opsjob@"))
+        output = self.outputs[target.split("@", 1)[1]]
+        if isinstance(output, Exception):
+            return subprocess.CompletedProcess(argv, 255, b"", str(output).encode())
+        return subprocess.CompletedProcess(argv, 0, output.encode(), b"")
+
+
+def _hypervisor(at: datetime = NOW, *, rx: int = 0, tx: int = 0, sha: dict | None = None, guards: int = 0) -> dict:
+    return {
+        "at": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "handshake_age_sec": 12,
+        "ping": {"sent": 10, "received": 10, "max_ms": 1.4},
+        "wg_rx_bytes": rx,
+        "wg_tx_bytes": tx,
+        "guards_active": guards,
+        "helper_sha256": sha or {"t4-hv-exec": "a" * 64, "t4-hv-exec-root": "b" * 64},
+    }
+
+
+def _ops(tmp_path: Path, remote: FakeRemote, clock: Clock | None = None, **kwargs) -> VmOps:
+    clock = clock or Clock()
+    return VmOps(
+        process_runner=remote,
+        clock=clock,
+        state_dir=tmp_path / "vm-ops",
+        archive_state_dir=tmp_path / "petition-archive",
+        hypervisor_target="opsview@192.168.122.1",
+        supervisor=MasterSupervisor(process_runner=remote, clock=clock, state_dir=tmp_path / "vm-ops",
+                                    control_dir=tmp_path / "cm", popen=lambda *a, **k: None),
+        **kwargs,
+    )
+
+
+def test_executor_form_is_the_shared_contract() -> None:
+    """The executors (testbed-services T4S) build the same argv: the always-open socket when it is there, an own
+    connection when it is not (ControlMaster=no), the executor account, and nothing but `sudo -n bash -s`."""
+    argv = executor_argv(HOSTS_BY_NAME["db01"])
+    assert argv[0] == "/usr/bin/ssh"
+    assert argv[-5:] == ["opsjob@192.168.127.41", "sudo", "-n", "bash", "-s"]
+    assert ["-i", "/root/.ssh/vm-ops/t4-executor"] == argv[1:3]
+    assert "ControlMaster=no" in argv and "ControlPath=/run/opsjob-ssh/%r@%h:%p" in argv
+    assert "BatchMode=yes" in argv and "StrictHostKeyChecking=yes" in argv
+    master = master_argv(HOSTS_BY_NAME["db01"])
+    assert "-M" in master and "-N" in master and "ServerAliveInterval=30" in master
+    assert "ControlPath=/run/opsjob-ssh/%r@%h:%p" in master and master[-1] == "opsjob@192.168.127.41"
+    # Every VM is reached on its management address only (§3-5 rule 4), the router on its management NIC.
+    assert {host.name: host.address for host in HOSTS} == {
+        "rt-core01": "192.168.127.2", "web01": "192.168.127.21", "was01": "192.168.127.31",
+        "was02": "192.168.127.32", "db01": "192.168.127.41", "loadgen": "192.168.127.10",
+    }
+
+
+def test_control_master_no_falls_back_to_an_own_connection_when_the_socket_is_gone(tmp_path: Path) -> None:
+    """Real OpenSSH: with ControlMaster=no and no socket, ssh goes on to connect by itself (so a cleanup reaches
+    the VM even with the master dead) instead of failing on the missing socket."""
+    assert shutil.which("ssh") is not None, "the runner image and 104 both carry an OpenSSH client"
+    result = subprocess.run(
+        ["ssh", "-v", "-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", f"ControlPath={tmp_path}/none",
+         "-o", "ConnectTimeout=2", "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={tmp_path}/kh",
+         "-p", "1", "nobody@127.0.0.1", "true"],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode != 0
+    assert "Connecting to 127.0.0.1" in result.stderr, result.stderr[-500:]
+
+
+def test_read_body_runs_under_bash_and_parses(tmp_path: Path) -> None:
+    """The read body is plain bash: run it for real with stand-ins for the system tools and parse the answer."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stubs = {
+        "hostname": "echo db01",
+        "systemctl": 'if [[ "$1" == is-active ]]; then echo active; else :; fi',
+        "chronyc": f"echo '{CHRONY_OK}'",
+    }
+    for name, body in stubs.items():
+        path = bin_dir / name
+        path.write_text(f"#!/usr/bin/env bash\n{body}\n")
+        path.chmod(0o755)
+    facts_file = tmp_path / "last.json"
+    facts_file.write_text('{"host": "db01", "at": "2026-11-20T05:35:00Z"}\n')
+    host = vm_ops.VmHost("db01", "x", "db", ("postgresql@16-main.service",), (("archive_state", str(facts_file)),))
+    result = subprocess.run(
+        ["bash", "-s"], input=read_stdin(host), capture_output=True, timeout=20,
+        env={"PATH": f"{bin_dir}:{os.environ['PATH']}", "LC_ALL": "C"},
+    )
+    assert result.returncode == 0, result.stderr
+    facts = parse_read(host, result.stdout.decode())
+    assert facts.units == {"postgresql@16-main.service": "active"}
+    assert facts.chrony == CHRONY_OK
+    assert len(facts.procstat) >= 8
+    assert json.loads(facts.files["archive_state"])["host"] == "db01"
+    # The sudo command line carries nothing: the arguments ride on stdin's `set --` line.
+    assert read_stdin(host).startswith(b"set -- postgresql@16-main.service -- archive_state=")
+
+
+def test_parse_rejects_a_cut_read_or_the_wrong_vm() -> None:
+    host = HOSTS_BY_NAME["web01"]
+    with pytest.raises(VmOpsError, match="did not finish"):
+        parse_read(host, _read_output(host, end=False))
+    with pytest.raises(VmOpsError, match="answered as 'was01'"):
+        parse_read(host, _read_output(host, hostname="was01"))
+
+
+def test_clock_and_cpu_arithmetic() -> None:
+    assert chrony_offset_ms(CHRONY_OK) == pytest.approx(0.012345)
+    with pytest.raises(VmOpsError, match="not synchronised"):
+        chrony_offset_ms(CHRONY_OK.replace("Normal", "Not synchronised"))
+    # 8 fields count; guest and guest_nice (already inside user and nice) do not.
+    older = [100, 0, 100, 800, 0, 0, 0, 0, 0, 0]
+    newer = [400, 0, 200, 1100, 100, 0, 0, 0, 999, 0]
+    assert cpu_busy_percent(older, newer) == pytest.approx(100 * 400 / 800)
+    with pytest.raises(VmOpsError, match="backwards"):
+        cpu_busy_percent(newer, older)
+
+
+def test_supervisor_opens_dead_masters_records_the_time_and_reopens_after_a_drop(tmp_path: Path) -> None:
+    clock = Clock()
+    alive: set[str] = set()
+    opened: list[str] = []
+
+    class Process:
+        def __init__(self, address: str) -> None:
+            self.address = address
+            self.terminated = False
+
+        def poll(self):
+            return None if self.address in alive else 255
+
+        def terminate(self):
+            self.terminated = True
+            alive.discard(self.address)
+
+        def wait(self, timeout=None):
+            return 0
+
+    processes: list[Process] = []
+
+    def popen(argv, **kwargs):
+        address = argv[-1].split("@", 1)[1]
+        opened.append(address)
+        alive.add(address)
+        process = Process(address)
+        processes.append(process)
+        return process
+
+    def check(argv, **kwargs):
+        address = argv[-1].split("@", 1)[1]
+        return subprocess.CompletedProcess(argv, 0 if address in alive else 255, "", "")
+
+    supervisor = MasterSupervisor(popen=popen, process_runner=check, clock=clock, state_dir=tmp_path / "s",
+                                  control_dir=tmp_path / "cm", sleep=lambda _: None)
+    status = supervisor.ensure()
+    assert sorted(opened) == sorted(host.address for host in HOSTS)
+    assert all(item["alive"] and item["opened_at"] == "2026-11-20T06:00:00Z" for item in status.values())
+    assert oct((tmp_path / "cm").stat().st_mode & 0o777) == "0o700"
+    assert json.loads((tmp_path / "s" / "masters.json").read_text())["db01"]["alive"] is True
+
+    clock.value += timedelta(minutes=40)
+    supervisor.ensure()  # all alive: nothing reopened, opened_at kept
+    assert len(opened) == 6 and supervisor.snapshot()["db01"]["opened_at"] == "2026-11-20T06:00:00Z"
+
+    alive.discard("192.168.127.41")  # the db01 connection dropped
+    supervisor.ensure()
+    assert opened[-1] == "192.168.127.41" and len(opened) == 7
+    assert supervisor.snapshot()["db01"]["opened_at"] == "2026-11-20T06:40:00Z"
+    assert supervisor.snapshot()["web01"]["opened_at"] == "2026-11-20T06:00:00Z"
+
+    supervisor.stop()  # ends the six live masters it started (the dropped one had already ended)
+    assert alive == set()
+    assert [process.terminated for process in processes].count(True) == 6
+    assert processes[4].address == "192.168.127.41" and processes[4].terminated is False
+    assert all(not item["alive"] for item in supervisor.snapshot().values())
+
+
+def test_supervisor_reports_why_a_master_did_not_open(tmp_path: Path) -> None:
+    class Dead:
+        def poll(self):
+            return 255
+
+        def terminate(self):
+            pass
+
+    def popen(argv, stderr=None, **kwargs):
+        stderr.write("opsjob@192.168.127.2: Permission denied (publickey).\n")
+        return Dead()
+
+    supervisor = MasterSupervisor(
+        hosts=[HOSTS_BY_NAME["rt-core01"]], popen=popen,
+        process_runner=lambda argv, **k: subprocess.CompletedProcess(argv, 255, "", ""),
+        clock=Clock(), state_dir=tmp_path / "s", control_dir=tmp_path / "cm", sleep=lambda _: None,
+    )
+    status = supervisor.ensure()["rt-core01"]
+    assert status["alive"] is False and status["opened_at"] is None
+    assert "Permission denied (publickey)" in status["detail"]
+
+
+def test_periodic_read_records_every_vm_and_66_and_hands_db01_line_over_unchanged(tmp_path: Path) -> None:
+    remote = FakeRemote()
+    line = '{"host": "db01", "at": "2026-11-20T05:35:02Z", "db": {"rows": {"petition": 2080000}}}'
+    remote.outputs["192.168.127.41"] = _read_output(HOSTS_BY_NAME["db01"], files={"archive_state": line})
+    remote.outputs["192.168.127.21"] = RuntimeError("ssh: connect to host 192.168.127.21 port 22: No route to host")
+    ops = _ops(tmp_path, remote)
+    document = ops.read_all()
+    # One VM down does not stop the others; its error is kept word for word.
+    assert document["hosts"]["web01"]["last_error"]["detail"].endswith("No route to host")
+    assert document["hosts"]["db01"]["facts"]["units"]["postgresql@16-main.service"] == "active"
+    assert document["hosts"]["rt-core01"]["cpu_history"][0]["procstat"][:4] == [100, 0, 100, 800]
+    assert (tmp_path / "petition-archive" / "last.json").read_text() == line + "\n"
+    assert document["hypervisor"]["history"][-1]["handshake_age_sec"] == 12
+    # Every VM call is the executor form over the socket with `sudo -n bash -s` and the body on stdin.
+    vm_calls = [(argv, stdin) for argv, stdin in remote.calls if any(a.startswith("opsjob@") for a in argv)]
+    assert len(vm_calls) == 6
+    assert all(argv[-4:] == ["sudo", "-n", "bash", "-s"] and stdin.startswith(b"set -- ") for argv, stdin in vm_calls)
+    assert all("ControlMaster=no" in argv for argv, _ in vm_calls)
+    # Nothing the read sends names a scenario, the testbed or the injection tooling (principle 8).
+    for _, stdin in vm_calls:
+        text = stdin.decode().lower()
+        for word in ("scenario", "testbed", "t4", "inject"):
+            assert word not in text, word
+
+    # A db01 line that is not JSON does not replace the good one.
+    remote.outputs["192.168.127.41"] = _read_output(HOSTS_BY_NAME["db01"], files={"archive_state": "{broken"})
+    ops.read_all()
+    assert (tmp_path / "petition-archive" / "last.json").read_text() == line + "\n"
+
+
+def test_hypervisor_history_is_capped_and_its_errors_are_recorded(tmp_path: Path) -> None:
+    remote = FakeRemote()
+    clock = Clock()
+    ops = _ops(tmp_path, remote, clock)
+    for index in range(vm_ops.HYPERVISOR_HISTORY + 3):
+        remote.hypervisor = _hypervisor(clock.value, rx=index)
+        ops.hypervisor_facts()
+        clock.value += timedelta(minutes=5)
+    history = ops.load()["hypervisor"]["history"]
+    assert len(history) == vm_ops.HYPERVISOR_HISTORY and history[-1]["wg_rx_bytes"] == vm_ops.HYPERVISOR_HISTORY + 2
+    remote.hypervisor = RuntimeError("refused: unknown verb")
+    document = ops.read_all()
+    assert "refused: unknown verb" in document["hypervisor"]["last_error"]["detail"]
+    remote.hypervisor = {k: v for k, v in _hypervisor().items() if k != "helper_sha256"}
+    with pytest.raises(VmOpsError, match="lacks helper_sha256"):
+        ops.hypervisor_facts()
+
+
+def test_drift_detail_names_what_differs_and_leaves_stale_reads_to_preflight(tmp_path: Path) -> None:
+    remote = FakeRemote()
+    clock = Clock()
+    ops = _ops(tmp_path, remote, clock)
+    ops.read_all()
+    assert ops.drift_detail() is None
+
+    remote.outputs["192.168.127.31"] = _read_output(
+        HOSTS_BY_NAME["was01"], units={"tomcat10.service": "inactive"},
+        sums={"/var/lib/petition-deploy/war.sha256": "rc=1"}, drift=("petition.war",),
+    )
+    remote.outputs["192.168.127.2"] = _read_output(
+        HOSTS_BY_NAME["rt-core01"], sums={"/var/lib/petition-deploy/expected.sha256": "missing"},
+    )
+    remote.hypervisor = _hypervisor(sha={"t4-hv-exec": "c" * 64, "t4-hv-exec-root": "b" * 64})
+    ops.read_all()
+    detail = ops.drift_detail()
+    assert "was01 tomcat10.service inactive" in detail
+    assert "was01 /var/lib/petition-deploy/war.sha256 rc=1" in detail
+    assert "was01 changed since install: petition.war" in detail
+    assert "rt-core01 /var/lib/petition-deploy/expected.sha256 missing" in detail
+    assert "hypervisor t4-hv-exec installed cccccccccccc != repository aaaaaaaaaaaa" in detail
+    # A WAR record is required only on the WAS pair (web01 has none and passes).
+    assert "web01" not in detail
+
+    # Stale reads say nothing here (preflight refuses them with the read error).
+    clock.value += timedelta(seconds=vm_ops.FACTS_MAX_AGE_SEC + 1)
+    assert ops.drift_detail() is None
+
+
+def test_get_vm_ops_is_off_unless_enabled(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(vm_ops, "_ops", None)
+    monkeypatch.setattr(vm_ops, "_service", None)
+    monkeypatch.delenv("CIVIL_PETITION_OPS", raising=False)
+    assert vm_ops.get_vm_ops() is None and vm_ops.get_vm_ops_service() is None
+    monkeypatch.setenv("CIVIL_PETITION_OPS", "on")
+    monkeypatch.setenv("PETITION_ARCHIVE_STATE_DIR", str(tmp_path / "archive"))
+    ops = vm_ops.get_vm_ops()
+    assert ops is not None and ops.archive_state_dir == tmp_path / "archive"
+    assert vm_ops.get_vm_ops_service().ops is ops
+
+
+@pytest.mark.asyncio
+async def test_service_checks_masters_reads_periodically_and_stops_its_masters(tmp_path: Path) -> None:
+    events: list[str] = []
+
+    class Supervisor:
+        def ensure(self):
+            events.append("check")
+
+        def stop(self):
+            events.append("stop")
+
+    class Ops:
+        supervisor = Supervisor()
+
+        def read_all(self):
+            events.append("read")
+
+    ticks = iter([0.0, 0.0, 10.0, 10.0, 400.0, 400.0, 400.0, 400.0] + [400.0] * 50)
+    service = vm_ops.VmOpsService(Ops(), check_interval_sec=0.01, read_interval_sec=300, monotonic=lambda: next(ticks))
+    service.ensure_started()
+    for _ in range(100):
+        if events.count("read") >= 2:
+            break
+        await asyncio.sleep(0.01)
+    await service.stop()
+    assert events[0] == "check" and events.count("read") >= 2 and events[-1] == "stop"
+    assert events.count("check") >= 3

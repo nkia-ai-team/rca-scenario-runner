@@ -2319,3 +2319,93 @@ def test_testbed_pods_not_ready_names_every_pod_that_is_not() -> None:
     assert testbed_pods_not_ready(refused) == (
         "could not list the testbed pods: CalledProcessError: The connection to the server was refused"
     )
+
+
+# --- VM testbed (civil-petition): testbed-services docs/spec-testbed-vm-3tier.md §6-6 live_probes row ------------
+
+class _VmFakes(Fakes):
+    """Answers the executor-form calls on the VM testbed (opsjob over the shared socket, body on stdin)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entry_status = "200"
+        self.vm_live = {
+            "domain": "civil-petition", "unit": "loadgen", "achieved_rps": 17.0, "http_count": 900,
+            "http_abnormal_rate": 0.0, "http_p95_ms": 9.0, "business_ok": True, "entry_status": 200,
+            "observed_at": NOW.isoformat(),
+        }
+
+    def process(self, argv, **kwargs):
+        argv = list(argv)
+        if any(item.startswith("opsjob@") for item in argv):
+            self.process_calls.append((argv, kwargs))
+            body = kwargs["input"].decode()
+            if body.startswith("cat -- /tmp/k6-civil-petition-live.json"):
+                return subprocess.CompletedProcess(argv, 0, json.dumps(self.vm_live).encode(), b"")
+            if body.startswith("curl "):
+                return subprocess.CompletedProcess(argv, 0, self.entry_status.encode(), b"")
+            if body.startswith("set -- "):
+                return subprocess.CompletedProcess(
+                    argv, 0, b'{"active":false,"clean":true,"filesystem_used_percent":41,"disk_io_utilization":3}\n', b"")
+            raise AssertionError(body)
+        return super().process(argv, **kwargs)
+
+
+def test_vm_domain_baseline_document_is_read_over_the_management_socket(tmp_path) -> None:
+    """The civil-petition loadgen is a VM on its own management network: the runner reads its summary as the
+    executor account over the always-open connection, never as nkia@ with tb_key."""
+    from app.live_probes import APPROVED_LOADGEN_DOMAINS
+
+    assert "civil-petition" in APPROVED_LOADGEN_DOMAINS
+    fakes = _VmFakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    observation = probes.observe(
+        registry.bind({"query_id": "loadgen.achieved_rps", "parameters": {"domain": "civil-petition"}})
+    )
+    assert observation["quality"] == "good" and observation["value"] == 17.0
+    assert observation["source"] == "k6:baseline:civil-petition:achieved_rps"
+    calls = [(argv, kwargs) for argv, kwargs in fakes.process_calls if "opsjob@192.168.127.10" in argv]
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert argv[-4:] == ["sudo", "-n", "bash", "-s"] and "ControlMaster=no" in argv
+    assert kwargs["input"] == b"cat -- /tmp/k6-civil-petition-live.json\n"
+    assert not any("tb_key" in item or item.startswith("nkia@") for argv, _ in calls for item in argv)
+    # Same freshness and identity rules as every baseline document.
+    fakes.vm_live["domain"] = "commerce"
+    foreign = probes.observe(registry.bind({"query_id": "loadgen.achieved_rps", "parameters": {"domain": "civil-petition"}}))
+    assert foreign["quality"] != "good" and foreign.get("value") is None
+
+
+def test_vm_entry_health_runs_on_the_loadgen_vm(tmp_path) -> None:
+    from app.live_probes import VM_DOMAIN_ENTRY_URL
+
+    assert VM_DOMAIN_ENTRY_URL == "http://192.168.124.11:80/petition"
+    fakes = _VmFakes()
+    probes = _probes(tmp_path, fakes)
+    assert probes.inspect(_eligibility(checks=["vm-entry-health"])).check_results["vm-entry-health"] is True
+    argv, kwargs = fakes.process_calls[-1]
+    assert "opsjob@192.168.127.10" in argv
+    assert kwargs["input"] == b"curl -sS -m 5 -o /dev/null -w '%{http_code}' http://192.168.124.11:80/petition/api/health\n"
+    fakes.entry_status = "503"
+    assert probes.inspect(_eligibility(checks=["vm-entry-health"])).check_results["vm-entry-health"] is False
+    # No HTTP from the runner itself: the business networks are not reachable from tb-ops.
+    assert not any("192.168.124.11" in url for _, url, _ in fakes.http_calls)
+
+
+def test_vm_host_probe_uses_the_management_socket(tmp_path, monkeypatch) -> None:
+    """A host probe on a VM of the VM testbed goes over the approved management address as the executor account;
+    the Kubernetes workers keep their nkia@ form."""
+    from app import live_probes
+    from app.live_probes import APPROVED_VM_HOSTS
+
+    assert APPROVED_VM_HOSTS["db01"] == "192.168.127.41"
+    monkeypatch.setitem(live_probes.HOST_PROBE_CONTRACTS, "F99-X", ("192.168.127.41", "fio", "/pgdata"))
+    fakes = _VmFakes()
+    probes = _probes(tmp_path, fakes, scenario_id="F99-X")
+    registry = ApprovedQueryRegistry.from_path()
+    observation = probes.observe(registry.bind({"query_id": "host.scenario_active", "parameters": {"scenario_id": "F99-X"}}))
+    assert observation["quality"] == "good" and observation["value"] is False
+    argv, kwargs = fakes.process_calls[-1]
+    assert "opsjob@192.168.127.41" in argv and argv[-4:] == ["sudo", "-n", "bash", "-s"]
+    assert kwargs["input"].startswith(b"set -- fio /pgdata\n")

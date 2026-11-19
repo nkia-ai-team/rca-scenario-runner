@@ -51,12 +51,15 @@ from app.pass_mode import (
     protection_window_enabled,
 )
 from app.preflight import (
+    DOMAIN_REQUIRED_SIGNALS,
     AiJudge,
     PreflightVerdict,
     build_preflight_checks,
     evaluate_preflight,
 )
 from app.runner import ScenarioRunner, get_runner
+from app.preflight_probe import vm_domain_probes
+from app.vm_ops import get_vm_ops
 from app import seasonal_window
 
 
@@ -148,6 +151,12 @@ DOMAIN_PODS_RECHECK = timedelta(seconds=30)
 # and resume, an operator stop) and a new not-Ready answer starts a new grace (review rv-orafix R2-M1).
 DOMAIN_PODS_HOLD_GAP = DOMAIN_PODS_RECHECK * 3
 ORACLE_CHECK_DEFAULT_PERIOD = timedelta(hours=6)
+# Traditional VM testbed (testbed-services docs/spec-testbed-vm-3tier.md §6-4 "버전 표류", §6-6 live_queue row): right
+# before one of its injections, every VM runs what the install left (WAR and placed files match their install-time
+# checksums, the role services are active, 66's helper is the repository's). The kubernetes counterpart is the
+# image drift check; a decoy deployment (U7) or a cleanup that did not finish leaves exactly this. Never
+# transient: a person has to put the file or the service back, so the queue pauses with what differs.
+VM_DOMAIN_STATE_CHECK_NAME = "vm_domain_state"
 
 
 def oracle_check_max_age(period: timedelta) -> timedelta:
@@ -597,8 +606,17 @@ class LiveScenarioQueue:
         archive_state_dir: Path | None = None,
         archive_state_max_facts_age: timedelta = ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE,
         domain_pods_probe: "Callable[[], str | None] | None" = None,
+        domain_preflight_probes: "Mapping[str, PreflightProbe] | None" = None,
+        vm_domain_state: "Callable[[], str | None] | None" = None,
     ) -> None:
         self.runner = runner
+        # Per-domain preflight probes (spec-testbed-vm-3tier §6-4): a scenario of a domain listed here is judged on
+        # that domain's signal set (app.preflight DOMAIN_REQUIRED_SIGNALS). A scenario of a domain that has its own
+        # set but no probe here fails the gate (never judged on another domain's signals).
+        self.domain_preflight_probes = dict(domain_preflight_probes or {})
+        # VM testbed drift and service state right before one of its injections (VM_DOMAIN_STATE_CHECK_NAME):
+        # None while the VMs run what the install left, else what differs. None (no callable) leaves it out.
+        self.vm_domain_state = vm_domain_state
         # None while every testbed app pod is Ready, else what is not. None (no probe) leaves the
         # check out (unit tests, older deployments). Called only right before an injection starts.
         self.domain_pods_probe = domain_pods_probe
@@ -1258,11 +1276,14 @@ class LiveScenarioQueue:
             return deferred, None, None
         # Every domain app pod Ready before this injection (v4 ORAFIX); the previous scenario's
         # cleanup and recovery are done by now, so a pod down here is a broken testbed.
-        verdict_pods, detail = self._domain_pods_gate()
+        verdict_pods, detail = self._domain_pods_gate(scenario_id)
         if verdict_pods == "hold":
             return state, None, None
         if verdict_pods == "pause":
             return self._pause(state, detail or DOMAIN_PODS_CHECK_NAME), None, None
+        vm_state = self._vm_domain_state_blocker(scenario_id)
+        if vm_state is not None:
+            return self._pause(state, vm_state), None, None
         # R6 preflight gate: prove [t1-10m, t1] is clean before injecting.
         short_circuit, verdict = self._preflight_gate(state, scenario_id)
         if short_circuit is not None:
@@ -1616,10 +1637,14 @@ class LiveScenarioQueue:
             self.injection_reserved = False
         return await asyncio.to_thread(self._enter_cycle_running, state, run, verdict)
 
-    def _domain_pods_gate(self) -> tuple[str, str | None]:
+    def _domain_pods_gate(self, scenario_id: str | None = None) -> tuple[str, str | None]:
         """("go", None), ("hold", detail) or ("pause", reason) for the testbed app pods right before an
-        injection (DOMAIN_PODS_* above). Hold keeps the queue in its phase; the next tick asks again."""
+        injection (DOMAIN_PODS_* above). Hold keeps the queue in its phase; the next tick asks again.
+        Kubernetes checks belong to the Kubernetes domains only (spec-testbed-vm-3tier §6-6 live_probes row): a
+        VM testbed scenario does not wait on another testbed's pods (their alarms still reach active_alarms)."""
         if self.domain_pods_probe is None:
+            return "go", None
+        if self._scenario_domain(scenario_id) in DOMAIN_REQUIRED_SIGNALS:
             return "go", None
         now = self.clock.now()
         if self._domain_pods_looked is not None and now - self._domain_pods_looked > DOMAIN_PODS_HOLD_GAP:
@@ -1652,6 +1677,41 @@ class LiveScenarioQueue:
             f"operational readiness failed: {DOMAIN_PODS_CHECK_NAME} ({DOMAIN_PODS_CHECK_NAME}: {detail}; "
             f"not Ready for {int(held.total_seconds())}s, limit {int(DOMAIN_PODS_GRACE.total_seconds())}s)"
         )
+
+    def _scenario_domain(self, scenario_id: str | None) -> str | None:
+        entry = self._scenario_entry(scenario_id)
+        domain = entry.get("domain") if entry else None
+        return domain if isinstance(domain, str) else None
+
+    def _vm_domain_state_blocker(self, scenario_id: str | None) -> str | None:
+        """Pause reason when a VM testbed scenario would start on drifted VMs (VM_DOMAIN_STATE_CHECK_NAME)."""
+        if self._scenario_domain(scenario_id) not in DOMAIN_REQUIRED_SIGNALS:
+            return None
+        if self.vm_domain_state is None:
+            return None
+        try:
+            detail = self.vm_domain_state()
+        except Exception as error:
+            detail = f"state unreadable: {type(error).__name__}: {error}"
+        if detail is None:
+            return None
+        detail = str(detail)[:600]
+        logger.warning("injection refused: %s: %s", VM_DOMAIN_STATE_CHECK_NAME, detail)
+        return f"operational readiness failed: {VM_DOMAIN_STATE_CHECK_NAME} ({VM_DOMAIN_STATE_CHECK_NAME}: {detail})"
+
+    def _preflight_probe_for(self, scenario_id: str | None) -> "tuple[PreflightProbe | None, str | None]":
+        """(probe, domain whose signal set it fills) for the scenario about to inject."""
+        domain = self._scenario_domain(scenario_id)
+        if domain in self.domain_preflight_probes:
+            return self.domain_preflight_probes[domain], domain
+        if domain in DOMAIN_REQUIRED_SIGNALS:
+            return None, domain
+        return self.preflight_probe, None
+
+    def _preflight_applies(self, scenario_id: str | None) -> bool:
+        probe, domain = self._preflight_probe_for(scenario_id)
+        # A domain with its own signal set always goes through the gate: without its probe the gate fails.
+        return probe is not None or domain in DOMAIN_REQUIRED_SIGNALS
 
     def _oracle_check_blocker(self) -> str | None:
         """Pause reason when the banking Oracle check blocks, read right before a cycle injection.
@@ -1688,14 +1748,17 @@ class LiveScenarioQueue:
             return self._pause(state, oracle), None
         # A domain app pod that is not Ready at injection start is a broken testbed, not a scenario
         # effect (none runs yet). Held for the grace first; past it, a person is needed: pause.
-        verdict_pods, detail = self._domain_pods_gate()
+        verdict_pods, detail = self._domain_pods_gate(scenario_id)
         if verdict_pods == "hold":
             return state, None
         if verdict_pods == "pause":
             return self._pause(state, detail or DOMAIN_PODS_CHECK_NAME), None
+        vm_state = self._vm_domain_state_blocker(scenario_id)
+        if vm_state is not None:
+            return self._pause(state, vm_state), None
         # None = decoys off; a list (possibly empty) = decoys on for this cycle.
         decoys = state.cycle_decoys if state.cycle_decoy_seed is not None else None
-        if self.preflight_probe is not None:
+        if self._preflight_applies(scenario_id):
             now = self.clock.now().astimezone(timezone.utc)
             buffer_start = (
                 parse_utc(state.cycle_buffer_started_at, field="cycle_buffer_started_at")
@@ -1704,11 +1767,11 @@ class LiveScenarioQueue:
             )
             try:
                 verdict = self._evaluate_preflight(
-                    now, waited_sec=0, decoys=decoys, buffer_start=buffer_start
+                    now, waited_sec=0, decoys=decoys, buffer_start=buffer_start, scenario_id=scenario_id
                 )
                 if not verdict.is_clean and self._sweep_lingering_incidents(verdict):
                     verdict = self._evaluate_preflight(
-                        now, waited_sec=0, decoys=decoys, buffer_start=buffer_start
+                        now, waited_sec=0, decoys=decoys, buffer_start=buffer_start, scenario_id=scenario_id
                     )
             except Exception as error:
                 return (
@@ -2766,7 +2829,7 @@ class LiveScenarioQueue:
         the queue is waiting for a recheck, has skipped the scenario, or paused.
         With no probe wired the gate is inert: ``(None, None)``.
         """
-        if self.preflight_probe is None:
+        if not self._preflight_applies(scenario_id):
             return None, None
         now = self.clock.now().astimezone(timezone.utc)
         if state.preflight_retry_not_before is not None and now < parse_utc(
@@ -2777,7 +2840,7 @@ class LiveScenarioQueue:
             PREFLIGHT_RECHECK_INTERVAL.total_seconds()
         )
         try:
-            verdict = self._evaluate_preflight(now, waited_sec)
+            verdict = self._evaluate_preflight(now, waited_sec, scenario_id=scenario_id)
         except Exception as error:
             return self._probe_error_wait(state, scenario_id, error, now), None
         if verdict.is_clean:
@@ -2790,7 +2853,7 @@ class LiveScenarioQueue:
         # signal (5xx, p95, dead loadgen, firing alarms) still blocks.
         if self._sweep_lingering_incidents(verdict):
             try:
-                verdict = self._evaluate_preflight(now, waited_sec)
+                verdict = self._evaluate_preflight(now, waited_sec, scenario_id=scenario_id)
             except Exception as error:
                 return self._probe_error_wait(state, scenario_id, error, now), None
             if verdict.is_clean:
@@ -2870,27 +2933,33 @@ class LiveScenarioQueue:
         *,
         decoys: list[DecoyRecord] | None = None,
         buffer_start: datetime | None = None,
+        scenario_id: str | None = None,
     ) -> PreflightVerdict:
         """R6 gate. With decoys in the cycle, a firing alarm that one of them
         explains (its target, inside its time span, decoy finished healthy) is
         not residue: it leaves ``active_alarms`` and is listed in the verdict's
-        ``excused_alarms`` instead. Every other alarm still fails the gate."""
-        assert self.preflight_probe is not None
-        set_filter = getattr(self.preflight_probe, "set_alarm_filter", None)
+        ``excused_alarms`` instead. Every other alarm still fails the gate.
+        The scenario's domain picks the probe and the signal set (_preflight_probe_for)."""
+        probe, domain = self._preflight_probe_for(scenario_id)
+        if probe is None:
+            raise RuntimeError(
+                f"no preflight probe for domain {domain} (its operations are off: CIVIL_PETITION_OPS)"
+            )
+        set_filter = getattr(probe, "set_alarm_filter", None)
         decoy_filter = (
             None if decoys is None else self._decoy_alarm_filter(decoys, now, buffer_start)
         )
         if callable(set_filter):
             set_filter(decoy_filter)
         try:
-            observations = self.preflight_probe.collect(now=now)
+            observations = probe.collect(now=now)
         finally:
             if callable(set_filter):
                 set_filter(None)
         excused = None
         if decoy_filter is not None and callable(set_filter):
-            excused = list(getattr(self.preflight_probe, "last_excused_alarms", None) or [])
-        checks = build_preflight_checks(observations)
+            excused = list(getattr(probe, "last_excused_alarms", None) or [])
+        checks = build_preflight_checks(observations, domain=domain)
         window = (self._format(now - PREFLIGHT_WINDOW_LEAD), self._format(now))
         return evaluate_preflight(
             window=window,
@@ -3407,5 +3476,9 @@ def get_live_queue() -> LiveScenarioQueue:
                 if os.environ.get("DOMAIN_PODS_CHECK", "1").strip().lower() in {"0", "false", "no", "off"}
                 else testbed_pods_not_ready
             ),
+            # VM testbed (civil-petition): its own preflight signals and the drift gate, both off unless
+            # CIVIL_PETITION_OPS is on (app.vm_ops runs the management connections and the periodic read).
+            domain_preflight_probes=vm_domain_probes() if preflight_probe is not None else {},
+            vm_domain_state=(vm_ops.drift_detail if (vm_ops := get_vm_ops()) is not None else None),
         )
     return _queue

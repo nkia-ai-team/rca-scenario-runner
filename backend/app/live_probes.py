@@ -25,6 +25,7 @@ from urllib.parse import urlencode
 
 from app.adaptive_runtime import EligibilityEvidence, EligibilityRequest
 from app.coordinator import CoordinatorState
+from app import vm_ops
 from app.observations import (
     CLOCK_SKEW_TOLERANCE_SEC,
     ApprovedQuery,
@@ -71,7 +72,18 @@ LOADGEN_FIELDS = {
 # blocked F15-G/T3/T4 and forced surge scripts to double as observation vehicles.
 # Deliberately not a new id space: 10 fields x 3 domains would fork LOADGEN_FIELDS,
 # and a forked allowlist is exactly what killed F06-P.
-APPROVED_LOADGEN_DOMAINS = frozenset({"commerce", "core-banking", "food-delivery"})
+APPROVED_LOADGEN_DOMAINS = frozenset({"commerce", "core-banking", "food-delivery", "civil-petition"})
+# Traditional VM testbed (testbed-services docs/spec-testbed-vm-3tier.md §6-6 live_probes row). Its loadgen is a VM on
+# that testbed's management network: the runner reaches it, and every other VM of the domain, only as the executor
+# account over the always-open connection (app.vm_ops), never as nkia@ with tb_key. Kubernetes checks (kube-*,
+# worker placement, the domain pods gate) stay with the Kubernetes domains.
+VM_LOADGEN_DOMAINS = frozenset({vm_ops.DOMAIN})
+# Management address per VM: the only hosts a VM-domain host probe may reach.
+APPROVED_VM_HOSTS = {host.name: host.address for host in vm_ops.HOSTS}
+# The portal's entry as the loadgen calls it (inventory: web01 business address, web_port 80, context petition).
+# The runner cannot reach the business networks (66 drops 192.168.122.0/24 <-> 123~126), so the check runs on the
+# loadgen VM over the management connection.
+VM_DOMAIN_ENTRY_URL = "http://192.168.124.11:80/petition"
 TARGET_HEALTH_URL = "http://192.168.122.77:30080/health"
 PROMETHEUS_URL = os.environ.get(
     "PROMETHEUS_URL", "http://192.168.230.119:18428/api/v1/query"
@@ -151,6 +163,8 @@ APPROVED_CHECK_IDS = frozenset(
         # missing-seed-account outage. See BASELINE_PAID_ORDERS_SQL.
         "baseline-business-success",
         "target-health",
+        # The VM testbed's entry answers its health path (curl from the loadgen VM, VM_DOMAIN_ENTRY_URL).
+        "vm-entry-health",
         # F05-P starves a worker node's memory and then measures the impact on
         # the services that node hosts. If they are not on it, the scenario is
         # a no-op that cannot fail loudly. The manifest has asked for this check
@@ -1098,6 +1112,7 @@ class LiveProbeSet:
             "baseline-traffic": self._baseline_active,
             "baseline-business-success": self._baseline_business_succeeds,
             "target-health": self._target_healthy,
+            "vm-entry-health": self._vm_entry_healthy,
             "worker-cohort-placement": self._worker_cohort_is_placed,
             "db-memory-headroom": self._db_memory_has_headroom,
         }
@@ -1430,6 +1445,30 @@ class LiveProbeSet:
     def _target_healthy(self) -> bool:
         response = self.http_client("GET", TARGET_HEALTH_URL, timeout=5.0)
         return 200 <= int(response["status"]) < 300
+
+    def _vm_read(self, host_name: str, body: bytes) -> bytes:
+        """One read on a VM of the VM testbed, as the executor account over the shared socket."""
+        completed = self.process_runner(
+            vm_ops.executor_argv(vm_ops.HOSTS_BY_NAME[host_name]),
+            input=body,
+            check=True,
+            capture_output=True,
+            text=False,
+            env=_read_only_environment(),
+            timeout=15,
+        )
+        return completed.stdout
+
+    def _vm_entry_healthy(self) -> bool:
+        body = (
+            "curl -sS -m 5 -o /dev/null -w '%{http_code}' "
+            + shlex.quote(f"{VM_DOMAIN_ENTRY_URL}/api/health")
+            + "\n"
+        ).encode()
+        status = self._vm_read("loadgen", body).decode("utf-8", "replace").strip()
+        if not status.isdigit():
+            raise LiveProbeError(f"entry health returned no status: {status[:80]!r}")
+        return 200 <= int(status) < 300
 
     def _overlap_evidence(
         self, start: datetime, end: datetime, *, exclude_run_id: str
@@ -2326,8 +2365,11 @@ class LiveProbeSet:
         if scenario_id not in HOST_PROBE_CONTRACTS:
             raise LiveProbeError("host probe scenario is not allowlisted")
         host, mode, target = HOST_PROBE_CONTRACTS[str(scenario_id)]
+        vm_host = next((name for name, address in APPROVED_VM_HOSTS.items() if address == host), None)
         result = self.process_runner(
-            [
+            vm_ops.executor_argv(vm_ops.HOSTS_BY_NAME[vm_host])
+            if vm_host is not None
+            else [
                 "ssh", "-i", LOADGEN_KEY, "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
                 f"nkia@{host}", "sudo", "bash", "-s",
@@ -2471,6 +2513,10 @@ class LiveProbeSet:
             raise LiveProbeError("baseline summary path escaped the trusted root")
         if local.is_file():
             document = _read_json(local)
+        elif domain in VM_LOADGEN_DOMAINS:
+            # The domain's loadgen VM writes the same summary (testbed-services loadgen_monitor) under the same name.
+            raw = self._vm_read("loadgen", f"cat -- /tmp/k6-{domain}-live.json\n".encode())
+            document = json.loads(raw.decode("utf-8"))
         else:
             completed = self.process_runner(
                 [
