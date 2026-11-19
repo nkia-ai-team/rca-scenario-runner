@@ -2406,6 +2406,8 @@ class LiveScenarioQueue:
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(raw)
+        # The topology collector stops at the same capture_end phases.json names.
+        self._bind_topology_window_end(cooldown_end)
 
     def _cycle_topology_dir(self, state: LiveQueueState) -> Path:
         return (
@@ -2467,6 +2469,17 @@ class LiveScenarioQueue:
         with suppress(Exception):
             collector.stop()
         self._topology_collector = None
+
+    def _bind_topology_window_end(self, capture_end: str) -> None:
+        """Tell this cycle's topology collector where the capture window ends
+        (fail-open). Snapshots after it fall outside the case window, and their
+        24h topology queries overlapped the capture's ClickHouse exports on 119
+        (v4 TOPO). Collectors without the hook keep running as before."""
+        collector = self._topology_collector
+        if collector is None:
+            return
+        with suppress(Exception):
+            collector.set_window_end(parse_utc(capture_end, field="capture_end"))
 
     def _write_topology_bundle_marker(self, run_id: str) -> None:
         """Point the capture invoker at this cycle's topology bundle (fail-open,

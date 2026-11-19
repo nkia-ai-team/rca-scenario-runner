@@ -896,9 +896,13 @@ class FakeTopologyCollector:
         self.started = False
         self.stopped = False
         self.run_id = None
+        self.window_end = None
 
     def start(self) -> None:
         self.started = True
+
+    def set_window_end(self, window_end) -> None:
+        self.window_end = window_end
 
     def stop(self) -> None:
         self.stopped = True
@@ -934,8 +938,15 @@ async def test_cycle_injection_writes_topology_bundle_marker(tmp_path: Path) -> 
     _complete_injection(runner, scheduler, clock, run_id,
                         t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
     state = await queue.tick()  # -> cooldown
+    # v4 TOPO: at cooldown entry the collector is bound to the capture window end
+    # phases.json names, so no snapshot query runs during the capture exports.
+    phases = json.loads((runner.artifact_store.root / run_id / "phases.json").read_text())
+    assert phases["capture_end"] == "2026-07-16T10:45:00Z"
+    assert created[0].window_end == datetime(2026, 7, 16, 10, 45, tzinfo=timezone.utc)
+    assert created[0].stopped is False
     clock.value = state_expected(state)
     await queue.tick()  # -> waiting_capture
+    assert created[0].window_end == datetime(2026, 7, 16, 10, 45, tzinfo=timezone.utc)
     scheduler.jobs[run_id].status = "completed"
     (runner.artifact_store.root / run_id / "capture-complete.json").write_text(
         "{}\n", encoding="utf-8"

@@ -8,6 +8,14 @@ consumers can trust provenance; blanks (all-failed ticks) are recorded too.
 
 Fail-open by design: collector errors never stall the live queue. A failed
 fetch lands in ``manifest.capture_failures`` and the loop keeps going.
+
+Window end (v4 TOPO, 2026-11-19): once the queue knows the capture window end
+(phases.json ``capture_end``) it binds it here, and no tick starts after it. A
+later snapshot lies outside the case window, and those tail ticks ran the 24h
+topology query on 119 ClickHouse (about 760MiB each) while the capture's own
+Parquet exports ran: the 11-17 ClickHouse memory peak was that overlap. Ticks up
+to the window end are unchanged, so the in-window bundle is byte-for-byte the
+same as before.
 """
 from __future__ import annotations
 
@@ -86,6 +94,22 @@ class TopologyCollector:
         # returns, a fetch still in flight cannot write into the bundle dir,
         # which a restarted cycle wipes and reuses.
         self._guard = threading.Lock()
+        self._window_end: datetime | None = None
+
+    def set_window_end(self, window_end: datetime) -> None:
+        """Bind the capture window end. No tick starts after it (second
+        resolution, same as ``captured_at``), and the loop then ends."""
+        if window_end.tzinfo is None:
+            raise ValueError("window_end must be timezone-aware")
+        with self._guard:
+            self._window_end = window_end
+
+    def window_closed(self, now: datetime) -> bool:
+        """Whether a tick at ``now`` would land after the bound window end.
+        Compared at second resolution so a tick whose ``captured_at`` equals
+        the window end still counts as inside, as capture's [t1, t2] check does."""
+        end = self._window_end
+        return end is not None and now.replace(microsecond=0) > end
 
     def set_run_id(self, run_id: str) -> None:
         """Bind the injection run (known only once buffer ends). Persisted on the
@@ -96,6 +120,8 @@ class TopologyCollector:
         """Fetch the graph + service-tree pair once, save raw bytes, and rewrite
         the manifest. Records every attempt; never raises for a fetch failure."""
         now = self._clock.now()
+        if self.window_closed(now):
+            return
         captured_at = _format_utc(now)
         stamp = captured_at.replace(":", "-")
         snapshot: dict = {"snapshot_id": captured_at, "captured_at": captured_at}
@@ -200,6 +226,8 @@ class TopologyCollector:
 
     async def run(self) -> None:
         while not self._stopped:
+            if self.window_closed(self._clock.now()):
+                return  # past the capture window end: nothing left to record
             try:
                 # Off the loop: inline, a slow 119 query API held the runner's
                 # event loop for up to 50s per tick, all through injection.

@@ -183,3 +183,117 @@ async def test_stop_during_an_in_flight_fetch_writes_nothing_after(tmp_path: Pat
     release.set()
     await asyncio.sleep(0.1)
     assert not (tmp_path / "bundle").exists()
+
+
+def test_no_tick_starts_after_the_window_end(tmp_path: Path) -> None:
+    """v4 TOPO: ticks after the capture window end fell outside the case and ran
+    the 24h topology query on 119 ClickHouse during the capture's exports."""
+    clock = FakeClock()
+    fetch = FakeFetch(graph=b'{"nodes":[]}', tree=b'{"tree":[]}')
+    collector = _collector(tmp_path, fetch, clock)
+    collector.set_window_end(clock.value + timedelta(seconds=60))
+
+    collector.collect_once()  # 08:00:00
+    clock.advance(30)
+    collector.collect_once()  # 08:00:30
+    clock.value += timedelta(seconds=30, microseconds=900_000)
+    collector.collect_once()  # 08:01:00.9 -> captured_at equals the end: still inside
+    calls_inside = len(fetch.calls)
+    clock.advance(1)
+    collector.collect_once()  # 08:01:01.9 -> after the end
+    clock.advance(30)
+    collector.collect_once()
+
+    manifest = json.loads((tmp_path / "bundle" / "manifest.json").read_text())
+    assert [s["captured_at"] for s in manifest["snapshots"]] == [
+        "2026-07-16T08:00:00Z",
+        "2026-07-16T08:00:30Z",
+        "2026-07-16T08:01:00Z",
+    ]
+    assert calls_inside == 6
+    assert len(fetch.calls) == calls_inside  # no query at all after the end
+    assert manifest["capture_failures"] == []
+    assert sorted(p.name for p in (tmp_path / "bundle" / "graph").iterdir()) == [
+        "2026-07-16T08-00-00Z-part-001.json",
+        "2026-07-16T08-00-30Z-part-001.json",
+        "2026-07-16T08-01-00Z-part-001.json",
+    ]
+
+
+def test_window_end_must_be_timezone_aware(tmp_path: Path) -> None:
+    import pytest
+
+    collector = _collector(tmp_path, FakeFetch(b"{}", b"{}"), FakeClock())
+    with pytest.raises(ValueError):
+        collector.set_window_end(datetime(2026, 7, 16, 9, 0))
+
+
+def test_window_end_keeps_in_window_bundle_byte_identical(tmp_path: Path) -> None:
+    """The same responses at the same tick times give the same files and
+    manifest entries up to the window end; only the tail after it is gone."""
+    def run(bundle: Path, window_end) -> None:
+        clock = FakeClock()
+        tick = {"n": 0}
+
+        def fetch(url: str) -> tuple[int, bytes]:
+            kind = "graph" if "topology/graph" in url else "tree"
+            return 200, json.dumps({"kind": kind, "tick": tick["n"]}).encode()
+
+        collector = TopologyCollector(bundle_dir=bundle, fetch=fetch, clock=clock)
+        if window_end is not None:
+            collector.set_window_end(window_end)
+        for _ in range(8):
+            collector.collect_once()
+            tick["n"] += 1
+            clock.advance(35)
+
+    end = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc) + timedelta(seconds=35 * 4)
+    run(tmp_path / "old", None)
+    run(tmp_path / "new", end)
+    old = json.loads((tmp_path / "old" / "manifest.json").read_text())
+    new = json.loads((tmp_path / "new" / "manifest.json").read_text())
+    inside = [s for s in old["snapshots"] if s["captured_at"] <= "2026-07-16T08:02:20Z"]
+    assert len(inside) == 5 and len(old["snapshots"]) == 8
+    assert new["snapshots"] == inside
+    assert {k: v for k, v in new.items() if k != "snapshots"} == {
+        k: v for k, v in old.items() if k != "snapshots"
+    }
+    new_files = sorted(
+        p.relative_to(tmp_path / "new")
+        for p in (tmp_path / "new").rglob("*.json")
+        if p.name != "manifest.json"
+    )
+    referenced = {s["graph"][0]["path"] for s in inside} | {s["service_tree"]["path"] for s in inside}
+    assert {str(p) for p in new_files} == referenced
+    for rel in new_files:
+        assert (tmp_path / "new" / rel).read_bytes() == (tmp_path / "old" / rel).read_bytes()
+
+
+async def test_loop_ends_by_itself_after_the_window_end(tmp_path: Path) -> None:
+    import asyncio
+
+    clock = FakeClock()
+    fetch = FakeFetch(graph=b'{"nodes":[]}', tree=b'{"tree":[]}')
+
+    async def sleeper(seconds: float) -> None:
+        clock.advance(int(seconds))
+        await asyncio.sleep(0)
+
+    collector = TopologyCollector(
+        bundle_dir=tmp_path / "bundle", fetch=fetch, clock=clock, interval_sec=30,
+        sleeper=sleeper,
+    )
+    collector.set_window_end(clock.value + timedelta(seconds=90))
+    collector.start()
+    task = collector._task
+    await asyncio.wait_for(task, timeout=5)
+
+    manifest = json.loads((tmp_path / "bundle" / "manifest.json").read_text())
+    assert [s["captured_at"] for s in manifest["snapshots"]] == [
+        "2026-07-16T08:00:00Z",
+        "2026-07-16T08:00:30Z",
+        "2026-07-16T08:01:00Z",
+        "2026-07-16T08:01:30Z",
+    ]
+    assert len(fetch.calls) == 8
+    collector.stop()  # the cycle's own stop stays harmless after the loop ended
