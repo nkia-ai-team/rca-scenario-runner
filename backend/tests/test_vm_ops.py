@@ -406,6 +406,10 @@ def test_get_vm_ops_is_off_unless_enabled(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("PETITION_ARCHIVE_STATE_DIR", str(tmp_path / "archive"))
     ops = vm_ops.get_vm_ops()
     assert ops is not None and ops.archive_state_dir == tmp_path / "archive"
+    # 66 gets a master too (T4S contract 6), with its own account and key.
+    hypervisor = ops.supervisor.hosts[-1]
+    assert [host.name for host in ops.supervisor.hosts] == [*(host.name for host in HOSTS), "pve66"]
+    assert (hypervisor.user, hypervisor.address, hypervisor.key.name) == ("hvjob", "192.168.122.1", "t4-hv")
     assert vm_ops.get_vm_ops_service().ops is ops
 
 

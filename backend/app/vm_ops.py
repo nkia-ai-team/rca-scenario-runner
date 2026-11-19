@@ -31,8 +31,8 @@ as it is into ``PETITION_ARCHIVE_STATE_DIR/last.json``, a file read with no data
 Hypervisor (66). The account there (``hvjob``) runs one forced command, the T4S helper ``t4-hv-exec``, which takes
 its request on stdin's first line. The runner uses its three read verbs (``tunnel``, ``guards``, ``version``,
 each one JSON line) with the periodic read and again right before an injection, and keeps one master to 66 as
-well (fewer login lines; 66's rsyslog filter keeps that account's lines away from 119, §6-2 66 row). 66 is not an
-SMS target, so its master is not part of the six-connection preflight check.
+well: the T4S 66 executors refuse to run without it (66's rsyslog filter keeps that account's lines away from 119,
+§6-2 66 row, but not the nameless session scope lines a new login leaves), and preflight checks it with the six.
 """
 from __future__ import annotations
 

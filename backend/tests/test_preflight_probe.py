@@ -247,8 +247,9 @@ def _vm_probe(tmp_path: _Path, *, answers=None, reads: int = 3, settle_min: int 
                                                         "target_id": _ROUTER_ID}]}))
     ops = _vm_ops.VmOps(
         process_runner=remote, clock=clock, state_dir=tmp_path / "vm-ops", hypervisor_target="hvjob@192.168.122.1",
-        supervisor=_vm_ops.MasterSupervisor(process_runner=remote, clock=clock, state_dir=tmp_path / "vm-ops",
-                                            control_dir=tmp_path / "cm", popen=lambda *a, **k: None),
+        supervisor=_vm_ops.MasterSupervisor(
+            (*_vm_ops.HOSTS, _vm_ops.hypervisor_host("hvjob@192.168.122.1")), process_runner=remote, clock=clock,
+            state_dir=tmp_path / "vm-ops", control_dir=tmp_path / "cm", popen=lambda *a, **k: None),
     )
     for index in range(reads):
         busy, idle = 100 + 250 * index, 800 + 750 * index
@@ -259,7 +260,7 @@ def _vm_probe(tmp_path: _Path, *, answers=None, reads: int = 3, settle_min: int 
         if index < reads - 1:
             clock.value += _timedelta(minutes=5)
     opened = (clock.value - _timedelta(minutes=settle_min)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    ops.supervisor.status = {host.name: {"alive": True, "opened_at": opened, "detail": ""} for host in _vm_ops.HOSTS}
+    ops.supervisor.status = {host.name: {"alive": True, "opened_at": opened, "detail": ""} for host in ops.supervisor.hosts}
     clock.value += _timedelta(minutes=5)  # the injection-time fresh 66 read is 5 minutes after the last periodic one
     remote.hypervisor = _hypervisor(clock.value, rx=30_000_000 * reads, tx=30_000_000 * reads)
     probe = VmDomainPreflightProbe(
@@ -324,6 +325,11 @@ def test_vm_domain_probe_goes_dirty_when_a_management_connection_is_down_or_just
     clock.value += _timedelta(minutes=1, seconds=1)
     remote.hypervisor = _hypervisor(clock.value, rx=90_000_000, tx=90_000_000)
     assert _vm_gate(probe.collect(now=clock.value), clock.value).verdict == "clean"
+    # 66's master counts too (T4S contract 6: the 66 executors need it).
+    assert "pve66" in ops.supervisor.status
+    ops.supervisor.status["pve66"] = {"alive": False, "opened_at": None, "detail": "could not open"}
+    verdict = _vm_gate(probe.collect(now=clock.value), clock.value)
+    assert {c.name for c in verdict.checks if c.status == "fail"} == {"mgmt_ssh_down", "mgmt_ssh_settle_sec"}
 
 
 def test_vm_domain_probe_counts_guards_clock_freshness_and_router_load(tmp_path) -> None:

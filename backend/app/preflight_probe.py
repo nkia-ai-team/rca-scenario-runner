@@ -165,7 +165,7 @@ class ProductionPreflightProbe:
 # - monitoring freshness: 119 VictoriaMetrics (sms.cpu.utilization, sms.server.icmp_status by the agents' host_name,
 #   nms.network.snmp_status of the router's target from the target table).
 # - router CPU, guards, clock: the periodic read (app.vm_ops), two router /proc/stat lines about 5 minutes apart.
-# - management connections: the ControlMaster supervisor (down count, time since the last reopen).
+# - management connections: the ControlMaster supervisor, six VMs and 66 (down count, time since the last reopen).
 # Anything missing or stale raises with the remote's own words, so the gate waits and then pauses with the reason
 # (U3) instead of judging on a guess.
 # ---------------------------------------------------------------------------------------------------------------
@@ -266,9 +266,13 @@ class VmDomainPreflightProbe:
         if sent < TUNNEL_PING_COUNT:
             raise _vm_ops.VmOpsError(f"hypervisor sent {sent} pings, expected {TUNNEL_PING_COUNT}")
         max_ms = ping.get("max_ms")
-        # The six VMs only: 66 is not an SMS target, so its master is not part of this check.
-        vm_names = {host.name for host in self.ops.hosts}
-        masters = {name: status for name, status in self.ops.supervisor.snapshot().items() if name in vm_names}
+        # The six VMs and 66 (T4S contract 6: the 66 executors refuse to run without its master, and a reopen there
+        # leaves session lines 66's filter cannot name, so it gets the same 30-minute settle).
+        masters = self.ops.supervisor.snapshot()
+        expected = {host.name for host in self.ops.supervisor.hosts}
+        missing = expected - set(masters)
+        if missing:
+            raise _vm_ops.VmOpsError(f"no master status for {sorted(missing)}")
         down = sum(1 for status in masters.values() if not status.get("alive"))
         settle = 0.0
         if not down:
