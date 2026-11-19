@@ -265,6 +265,27 @@ def master_check_argv(host: VmHost) -> list[str]:
     return ["/usr/bin/ssh", *ssh_options(key=host.key), "-O", "check", f"{host.user}@{host.address}"]
 
 
+def master_is_up(host: VmHost, process_runner: ProcessRunner = subprocess.run) -> bool | None:
+    """``ssh -O check`` on the host's socket (local, nothing reaches the host): True up, False down, None unknown
+    (the check itself timed out or could not run)."""
+    try:
+        result = process_runner(
+            master_check_argv(host), capture_output=True, text=True, timeout=REMOTE_TIMEOUT_SEC,
+            env=_environment(), check=False,
+        )
+    except Exception:
+        return None
+    return result.returncode == 0
+
+
+def require_master(host: VmHost, process_runner: ProcessRunner = subprocess.run) -> None:
+    """The runner's own reads go only over a live master (review rv-t4r3 R-M1). ControlMaster=no would otherwise
+    log in directly, a new login and a new host_connections row (Q7c) every 5 minutes while the master is down; the
+    read fails instead, the facts go stale and preflight stops the domain."""
+    if master_is_up(host, process_runner) is not True:
+        raise VmOpsError(f"control connection to {host.address} is down; not reading {host.name} without it")
+
+
 def master_exit_argv(host: VmHost) -> list[str]:
     return ["/usr/bin/ssh", *ssh_options(key=host.key), "-O", "exit", f"{host.user}@{host.address}"]
 
@@ -427,14 +448,7 @@ class MasterSupervisor:
         }
 
     def _alive(self, host: VmHost) -> bool:
-        try:
-            result = self.process_runner(
-                master_check_argv(host), capture_output=True, text=True, timeout=REMOTE_TIMEOUT_SEC,
-                env=_environment(), check=False,
-            )
-        except Exception:
-            return False
-        return result.returncode == 0
+        return master_is_up(host, self.process_runner) is True
 
     def socket_path(self, host: VmHost) -> Path:
         """The file ssh makes from CONTROL_PATH (%r@%h:%p) for this target (port 22)."""
@@ -509,7 +523,12 @@ class MasterSupervisor:
         """Check every master and reopen the dead ones. Returns the status (also written to masters.json)."""
         with self._lock:
             for host in self.hosts:
-                if self._alive(host):
+                state = master_is_up(host, self.process_runner)
+                if state is None:
+                    # The check itself timed out: the master may be alive, so its socket must not be removed and
+                    # reopened over (review rv-t4r3 R-L1). Look again on the next round.
+                    continue
+                if state:
                     current = self.status.get(host.name) or {}
                     if current.get("opened_at") is None:
                         # A live socket this process did not open (left by an earlier runner process in the same
@@ -585,6 +604,7 @@ class VmOps:
     # ------------------------------------------------------------------ remote calls
 
     def _remote_read(self, host: VmHost, stdin: bytes) -> str:
+        require_master(host, self.process_runner)
         try:
             result = self.process_runner(
                 executor_argv(host), input=stdin, capture_output=True, timeout=REMOTE_TIMEOUT_SEC,
@@ -636,6 +656,10 @@ class VmOps:
     def _helper(self, verb: str) -> dict[str, Any]:
         """One read verb of the 66 helper (T4S contract 6, 7): the request on stdin's first line, one JSON line back,
         exit 3 refused, 1 failed."""
+        hypervisor = hypervisor_host(self.hypervisor_target)
+        if hypervisor is None:
+            raise VmOpsError("hypervisor target is not configured")
+        require_master(hypervisor, self.process_runner)
         argv = ["/usr/bin/ssh", *ssh_options(key=HYPERVISOR_KEY), "-o", "ControlMaster=no", self.hypervisor_target]
         try:
             result = self.process_runner(

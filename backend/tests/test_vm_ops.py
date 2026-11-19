@@ -72,9 +72,12 @@ class FakeRemote:
         self.outputs: dict[str, str | Exception] = {host.address: _read_output(host) for host in HOSTS}
         self.hypervisor: dict | Exception = _hypervisor()
         self.calls: list[tuple[list[str], bytes | None]] = []
+        self.masters_down: set[str] = set()
 
     def __call__(self, argv, **kwargs):
         self.calls.append((list(argv), kwargs.get("input")))
+        if "-O" in argv:  # master check: up unless the target is listed as down
+            return subprocess.CompletedProcess(argv, 255 if argv[-1].split("@", 1)[1] in self.masters_down else 0, "", "")
         if argv[-1].startswith("hvjob@"):
             if isinstance(self.hypervisor, Exception):
                 return subprocess.CompletedProcess(argv, 3, "", str(self.hypervisor))
@@ -90,8 +93,6 @@ class FakeRemote:
                 "version": {"files": hv.get("helper_sha256", {})} if "helper_sha256" in hv else {},
             }[verb]
             return subprocess.CompletedProcess(argv, 0, json.dumps(answer) + "\n", "")
-        if "-O" in argv:
-            return subprocess.CompletedProcess(argv, 0, "", "")
         target = next(item for item in argv if item.startswith("opsjob@"))
         output = self.outputs[target.split("@", 1)[1]]
         if isinstance(output, Exception):
@@ -333,7 +334,8 @@ def test_periodic_read_records_every_vm_and_66_and_hands_db01_line_over_unchange
     assert (tmp_path / "petition-archive" / "last.json").read_text() == line + "\n"
     assert document["hypervisor"]["history"][-1]["handshake_age_sec"] == 12
     # Every VM call is the executor form over the socket with `sudo -n bash -s` and the body on stdin.
-    vm_calls = [(argv, stdin) for argv, stdin in remote.calls if any(a.startswith("opsjob@") for a in argv)]
+    vm_calls = [(argv, stdin) for argv, stdin in remote.calls
+                if any(a.startswith("opsjob@") for a in argv) and "-O" not in argv]
     assert len(vm_calls) == 6
     assert all(argv[-4:] == ["sudo", "-n", "bash", "-s"] and stdin.startswith(b"set -- ") for argv, stdin in vm_calls)
     assert all("ControlMaster=no" in argv for argv, _ in vm_calls)
@@ -564,3 +566,46 @@ def test_the_66_target_is_fixed_to_the_executors_value() -> None:
     assert "VM_OPS_HYPERVISOR_TARGET" not in inspect.getsource(vm_ops)
     host = vm_ops.hypervisor_host()
     assert (host.user, host.address) == ("hvjob", "192.168.122.1")
+
+
+def test_runner_reads_never_log_in_directly_while_a_master_is_down(tmp_path: Path) -> None:
+    """Review rv-t4r3 R-M1: with ControlMaster=no a read would log in by itself when the master is gone (given up
+    or waiting for its retry), a new login and host_connections row every 5 minutes (Q7c). The runner's reads
+    check the master first and fail instead; the facts go stale and preflight stops the domain."""
+    remote = FakeRemote()
+    remote.masters_down = {host.address for host in HOSTS} | {"192.168.122.1"}
+    ops = _ops(tmp_path, remote)
+    document = ops.read_all()
+    assert [argv for argv, _ in remote.calls if "-O" not in argv] == []
+    for host in HOSTS:
+        assert f"control connection to {host.address} is down" in document["hosts"][host.name]["last_error"]["detail"]
+        assert document["hosts"][host.name].get("facts") is None
+    assert "control connection to 192.168.122.1 is down" in document["hypervisor"]["last_error"]["detail"]
+    with pytest.raises(VmOpsError, match="control connection to 192.168.127.10 is down"):
+        ops.read_loadgen_live()
+    with pytest.raises(VmOpsError, match="control connection to 192.168.122.1 is down"):
+        ops.hypervisor_facts()
+    assert [argv for argv, _ in remote.calls if "-O" not in argv] == []
+    # One master back: only that host is read.
+    remote.masters_down.discard("192.168.127.41")
+    ops.read_all()
+    assert [a for argv, _ in remote.calls if "-O" not in argv for a in argv if a.startswith("opsjob@")] == [
+        "opsjob@192.168.127.41"]
+
+
+def test_a_check_that_times_out_does_not_remove_or_reopen_a_socket(tmp_path: Path) -> None:
+    """Review rv-t4r3 R-L1: a check that timed out says nothing about the master, so its socket stays."""
+    control = tmp_path / "cm"
+    control.mkdir()
+    socket = control / "opsjob@192.168.127.2:22"
+    socket.write_text("")
+    opens = []
+
+    def check(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 10)
+
+    supervisor = MasterSupervisor(hosts=[HOSTS_BY_NAME["rt-core01"]], popen=lambda *a, **k: opens.append(a),
+                                  process_runner=check, clock=Clock(), state_dir=tmp_path / "s", control_dir=control,
+                                  sleep=lambda _: None)
+    supervisor.ensure()
+    assert opens == [] and socket.exists()

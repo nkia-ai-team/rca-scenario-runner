@@ -1447,7 +1447,11 @@ class LiveProbeSet:
         return 200 <= int(response["status"]) < 300
 
     def _vm_read(self, host_name: str, body: bytes) -> bytes:
-        """One read on a VM of the VM testbed, as the executor account over the shared socket."""
+        """One read on a VM of the VM testbed, as the executor account over the shared socket, only while its
+        master is up (review rv-t4r3 R-M1: never a direct login in its place)."""
+        host = vm_ops.HOSTS_BY_NAME[host_name]
+        if vm_ops.master_is_up(host, self.process_runner) is not True:
+            raise LiveProbeError(f"control connection to {host.address} is down; not reading {host_name} without it")
         completed = self.process_runner(
             vm_ops.executor_argv(vm_ops.HOSTS_BY_NAME[host_name]),
             input=body,
@@ -2366,6 +2370,8 @@ class LiveProbeSet:
             raise LiveProbeError("host probe scenario is not allowlisted")
         host, mode, target = HOST_PROBE_CONTRACTS[str(scenario_id)]
         vm_host = next((name for name, address in APPROVED_VM_HOSTS.items() if address == host), None)
+        if vm_host is not None and vm_ops.master_is_up(vm_ops.HOSTS_BY_NAME[vm_host], self.process_runner) is not True:
+            raise LiveProbeError(f"control connection to {host} is down; not probing {vm_host} without it")
         result = self.process_runner(
             vm_ops.executor_argv(vm_ops.HOSTS_BY_NAME[vm_host])
             if vm_host is not None

@@ -2329,6 +2329,7 @@ class _VmFakes(Fakes):
     def __init__(self) -> None:
         super().__init__()
         self.entry_status = "200"
+        self.masters_down = False
         self.vm_live = {
             "domain": "civil-petition", "unit": "loadgen", "achieved_rps": 17.0, "http_count": 900,
             "http_abnormal_rate": 0.0, "http_p95_ms": 9.0, "business_ok": True, "entry_status": 200,
@@ -2339,6 +2340,8 @@ class _VmFakes(Fakes):
         argv = list(argv)
         if any(item.startswith("opsjob@") for item in argv):
             self.process_calls.append((argv, kwargs))
+            if "-O" in argv:
+                return subprocess.CompletedProcess(argv, 255 if self.masters_down else 0, "", "")
             body = kwargs["input"].decode()
             if body.startswith("cat -- /tmp/k6-civil-petition-live.json"):
                 return subprocess.CompletedProcess(argv, 0, json.dumps(self.vm_live).encode(), b"")
@@ -2365,7 +2368,7 @@ def test_vm_domain_baseline_document_is_read_over_the_management_socket(tmp_path
     )
     assert observation["quality"] == "good" and observation["value"] == 17.0
     assert observation["source"] == "k6:baseline:civil-petition:achieved_rps"
-    calls = [(argv, kwargs) for argv, kwargs in fakes.process_calls if "opsjob@192.168.127.10" in argv]
+    calls = [(argv, kwargs) for argv, kwargs in fakes.process_calls if "opsjob@192.168.127.10" in argv and "-O" not in argv]
     assert len(calls) == 1
     argv, kwargs = calls[0]
     assert argv[-4:] == ["sudo", "-n", "bash", "-s"] and "ControlMaster=no" in argv
@@ -2409,3 +2412,19 @@ def test_vm_host_probe_uses_the_management_socket(tmp_path, monkeypatch) -> None
     argv, kwargs = fakes.process_calls[-1]
     assert "opsjob@192.168.127.41" in argv and argv[-4:] == ["sudo", "-n", "bash", "-s"]
     assert kwargs["input"].startswith(b"set -- fio /pgdata\n")
+
+
+def test_vm_reads_refuse_without_a_master_instead_of_logging_in(tmp_path, monkeypatch) -> None:
+    """Review rv-t4r3 R-M1: the live probes on the VM testbed read only over a live master."""
+    from app import live_probes
+
+    monkeypatch.setitem(live_probes.HOST_PROBE_CONTRACTS, "F99-X", ("192.168.127.41", "fio", "/pgdata"))
+    fakes = _VmFakes()
+    fakes.masters_down = True
+    probes = _probes(tmp_path, fakes, scenario_id="F99-X")
+    registry = ApprovedQueryRegistry.from_path()
+    baseline = probes.observe(registry.bind({"query_id": "loadgen.achieved_rps", "parameters": {"domain": "civil-petition"}}))
+    host = probes.observe(registry.bind({"query_id": "host.scenario_active", "parameters": {"scenario_id": "F99-X"}}))
+    entry = probes.inspect(_eligibility(checks=["vm-entry-health"])).check_results["vm-entry-health"]
+    assert baseline["quality"] != "good" and host["quality"] != "good" and entry is False
+    assert [argv for argv, _ in fakes.process_calls if "-O" not in argv and any(a.startswith("opsjob@") for a in argv)] == []
