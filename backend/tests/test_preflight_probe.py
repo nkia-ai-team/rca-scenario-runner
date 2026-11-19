@@ -232,6 +232,7 @@ def _vm_answers(*, cpu_age=None, icmp=None, icmp_age=None, snmp=1, snmp_age=30, 
             {"": snmp_age} if snmp_age is not None else {}),
         f'max(last_over_time({{__name__="nms.network.snmp_status",target_id="{_ROUTER_ID}"}}': _rows(
             {"": snmp} if snmp is not None else {}),
+        "pending_requests": _rows({"": 0}),
         "/api/v1/alerts": {"data": {"alerts": list(alerts)}},
     }
 
@@ -309,6 +310,20 @@ def test_vm_domain_probe_goes_dirty_when_the_tunnel_is_cut(tmp_path) -> None:
     assert verdict.verdict == "dirty"
     assert {c.name for c in verdict.checks if c.status == "fail"} == {
         "tunnel_handshake_age_sec", "tunnel_ping_lost", "tunnel_ping_max_ms"}
+
+
+def test_vm_domain_probe_reads_the_helpers_never_handshake_value_as_none(tmp_path) -> None:
+    """Review rv-t4r3 M1: the helper answers -1 when there was never a handshake. With every ping answered the
+    handshake check alone must still fail (it used to pass -1 <= 150)."""
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    remote.hypervisor = {**_hypervisor(clock.value, rx=90_000_000, tx=90_000_000), "handshake_age_sec": None}
+    observations = probe.collect(now=clock.value)
+    assert observations["tunnel_handshake_age_sec"] == 1_000_000 and observations["tunnel_ping_lost"] == 0
+    assert ops.load()["hypervisor"]["history"][-1]["handshake_age_sec"] is None
+    verdict = _vm_gate(observations, clock.value)
+    assert {c.name for c in verdict.checks if c.status == "fail"} == {"tunnel_handshake_age_sec"}
+    # Any negative age is «none» too.
+    assert _vm_ops._handshake_age(-5) is None and _vm_ops._handshake_age(0) == 0 and _vm_ops._handshake_age(None) is None
 
 
 def test_vm_domain_probe_goes_dirty_when_a_management_connection_is_down_or_just_reopened(tmp_path) -> None:

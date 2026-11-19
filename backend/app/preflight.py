@@ -226,7 +226,8 @@ R6_REQUIRED_SIGNALS: frozenset[str] = frozenset(
 
 # Traditional VM testbed (testbed-services docs/spec-testbed-vm-3tier.md §6-4). The R6 categories are filled
 # with this domain's values (its own loadgen on the VM network, the same alarm and incident views), the previous
-# run's residue is the executors' armed guards on the six VMs and 66 (there is no commerce pool here), and the
+# run's residue is the executors' armed guards on the six VMs and 66 plus the same global pool residue every other
+# domain is held on (prev_pool_pending, U7 rule as is: command-session decision on review rv-t4r3 L1), and the
 # design adds the tunnel, the monitoring freshness, the router load, the always-open management connections and
 # the clock. Each value comes from app.preflight_probe.VmDomainPreflightProbe.
 VM_DOMAIN = "civil-petition"
@@ -250,6 +251,7 @@ VM_DOMAIN_REQUIRED_SIGNALS: frozenset[str] = frozenset(
         "entry_p95_sec",
         "active_alarms",
         "open_incidents",
+        "prev_pool_pending",
         "residual_guards",
         "tunnel_handshake_age_sec",
         "tunnel_ping_lost",
@@ -365,6 +367,7 @@ def _vm_domain_checks(observations: Mapping[str, float]) -> list[PreflightCheckI
         check("entry_p95_sec", R6_ENTRY_P95_SEC, "lte", tolerance=R6_ENTRY_P95_TOLERANCE),
         check("active_alarms", 0.0, "eq"),
         check("open_incidents", 0.0, "eq"),
+        check("prev_pool_pending", 0.0, "eq"),
         # The previous run's residue on this domain: armed executor guards on the VMs and 66 (§6-4 "남은 가드").
         check("residual_guards", 0.0, "eq"),
         check("tunnel_handshake_age_sec", TUNNEL_HANDSHAKE_MAX_SEC, "lte"),

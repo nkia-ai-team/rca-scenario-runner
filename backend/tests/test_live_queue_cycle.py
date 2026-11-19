@@ -2718,10 +2718,11 @@ async def test_cycle_buffer_gate_judges_a_vm_domain_scenario_on_its_own_signals(
     queue.preflight_probe = default
     queue.domain_preflight_probes = {"civil-petition": vm_probe}
     pods = []
-    queue.domain_pods_probe = lambda: pods.append(1) or "1 of 31 app pods not Ready: x"
+    # The pods gate holds this domain too (review rv-t4r3 M3); here every pod is Ready.
+    queue.domain_pods_probe = lambda: pods.append(1) or None
     queue.vm_domain_state = lambda: None
     state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
-    assert vm_probe.calls == 1 and default.calls == 0 and pods == []
+    assert vm_probe.calls == 1 and default.calls == 0 and pods == [1]
     verdict = json.loads((runner.artifact_store.root / state.current_run_id / "preflight.json").read_text())
     assert verdict["verdict"] == "clean"
     assert "tunnel_load_mbps" in {check["name"] for check in verdict["checks"]}

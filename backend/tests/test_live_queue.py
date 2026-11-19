@@ -1735,6 +1735,37 @@ async def test_restore_failure_pauses_queue(tmp_path: Path, monkeypatch) -> None
 from tests.test_preflight import VM_CLEAN
 
 
+@pytest.mark.asyncio
+async def test_a_scenario_whose_domain_cannot_be_read_is_not_injected(tmp_path: Path) -> None:
+    """Review rv-t4r3 M2: the domain picks the probe, the signal set and the drift gate. A registry that cannot be
+    read, or a scenario without an entry, stops the injection with why instead of falling to the R6 signals."""
+    from app.live_queue import SCENARIO_METADATA_CHECK_NAME
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    _make_vm_domain(runner, "F01-R")
+    default = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    vm_probe = FakePreflightProbe(VM_CLEAN)
+    queue.preflight_probe = default
+    queue.domain_preflight_probes = {"civil-petition": vm_probe}
+    drift_calls = []
+    queue.vm_domain_state = lambda: drift_calls.append(1) or "was01 changed since install: petition.war"
+    await queue.start()
+    calls_before = default.calls
+    runner.scenario_metadata_path.write_text("{broken", encoding="utf-8")
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == []
+    assert default.calls == calls_before and vm_probe.calls == 0
+    assert f"{SCENARIO_METADATA_CHECK_NAME}: scenario metadata unreadable" in (state.reason or "")
+
+    # No entry for the scenario: the same.
+    document = {"schema_version": "1.0", "scenarios": {}}
+    runner.scenario_metadata_path.write_text(json.dumps(document), encoding="utf-8")
+    await queue.resume()  # readiness does not read the entry; the injection gate does, and stops again
+    state = await queue.tick()
+    assert state.phase == "paused" and "scenario metadata has no entry for F01-R" in (state.reason or "")
+    assert runner.started == []
+
+
 def _make_vm_domain(runner, *scenario_ids: str) -> None:
     """Mark scenarios as civil-petition in the scenario metadata the queue reads."""
     document = json.loads(runner.scenario_metadata_path.read_text())
@@ -1758,20 +1789,22 @@ async def test_a_vm_domain_scenario_is_judged_on_its_own_signals_and_the_others_
     queue.vm_domain_state = lambda: None
     await queue.start()
     calls_before = default.calls  # readiness proved the default probe once
+    # The pods gate holds every domain, this one included (review rv-t4r3 M3: a recording holds all of 119).
+    state = await queue.tick()
+    assert runner.started == [] and pods == [1] and state.phase != "paused"
+    queue.domain_pods_probe = lambda: pods.append(1) or None
+    clock.value += timedelta(seconds=31)
     state = await queue.tick()
     assert runner.started == [("F01-R", "run")], state.reason
     assert vm_probe.calls == 1 and default.calls == calls_before
-    # Kubernetes pods are not this domain's gate (their alarms still count in active_alarms).
-    assert pods == []
     verdict = json.loads((runner.artifact_store.root / "run-F01-R" / "preflight.json").read_text())
     names = {check["name"] for check in verdict["checks"]}
     assert {"tunnel_handshake_age_sec", "mgmt_ssh_settle_sec", "residual_guards", "router_cpu_pct"} <= names
-    assert "prev_pool_pending" not in names
+    assert "prev_pool_pending" in names  # U7 rule as is (review L1)
     assert VM_DOMAIN_STATE_CHECK_NAME not in names
 
-    # A scenario of another domain still goes through the R6 probe and the pods gate.
+    # A scenario of another domain still goes through the R6 probe.
     assert queue._preflight_probe_for("F01-H") == (default, None)
-    assert queue._domain_pods_gate("F01-H")[0] == "hold" and pods == [1]
 
 
 @pytest.mark.asyncio
@@ -1863,7 +1896,10 @@ async def test_vm_domain_drift_pauses_before_the_injection_with_what_differs(tmp
 def test_compose_carries_the_vm_testbed_settings_and_leaves_them_off() -> None:
     compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text(encoding="utf-8")
     assert "- CIVIL_PETITION_OPS=${CIVIL_PETITION_OPS:-}" in compose
-    assert "- VM_OPS_HYPERVISOR_TARGET=${VM_OPS_HYPERVISOR_TARGET:-hvjob@192.168.122.1}" in compose
+    # The 66 target is fixed in code (the executors name the same socket), not a setting (review L2).
+    assert "VM_OPS_HYPERVISOR_TARGET" not in compose
+    # Room to end the masters with -O exit before docker's SIGKILL (review H1).
+    assert "    stop_grace_period: 60s\n" in compose
     assert "- VM_OPS_STATE_DIR=/app/state/vm-ops" in compose
     # The socket directory the executors read from the same variable (T4 contract 3), on the state volume.
     assert "- CIVIL_PETITION_SSH_CONTROL_DIR=/app/state/ssh-control" in compose

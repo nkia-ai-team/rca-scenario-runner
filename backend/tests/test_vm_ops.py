@@ -82,7 +82,8 @@ class FakeRemote:
             hv = self.hypervisor
             answer = {
                 "tunnel": {key: hv[key] for key in ("at", "wg_rx_bytes", "wg_tx_bytes") if key in hv}
-                | {"handshake_age_s": hv.get("handshake_age_sec"),
+                # The helper's real shape: -1 when there was never a handshake (t4-hv-exec-root, review M1).
+                | {"handshake_age_s": -1 if hv.get("handshake_age_sec") is None else hv["handshake_age_sec"],
                    "ping": {"sent": hv["ping"]["sent"], "lost": hv["ping"]["sent"] - hv["ping"]["received"],
                             "max_ms": hv["ping"]["max_ms"]}},
                 "guards": {"armed": hv.get("guards_active", 0), "jobs": []},
@@ -453,3 +454,113 @@ async def test_service_checks_masters_reads_periodically_and_stops_its_masters(t
     await service.stop()
     assert events[0] == "check" and events.count("read") >= 2 and events[-1] == "stop"
     assert events.count("check") >= 3
+
+
+class _Opened:
+    """The first `ssh -M -N -f` process: exits with `code` (0 = it forked), or keeps running (None)."""
+
+    def __init__(self, code):
+        self.code = code
+        self.terminated = False
+
+    def poll(self):
+        return self.code
+
+    def terminate(self):
+        self.terminated = True
+
+
+def test_a_dead_socket_file_is_removed_before_the_master_is_reopened(tmp_path: Path) -> None:
+    """Review rv-t4r3 H1: a master killed without cleanup leaves its socket file on the state volume, and
+    ControlMaster=yes then cannot listen there and goes on as a plain detached connection. The supervisor removes
+    the dead file before it opens, so the new master takes the socket."""
+    host = HOSTS_BY_NAME["db01"]
+    control = tmp_path / "cm"
+    control.mkdir()
+    socket = control / "opsjob@192.168.127.41:22"
+    socket.write_text("")  # what a SIGKILLed master leaves (a dead unix socket entry)
+    seen_at_open = []
+    alive: set[str] = set()
+
+    def popen(argv, **kwargs):
+        seen_at_open.append(socket.exists())
+        alive.add(argv[-1])
+        return _Opened(0)
+
+    def check(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0 if argv[-1] in alive else 255, "", "")
+
+    supervisor = MasterSupervisor(hosts=[host], popen=popen, process_runner=check, clock=Clock(),
+                                  state_dir=tmp_path / "s", control_dir=control, sleep=lambda _: None)
+    assert supervisor.socket_path(host) == socket
+    status = supervisor.ensure()["db01"]
+    assert seen_at_open == [False] and status["alive"] is True
+
+
+def test_an_open_that_leaves_no_master_is_not_retried_and_logins_do_not_pile_up(tmp_path: Path) -> None:
+    """Review rv-t4r3 H1: when the opening ssh forked (exit 0) but no master answers, a plain connection may be
+    left on the VM that the runner cannot see or end. Trying again every check would add a login and a new
+    host_connections row each time, so the supervisor gives up on that host until the runner restarts and the
+    status (preflight: mgmt_ssh_down) says why."""
+    clock = Clock()
+    opens: list[str] = []
+
+    def popen(argv, stderr=None, **kwargs):
+        opens.append(argv[-1])
+        stderr.write("ControlSocket /app/state/ssh-control/opsjob@192.168.127.2:22 already exists, disabling multiplexing\n")
+        return _Opened(0)
+
+    supervisor = MasterSupervisor(
+        hosts=[HOSTS_BY_NAME["rt-core01"]], popen=popen,
+        process_runner=lambda argv, **k: subprocess.CompletedProcess(argv, 255, "", ""),
+        clock=clock, state_dir=tmp_path / "s", control_dir=tmp_path / "cm", sleep=lambda _: None, open_wait_sec=3,
+    )
+    for _ in range(40):  # 40 checks over 20 minutes
+        status = supervisor.ensure()["rt-core01"]
+        clock.value += timedelta(seconds=30)
+    assert opens == ["opsjob@192.168.127.2"]
+    assert status["alive"] is False and status["given_up"] is True
+    assert "disabling multiplexing" in status["detail"] and "until it restarts" in status["detail"]
+
+
+def test_an_open_that_failed_by_itself_is_retried_after_the_backoff_only(tmp_path: Path) -> None:
+    """A VM that is rebooting refuses the connection (ssh exits 255, nothing is left on the VM): try again, but
+    not on every check."""
+    clock = Clock()
+    opens: list[str] = []
+    hung = _Opened(None)
+    answers = [_Opened(255), hung]
+
+    def popen(argv, stderr=None, **kwargs):
+        opens.append(argv[-1])
+        stderr.write("ssh: connect to host 192.168.127.2 port 22: Connection refused\n")
+        return answers.pop(0) if answers else _Opened(255)
+
+    supervisor = MasterSupervisor(
+        hosts=[HOSTS_BY_NAME["rt-core01"]], popen=popen,
+        process_runner=lambda argv, **k: subprocess.CompletedProcess(argv, 255, "", ""),
+        clock=clock, state_dir=tmp_path / "s", control_dir=tmp_path / "cm", sleep=lambda _: None, open_wait_sec=3,
+    )
+    status = supervisor.ensure()["rt-core01"]
+    assert len(opens) == 1 and "Connection refused" in status["detail"] and not status.get("given_up")
+    for _ in range(9):  # 4.5 minutes of checks: no new attempt
+        clock.value += timedelta(seconds=30)
+        supervisor.ensure()
+    assert len(opens) == 1
+    clock.value += timedelta(seconds=31)  # past MASTER_RETRY_SEC
+    supervisor.ensure()
+    assert len(opens) == 2
+    # The second open hung before forking: the runner ends its own process and it counts as a clean failure.
+    assert hung.terminated is True and supervisor.snapshot()["rt-core01"].get("retry_at")
+
+
+def test_the_66_target_is_fixed_to_the_executors_value() -> None:
+    """Review rv-t4r3 L2: the socket name comes from the target, and the executors (testbed-services
+    vm_executor_common, T4S) call hvjob@192.168.122.1. A runner-only setting would split the sockets and refuse every
+    66 executor run, so the value is fixed in code, not read from the environment."""
+    import inspect
+
+    assert vm_ops.HYPERVISOR_TARGET == "hvjob@192.168.122.1"
+    assert "VM_OPS_HYPERVISOR_TARGET" not in inspect.getsource(vm_ops)
+    host = vm_ops.hypervisor_host()
+    assert (host.user, host.address) == ("hvjob", "192.168.122.1")

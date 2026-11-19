@@ -159,7 +159,7 @@ class ProductionPreflightProbe:
 # - the time-of-day floor: half the loadgen's own target rate for this KST hour and the previous one (the hour
 #   table of civil-petition/loadgen/entrypoint.sh with the PEAK_RPS and TROUGH_RPS the unit runs with). A dead or
 #   degenerate generator falls far below it; a healthy one sits at its target.
-# - alarms and incidents: the same global views as the other domains (ProductionPreflightProbe).
+# - alarms, incidents and the pool residue: the same global views as the other domains (ProductionPreflightProbe).
 # - tunnel: 66's helper (`tunnel`, `guards`, `version`), read now (handshake age, 10 pings to the monitoring end) plus the WireGuard byte
 #   counters of the periodic reads for the 10-minute average.
 # - monitoring freshness: 119 VictoriaMetrics (sms.cpu.utilization, sms.server.icmp_status by the agents' host_name,
@@ -289,8 +289,13 @@ class VmDomainPreflightProbe:
             "entry_p95_sec": float(document["http_p95_ms"]) / 1000.0,
             "active_alarms": float(self.base._firing_alarm_count()),
             "open_incidents": float(self.incident_count()),
+            # The same global residue signal the other domains are held on (U7 rule as is, review rv-t4r3 L1).
+            "prev_pool_pending": self.base._vm_scalar(POOL_PENDING_QUERY, default=0.0),
             "residual_guards": float(guards),
-            "tunnel_handshake_age_sec": float(handshake) if handshake is not None else TUNNEL_NEVER_SEC,
+            # None or negative (the helper's -1) = no handshake at all (review rv-t4r3 M1).
+            "tunnel_handshake_age_sec": (
+                float(handshake) if handshake is not None and float(handshake) >= 0 else TUNNEL_NEVER_SEC
+            ),
             "tunnel_ping_lost": float(sent - received),
             "tunnel_ping_max_ms": float(max_ms) if max_ms is not None else TUNNEL_NEVER_SEC,
             "tunnel_load_mbps": self._tunnel_load_mbps(),

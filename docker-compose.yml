@@ -9,6 +9,9 @@ services:
     image: scenario-runner:latest
     container_name: scenario-runner
     restart: unless-stopped
+    # 끝낼 때 관리망 마스터를 -O exit 로 닫을 시간(backend/app/vm_ops.py VmOpsService.stop). docker 기본 10초 뒤
+    # SIGKILL 이면 마스터 소켓 파일이 state 볼륨에 남는다(리뷰 rv-t4r3 H1).
+    stop_grace_period: 60s
 
     # host network: 컨테이너가 호스트 네트워크를 공유하므로
     #   1) uvicorn 이 호스트의 ${PORT} 에 직접 bind
@@ -96,9 +99,9 @@ services:
       # 읽기(backend/app/vm_ops.py)가 db01 의 last.json 을 그 폴더에 그대로 옮긴다.
       - PETITION_ARCHIVE_STATE_DIR=${PETITION_ARCHIVE_STATE_DIR:-}
       # 전통 3계층 관리망 운영(VM 6대 늘 열린 ssh 연결, 5분 평시 점검 읽기, 도메인 preflight, 버전 표류 게이트).
-      # 비우면 꺼짐(이 도메인 시나리오는 preflight 가 실패해 주입되지 않는다). 66 도우미 접속 대상은 계정@주소.
+      # 비우면 꺼짐(이 도메인 시나리오는 preflight 가 실패해 주입되지 않는다). 66 대상(hvjob@192.168.122.1)은 실행기와
+      # 같은 소켓 이름을 쓰도록 코드에 고정(바꾸지 않는다).
       - CIVIL_PETITION_OPS=${CIVIL_PETITION_OPS:-}
-      - VM_OPS_HYPERVISOR_TARGET=${VM_OPS_HYPERVISOR_TARGET:-hvjob@192.168.122.1}
       - VM_OPS_STATE_DIR=/app/state/vm-ops
       # 늘 열린 연결의 소켓 폴더. 실행기도 같은 변수를 읽는다(T4 계약 3).
       - CIVIL_PETITION_SSH_CONTROL_DIR=/app/state/ssh-control

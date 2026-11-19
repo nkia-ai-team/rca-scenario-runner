@@ -74,6 +74,9 @@ SERVER_ALIVE_INTERVAL_SEC = 30
 SERVER_ALIVE_COUNT_MAX = 3
 MASTER_CHECK_INTERVAL_SEC = 30
 MASTER_OPEN_WAIT_SEC = 15
+# A master that could not open (the opening ssh failed by itself, nothing left on the VM) is tried again after this.
+MASTER_RETRY_SEC = 300
+STOP_LOOP_WAIT_SEC = 5
 PERIODIC_READ_INTERVAL_SEC = 300
 # A read result older than two periods plus a minute means the periodic read stopped (or a VM did not answer
 # twice): preflight does not judge on it.
@@ -83,8 +86,10 @@ HYPERVISOR_HISTORY = 12
 ROUTER_CPU_HISTORY = 4
 STATE_DIR = Path(os.environ.get("VM_OPS_STATE_DIR", "/app/state/vm-ops"))
 
-# 66 as tb-ops reaches it (vmbr1), the helper account (T4S contract 6). Empty turns the 66 reads off.
-HYPERVISOR_TARGET = os.environ.get("VM_OPS_HYPERVISOR_TARGET", "hvjob@192.168.122.1")
+# 66 as tb-ops reaches it (vmbr1), the helper account (T4S contract 6). Fixed, not a setting (review rv-t4r3 L2): the
+# socket name comes from it, and the executors (testbed-services vm_executor_common) name the same target, so a
+# runner-only change would split the sockets and every 66 executor run would be refused.
+HYPERVISOR_TARGET = "hvjob@192.168.122.1"
 # The helper is rendered from the inventory at apply time (no file with addresses lives in the repository), so the
 # repository keeps its expected checksums in one file (T4S): {"files": {"t4-hv-exec": "<sha256>", ...}}, the same
 # shape the helper's `version` verb prints. Read from the testbed-services deploy directory mounted into the runner.
@@ -346,6 +351,14 @@ def parse_read(host: VmHost, text: str) -> HostFacts:
     )
 
 
+def _handshake_age(value: Any) -> int | None:
+    """Seconds since the last WireGuard handshake, None when there was none (the helper's -1, null, negatives)."""
+    if value is None or isinstance(value, bool):
+        return None
+    age = int(value)
+    return None if age < 0 else age
+
+
 def chrony_offset_ms(line: str) -> float:
     """|System time| from ``chronyc -c tracking`` (field 5, seconds) in ms; raises when not synchronised."""
     fields = line.split(",")
@@ -423,12 +436,32 @@ class MasterSupervisor:
             return False
         return result.returncode == 0
 
+    def socket_path(self, host: VmHost) -> Path:
+        """The file ssh makes from CONTROL_PATH (%r@%h:%p) for this target (port 22)."""
+        return self.control_dir / f"{host.user}@{host.address}:22"
+
     def _open(self, host: VmHost) -> None:
+        """Open one master and prove it is there (review rv-t4r3 H1).
+
+        A master that died without cleaning up (SIGKILL, OOM, a forced container stop) leaves its socket file on
+        the state volume. ``ControlMaster=yes`` does not reuse it: listen fails with EEXIST, ssh says "already
+        exists, disabling multiplexing" and goes on as a plain connection that ``-f`` detaches (pid unknown, never
+        ended, a new login and a new host_connections row each time). So a dead socket file is removed first, and
+        an open that leaves no working master is classified:
+        - the opening ssh failed by itself (non-zero exit, or no answer and ended by us before it forked): nothing
+          was left on the VM, so it is tried again after MASTER_RETRY_SEC (a VM rebooting, a network blip);
+        - it exited 0 (it forked) but no master answers: a connection was left behind that the runner cannot see
+          or end. It is not tried again until the runner restarts; the status says so and preflight stays dirty.
+        """
         previous = self._processes.pop(host.name, None)
         if previous is not None and previous.poll() is None:
             previous.terminate()
         self.control_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.control_dir, 0o700)
+        socket = self.socket_path(host)
+        if socket.exists() or socket.is_symlink():
+            socket.unlink()
+            logger.warning("removed the dead control socket of %s (%s)", host.name, socket)
         log_path = self.state_dir / f"{host.name}.master.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "w", encoding="utf-8") as log:
@@ -451,14 +484,25 @@ class MasterSupervisor:
             self._sleep(1.0)
             waited += 1.0
         detail = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
-        if process.poll() is None:
-            process.terminate()
+        code = process.poll()
+        if code is None:
+            process.terminate()  # still ours, before any fork: nothing is left
         self._processes.pop(host.name, None)
-        self.status[host.name] = {
-            "alive": False,
-            "opened_at": None,
-            "detail": f"could not open: {_tail(detail) if detail.strip() else 'no answer within the wait'}",
-        }
+        said = _tail(detail) if detail.strip() else "no answer within the wait"
+        if code == 0:
+            self.status[host.name] = {
+                "alive": False, "opened_at": None, "given_up": True,
+                "detail": (
+                    f"opened without a working master ({said}); a connection may be left on the VM, so the runner "
+                    "does not try again until it restarts (end any stray ssh to this address on tb-ops first)"
+                ),
+            }
+        else:
+            self.status[host.name] = {
+                "alive": False, "opened_at": None,
+                "retry_at": _format(self.clock() + timedelta(seconds=MASTER_RETRY_SEC)),
+                "detail": f"could not open: {said}",
+            }
         logger.warning("management ssh to %s (%s) failed: %s", host.name, host.address, self.status[host.name]["detail"])
 
     def ensure(self) -> dict[str, dict[str, Any]]:
@@ -471,7 +515,15 @@ class MasterSupervisor:
                         # A live socket this process did not open (left by an earlier runner process in the same
                         # container): its open time is unknown, so the 30-minute settle starts now.
                         current = {"alive": True, "opened_at": _format(self.clock()), "detail": "found open"}
-                    self.status[host.name] = {**current, "alive": True, "detail": current.get("detail", "")}
+                    self.status[host.name] = {
+                        "alive": True, "opened_at": current["opened_at"], "detail": current.get("detail", ""),
+                    }
+                    continue
+                current = self.status.get(host.name) or {}
+                if current.get("given_up"):
+                    continue
+                retry_at = current.get("retry_at")
+                if retry_at and self.clock() < _parse(retry_at):
                     continue
                 self._open(host)
             snapshot = {name: dict(value) for name, value in self.status.items()}
@@ -609,7 +661,7 @@ class VmOps:
         Kept in one record: at, handshake_age_sec (None = never), ping {sent, received, max_ms}, wg_rx_bytes,
         wg_tx_bytes, guards_active, helper_sha256 {file: hex}."""
         if not self.hypervisor_target:
-            raise VmOpsError("hypervisor target is not configured (VM_OPS_HYPERVISOR_TARGET)")
+            raise VmOpsError("hypervisor target is not configured")
         tunnel = self._helper("tunnel")
         guards = self._helper("guards")
         version = self._helper("version")
@@ -618,7 +670,9 @@ class VmOps:
             sent, lost = int(ping["sent"]), int(ping["lost"])
             record = {
                 "at": tunnel["at"],
-                "handshake_age_sec": tunnel["handshake_age_s"],
+                # The helper says -1 when there was never a handshake (t4-hv-exec-root); None and any negative
+                # value mean «none» (review rv-t4r3 M1).
+                "handshake_age_sec": _handshake_age(tunnel["handshake_age_s"]),
                 "ping": {"sent": sent, "received": sent - lost, "max_ms": ping.get("max_ms")},
                 "wg_rx_bytes": int(tunnel["wg_rx_bytes"]),
                 "wg_tx_bytes": int(tunnel["wg_tx_bytes"]),
@@ -812,10 +866,15 @@ class VmOpsService:
             self._task = asyncio.create_task(self.run())
 
     async def stop(self) -> None:
+        """End the loop, then the masters with ``-O exit`` (review rv-t4r3 H1: a master killed by docker's SIGKILL
+        leaves its socket file behind). The loop gets STOP_LOOP_WAIT_SEC; a check or read already running in its
+        worker thread cannot be cancelled, so the supervisor waits for its lock (an open takes at most
+        MASTER_OPEN_WAIT_SEC). The app stops this service first and compose gives the container stop_grace_period
+        60s, longer than this path."""
         self._stop.set()
         if self._task is not None:
             try:
-                await asyncio.wait_for(self._task, timeout=30)
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=STOP_LOOP_WAIT_SEC)
             except Exception:
                 self._task.cancel()
         await asyncio.to_thread(self.ops.supervisor.stop)

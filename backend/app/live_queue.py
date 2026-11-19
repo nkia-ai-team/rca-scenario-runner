@@ -157,6 +157,13 @@ ORACLE_CHECK_DEFAULT_PERIOD = timedelta(hours=6)
 # image drift check; a decoy deployment (U7) or a cleanup that did not finish leaves exactly this. Never
 # transient: a person has to put the file or the service back, so the queue pauses with what differs.
 VM_DOMAIN_STATE_CHECK_NAME = "vm_domain_state"
+# The scenario's domain decides its preflight probe, signal set and drift gate, so a domain that cannot be read
+# (registry unreadable, no entry for the scenario) stops the injection with why (review rv-t4r3 M2).
+SCENARIO_METADATA_CHECK_NAME = "scenario_metadata"
+
+
+class ScenarioMetadataError(RuntimeError):
+    """The scenario's metadata entry (its domain) cannot be read."""
 
 
 def oracle_check_max_age(period: timedelta) -> timedelta:
@@ -1276,6 +1283,9 @@ class LiveScenarioQueue:
             return deferred, None, None
         # Every domain app pod Ready before this injection (v4 ORAFIX); the previous scenario's
         # cleanup and recovery are done by now, so a pod down here is a broken testbed.
+        metadata = self._scenario_metadata_blocker(scenario_id)
+        if metadata is not None:
+            return self._pause(state, metadata), None, None
         verdict_pods, detail = self._domain_pods_gate(scenario_id)
         if verdict_pods == "hold":
             return state, None, None
@@ -1640,11 +1650,10 @@ class LiveScenarioQueue:
     def _domain_pods_gate(self, scenario_id: str | None = None) -> tuple[str, str | None]:
         """("go", None), ("hold", detail) or ("pause", reason) for the testbed app pods right before an
         injection (DOMAIN_PODS_* above). Hold keeps the queue in its phase; the next tick asks again.
-        Kubernetes checks belong to the Kubernetes domains only (spec-testbed-vm-3tier §6-6 live_probes row): a
-        VM testbed scenario does not wait on another testbed's pods (their alarms still reach active_alarms)."""
+        Every domain, the VM testbed included (command-session decision on review rv-t4r3 M3): a recording holds
+        all of 119 whatever its domain, the same reason the archive state gates the whole queue (11-17)."""
+        del scenario_id
         if self.domain_pods_probe is None:
-            return "go", None
-        if self._scenario_domain(scenario_id) in DOMAIN_REQUIRED_SIGNALS:
             return "go", None
         now = self.clock.now()
         if self._domain_pods_looked is not None and now - self._domain_pods_looked > DOMAIN_PODS_HOLD_GAP:
@@ -1679,12 +1688,41 @@ class LiveScenarioQueue:
         )
 
     def _scenario_domain(self, scenario_id: str | None) -> str | None:
-        entry = self._scenario_entry(scenario_id)
-        domain = entry.get("domain") if entry else None
-        return domain if isinstance(domain, str) else None
+        """The scenario's domain from the scenario metadata, None when its entry names none (older entries).
+
+        Closed when it cannot be known (review rv-t4r3 M2): an unreadable registry or a scenario without an entry
+        raises ScenarioMetadataError instead of answering None, which would judge a VM testbed scenario on the R6
+        signals with no drift gate. None for no scenario at all (readiness)."""
+        if not scenario_id:
+            return None
+        try:
+            registry = json.loads(self.runner.scenario_metadata_path.read_text(encoding="utf-8"))
+            entry = (registry.get("scenarios") or {}).get(scenario_id)
+        except Exception as error:
+            raise ScenarioMetadataError(
+                f"scenario metadata unreadable at {self.runner.scenario_metadata_path}: {type(error).__name__}: {error}"
+            ) from None
+        if not isinstance(entry, dict):
+            raise ScenarioMetadataError(f"scenario metadata has no entry for {scenario_id}")
+        domain = entry.get("domain")
+        if domain is not None and not isinstance(domain, str):
+            raise ScenarioMetadataError(f"scenario metadata domain of {scenario_id} is not a string: {domain!r}")
+        return domain
+
+    def _scenario_metadata_blocker(self, scenario_id: str) -> str | None:
+        """Pause reason when the scenario's domain cannot be known right before its injection (M2)."""
+        try:
+            self._scenario_domain(scenario_id)
+        except ScenarioMetadataError as error:
+            logger.warning("injection refused: %s", error)
+            return f"operational readiness failed: {SCENARIO_METADATA_CHECK_NAME} ({SCENARIO_METADATA_CHECK_NAME}: {error})"
+        return None
 
     def _vm_domain_state_blocker(self, scenario_id: str | None) -> str | None:
         """Pause reason when a VM testbed scenario would start on drifted VMs (VM_DOMAIN_STATE_CHECK_NAME)."""
+        metadata = self._scenario_metadata_blocker(scenario_id) if scenario_id else None
+        if metadata is not None:
+            return metadata
         if self._scenario_domain(scenario_id) not in DOMAIN_REQUIRED_SIGNALS:
             return None
         if self.vm_domain_state is None:
@@ -1709,7 +1747,10 @@ class LiveScenarioQueue:
         return self.preflight_probe, None
 
     def _preflight_applies(self, scenario_id: str | None) -> bool:
-        probe, domain = self._preflight_probe_for(scenario_id)
+        try:
+            probe, domain = self._preflight_probe_for(scenario_id)
+        except ScenarioMetadataError:
+            return True  # the gate runs and its probe call fails with the reason (closed)
         # A domain with its own signal set always goes through the gate: without its probe the gate fails.
         return probe is not None or domain in DOMAIN_REQUIRED_SIGNALS
 
@@ -1748,6 +1789,9 @@ class LiveScenarioQueue:
             return self._pause(state, oracle), None
         # A domain app pod that is not Ready at injection start is a broken testbed, not a scenario
         # effect (none runs yet). Held for the grace first; past it, a person is needed: pause.
+        metadata = self._scenario_metadata_blocker(scenario_id)
+        if metadata is not None:
+            return self._pause(state, metadata), None
         verdict_pods, detail = self._domain_pods_gate(scenario_id)
         if verdict_pods == "hold":
             return state, None

@@ -58,11 +58,13 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        # First: the masters end with -O exit before docker's stop grace runs out (a SIGKILLed master leaves its
+        # socket file on the state volume).
+        if vm_ops_service is not None:
+            await vm_ops_service.stop()
         await get_live_queue().stop_worker()
         await runner.stop_capture_worker()
         await runner.stop_watchdog_worker()
-        if vm_ops_service is not None:
-            await vm_ops_service.stop()
 
 
 app = FastAPI(

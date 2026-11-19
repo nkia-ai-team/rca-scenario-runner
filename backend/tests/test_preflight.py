@@ -131,6 +131,7 @@ VM_CLEAN = {
     "entry_p95_sec": 0.009,
     "active_alarms": 0,
     "open_incidents": 0,
+    "prev_pool_pending": 0,
     "residual_guards": 0,
     "tunnel_handshake_age_sec": 40,
     "tunnel_ping_lost": 0,
@@ -161,20 +162,20 @@ def test_vm_domain_has_its_own_signal_set_and_keeps_r6_for_the_others() -> None:
 
     assert required_signals(None) == required_signals("commerce") == R6_REQUIRED_SIGNALS
     assert required_signals("civil-petition") == VM_DOMAIN_REQUIRED_SIGNALS == frozenset(VM_CLEAN)
-    # No commerce pool here; the previous run's residue is the armed guards.
-    assert "prev_pool_pending" not in VM_DOMAIN_REQUIRED_SIGNALS
+    # The previous run's residue: the same global pool signal as every domain (U7 rule as is, review L1) and the
+    # executors' armed guards.
+    assert {"prev_pool_pending", "residual_guards"} <= VM_DOMAIN_REQUIRED_SIGNALS
     verdict = _vm_verdict()
     assert verdict.verdict == "clean"
     names = [check.name for check in verdict.checks]
-    assert names[:7] == [
+    assert names[:8] == [
         "baseline_loadgen_alive", "diurnal_band_rps", "user_5xx_rate", "entry_p95_sec",
-        "active_alarms", "open_incidents", "residual_guards",
+        "active_alarms", "open_incidents", "prev_pool_pending", "residual_guards",
     ]
     with pytest.raises(ValueError, match="tunnel_handshake_age_sec"):
         build_preflight_checks({k: v for k, v in VM_CLEAN.items() if k != "tunnel_handshake_age_sec"}, domain="civil-petition")
-    # The R6 set without a domain still refuses the VM observations (no silent cross-domain pass).
-    with pytest.raises(ValueError, match="prev_pool_pending"):
-        build_preflight_checks(VM_CLEAN)
+    # The R6 set and the VM set are not interchangeable: R6 checks never include the VM additions.
+    assert "tunnel_handshake_age_sec" not in {check.name for check in build_preflight_checks(VM_CLEAN)}
 
 
 @pytest.mark.parametrize(
@@ -193,6 +194,7 @@ def test_vm_domain_has_its_own_signal_set_and_keeps_r6_for_the_others() -> None:
         ({"mgmt_ssh_down": 1}, "mgmt_ssh_down"),
         ({"mgmt_ssh_settle_sec": 1799}, "mgmt_ssh_settle_sec"),
         ({"residual_guards": 1}, "residual_guards"),
+        ({"prev_pool_pending": 1}, "prev_pool_pending"),
         ({"clock_offset_ms": 50.1}, "clock_offset_ms"),
         ({"achieved_rps": 7.9}, "diurnal_band_rps"),
         ({"baseline_loadgen_alive": 0}, "baseline_loadgen_alive"),
