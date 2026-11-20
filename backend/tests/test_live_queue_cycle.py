@@ -2778,7 +2778,9 @@ async def test_a_vm_decoy_holds_as_rolling_until_its_revert(tmp_path: Path) -> N
                          service_name="was01", target_id="uuid-was01", relation="same_domain", value="x")
     started = await queue._start_decoy(vm, record, datetime(2026, 7, 16, 8, 30, tzinfo=timezone.utc))
     assert started.status == "rolling" and calls == [["was01", "--decoy-change", "war_redeploy"]]
-    assert queue._decoy_timeout(vm, started, SimpleNamespace(rollout_timeout_sec=420)) == 600 + 300
+    from app.decoys import VM_DECOY_CALL_TIMEOUT_SEC
+
+    assert queue._decoy_timeout(vm, started, SimpleNamespace(rollout_timeout_sec=420)) == 600 + 2 * VM_DECOY_CALL_TIMEOUT_SEC
 
 
 

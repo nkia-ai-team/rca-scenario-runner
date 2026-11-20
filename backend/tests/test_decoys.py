@@ -920,7 +920,7 @@ def _vm_policy(**overrides) -> DecoyPolicy:
     document["domain_namespaces"]["civil-petition"] = "civil-petition-vm"
     document["targets"] += [_vm_target("was01"), _vm_target("was02"), _vm_target("web01", kinds=("config_reapply",))]
     document["kind_weights"].update({"war_redeploy": 20, "config_reapply": 20})
-    document["vm_hold_sec"] = {"min": 240, "max": 1500}
+    document["vm_hold_sec"] = {"min": 96, "max": 1878}  # the whole recorded range (command-session decision)
     document.update(overrides)
     return DecoyPolicy.model_validate(document)
 
@@ -1011,7 +1011,11 @@ def test_vm_decoy_executor_applies_holds_then_undoes_like_an_injection() -> None
     assert calls[-1] == ["was02", "--decoy-revert", "war_redeploy"]
     assert kube.calls == []
     # The queue waits the gap plus the undo call before it gives up.
-    assert executor.timeout_sec(record, 420) == 420 + 2 * 150
+    # Decoy calls have their own limit (CLI limit + 60s), longer than the routine check's 150s.
+    from app.decoys import VM_DECOY_CALL_TIMEOUT_SEC, VM_DECOY_CLI_LIMIT_SEC
+
+    assert VM_DECOY_CALL_TIMEOUT_SEC == VM_DECOY_CLI_LIMIT_SEC + 60 > 150
+    assert executor.timeout_sec(record, 420) == 420 + 2 * VM_DECOY_CALL_TIMEOUT_SEC
     assert executor.timeout_sec(_record(), 420) == 420
     executor.undo(record)
     assert calls[-1] == ["was02", "--decoy-revert", "war_redeploy"]
@@ -1035,28 +1039,52 @@ def test_vm_decoy_executor_applies_holds_then_undoes_like_an_injection() -> None
     assert kube.calls
 
 
+def _recorded_quantile(q: float) -> float:
+    from app.decoys import VM_DECOY_RECORDED_GAPS_SEC as values
+
+    position = q * (len(values) - 1)
+    index = min(int(position), len(values) - 2)
+    return values[index] + (values[index + 1] - values[index]) * (position - index)
+
+
 def test_vm_decoy_gaps_follow_the_injection_lengths_and_end_before_the_buffer() -> None:
     import random
 
-    from app.decoys import VM_DECOY_GAP_DECILES_SEC, draw_vm_decoy_gap
+    from app.decoys import VM_DECOY_CALL_ROOM_SEC, VM_DECOY_RECORDED_GAPS_SEC, draw_vm_decoy_gap
 
+    assert len(VM_DECOY_RECORDED_GAPS_SEC) == 129 and list(VM_DECOY_RECORDED_GAPS_SEC) == sorted(VM_DECOY_RECORDED_GAPS_SEC)
     rng = random.Random(5)
     gaps = sorted(draw_vm_decoy_gap(rng) for _ in range(5000))
-    assert VM_DECOY_GAP_DECILES_SEC[0] <= gaps[0] and gaps[-1] <= VM_DECOY_GAP_DECILES_SEC[-1]
-    # Each decile of the draws sits near the recorded decile (within 15%).
+    assert VM_DECOY_RECORDED_GAPS_SEC[0] - 20 <= gaps[0] and gaps[-1] <= VM_DECOY_RECORDED_GAPS_SEC[-1] + 20
+    # Each decile of the draws sits near the recorded one (within 10%).
     for decile in range(1, 10):
-        drawn = gaps[decile * len(gaps) // 10]
-        assert abs(drawn - VM_DECOY_GAP_DECILES_SEC[decile]) <= 0.15 * VM_DECOY_GAP_DECILES_SEC[decile], decile
+        drawn, recorded = gaps[decile * len(gaps) // 10], _recorded_quantile(decile / 10)
+        assert abs(drawn - recorded) <= 0.10 * recorded, decile
     for seed in range(400):
         for record in build_schedule(_vm_policy(), seed=seed, scenario_id="F99-X", scenario=VM_SCENARIO,
                                      cycle_start=CYCLE_START, buffer_start=BUFFER_START):
             if record.node is None:
                 assert record.gap_sec is None
                 continue
+            if record.status == "skipped":
+                # No recorded length fit before the buffer: not run, and the record says why.
+                assert record.gap_sec is None and "fits the" in (record.detail or "")
+                continue
             planned = datetime.strptime(record.planned_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            # Inside the policy bounds (240 to 1500 seconds), the recorded shape otherwise.
-            assert 240 <= record.gap_sec <= 1500
-            assert planned + timedelta(seconds=record.gap_sec + 300) <= BUFFER_START
+            assert 96 <= record.gap_sec <= 1878
+            assert planned + timedelta(seconds=record.gap_sec + VM_DECOY_CALL_ROOM_SEC) <= BUFFER_START
+
+
+def test_a_vm_decoy_with_no_gap_that_fits_is_skipped_and_recorded(monkeypatch) -> None:
+    """Command-session decision: when no recorded length fits before the buffer even after drawing again, the
+    decoy is not run and the record says why (nothing is cut to fit)."""
+    import app.decoys as decoys
+
+    monkeypatch.setattr(decoys, "draw_vm_decoy_gap_within", lambda rng, low, high: None)
+    records = [r for seed in range(200) for r in build_schedule(
+        _vm_policy(), seed=seed, scenario_id="F99-X", scenario=VM_SCENARIO, cycle_start=CYCLE_START,
+        buffer_start=BUFFER_START) if r.node]
+    assert records and all(r.status == "skipped" and r.gap_sec is None and "fits the" in r.detail for r in records)
 
 
 def test_a_vm_decoy_alarm_is_excused_by_its_service_or_target_name() -> None:
@@ -1159,23 +1187,39 @@ def test_a_failed_vm_change_is_reverted_once_and_a_failed_revert_is_unsettled() 
 
 
 def test_vm_decoy_gaps_are_drawn_again_never_piled_on_an_edge() -> None:
-    """Review rv-t4u2 N6 (b): cutting to the range piled gaps on exactly 240 and 1500 seconds. Drawn again instead,
-    the gaps keep the recorded shape inside the range."""
+    """Review rv-t4u2 N6 (b) and the command-session decision: nothing is cut to an edge (the old cut piled 8% on
+    exactly 240 s and 4% on exactly 1500 s). With the policy range the whole recorded range, the draws keep the
+    recorded shape: under 240 s about 4.7%, over 1500 s about 2.3%. A tighter range (the room before the buffer) is
+    met by drawing again."""
     import random
     from collections import Counter
 
-    from app.decoys import VM_DECOY_GAP_DECILES_SEC, draw_vm_decoy_gap_within
+    from app.decoys import draw_vm_decoy_gap_within
 
-    for low, high in ((96, 1500), (240, 1500)):
+    for low, high in ((96, 1878), (96, 900)):
         rng = random.Random(9)
         gaps = sorted(draw_vm_decoy_gap_within(rng, low, high) for _ in range(2000))
         assert low <= gaps[0] and gaps[-1] <= high
         assert Counter(gaps).most_common(1)[0][1] <= 20  # no value holds even 1% of the draws
         assert gaps.count(low) <= 5 and gaps.count(high) <= 5
-    # With the range down at the recorded minimum, the draws follow the recorded deciles (only the 2% over 1500 go).
     rng = random.Random(9)
-    gaps = sorted(draw_vm_decoy_gap_within(rng, 96, 1500) for _ in range(2000))
-    for decile in range(1, 9):
-        drawn = gaps[decile * len(gaps) // 10]
-        assert abs(drawn - VM_DECOY_GAP_DECILES_SEC[decile]) <= 0.15 * VM_DECOY_GAP_DECILES_SEC[decile], decile
+    gaps = [draw_vm_decoy_gap_within(rng, 96, 1878) for _ in range(2000)]
+    under, over = sum(g < 240 for g in gaps) / 2000, sum(g > 1500 for g in gaps) / 2000
+    assert 0.02 <= under <= 0.08 and 0.008 <= over <= 0.04, (under, over)
     assert draw_vm_decoy_gap_within(random.Random(1), 300, 200) is None
+
+
+def test_the_recorded_gaps_are_the_testbed_services_list_and_its_policy_range() -> None:
+    """The runner draws from the same 129 recorded injection lengths testbed-services keeps, and the policy range
+    is that list's two ends (command-session decision; the guard is the max + 600 seconds)."""
+    from app.decoys import VM_DECOY_CLI_LIMIT_SEC, VM_DECOY_RECORDED_GAPS_SEC
+
+    recorded = REGISTRY / "recorded-injection-durations.json"
+    if not recorded.is_file():
+        pytest.skip("this testbed-services checkout has no recorded-injection-durations.json yet")
+    assert tuple(json.loads(recorded.read_text(encoding="utf-8"))["seconds"]) == VM_DECOY_RECORDED_GAPS_SEC
+    active, _ = load_decoy_policy(REGISTRY / "decoy-deployments.json")
+    assert active.vm_hold_sec is not None
+    assert (active.vm_hold_sec.min, active.vm_hold_sec.max) == (VM_DECOY_RECORDED_GAPS_SEC[0], VM_DECOY_RECORDED_GAPS_SEC[-1])
+    source = (REGISTRY.parent / "profiles" / "operator_session.py").read_text(encoding="utf-8")
+    assert f"DECOY_LIMIT_SECONDS = {VM_DECOY_CLI_LIMIT_SEC}" in source

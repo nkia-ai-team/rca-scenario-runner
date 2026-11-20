@@ -65,13 +65,28 @@ KIND_ORDER: tuple[DecoyKind, ...] = (
 VM_KINDS: frozenset[str] = frozenset({"war_redeploy", "config_reapply"})
 # Kinds whose run can raise an alarm on its target (a rollout, or a VM service that reloads); only these excuse one.
 ALARM_KINDS: frozenset[str] = ROLLOUT_KINDS | VM_KINDS
+# A decoy call waits for the app to come back like the was install step (120 s of health after a tomcat restart), so
+# its CLI limit is longer than the routine check's (command-session decision; value agreed with testbed-services).
+# The runner waits that plus 60 seconds, so the CLI always ends its own session first.
+VM_DECOY_CLI_LIMIT_SEC = 240  # testbed-services operator_session.py DECOY_LIMIT_SECONDS
+VM_DECOY_CALL_TIMEOUT_SEC = VM_DECOY_CLI_LIMIT_SEC + 60
 # Room kept after a VM decoy's revert before the buffer opens: the change and the revert call each take at most the
-# runner's operator CLI limit (150s).
-VM_DECOY_CALL_ROOM_SEC = 300
-# The gap between a VM decoy's apply and its undo follows the injection lengths (review rv-t4u R1 (a), command-session
-# decision: drawn by the runner). Deciles of the injection length (t2 - t1) of the 129 recorded cases under
-# /data/eval-cases on 104 (meta.json, measured 2026-11-21 KST); a draw is uniform within a randomly chosen decile.
-VM_DECOY_GAP_DECILES_SEC: tuple[int, ...] = (96, 267, 375, 484, 500, 624, 857, 920, 957, 1069, 1878)
+# runner's decoy call limit.
+VM_DECOY_CALL_ROOM_SEC = 2 * VM_DECOY_CALL_TIMEOUT_SEC
+# The gap between a VM decoy's change and its revert follows the injection lengths (review rv-t4u R1 (a),
+# command-session decision: drawn by the runner). Every injection length (t2 - t1, seconds) of the 129 recorded
+# cases under /data/eval-cases on 104 (meta.json, measured 2026-11-21 KST; testbed-services keeps the same list in
+# registry/recorded-injection-durations.json, and the policy range is its two ends). A draw is one recorded length moved by
+# up to VM_DECOY_GAP_JITTER_SEC either way: the shape is the recorded one (under 240 s 4.7%, over 1500 s 2.3%) with
+# no value repeated (several recordings share a length, 250 s three times, and a plain pick would repeat it).
+VM_DECOY_RECORDED_GAPS_SEC: tuple[int, ...] = (
+    96, 137, 164, 211, 225, 225, 245, 250, 250, 250, 251, 262, 262, 267, 284, 291, 319, 321, 334, 337, 341, 344,
+    345, 370, 373, 373, 375, 382, 397, 418, 419, 420, 422, 426, 436, 440, 447, 483, 484, 485, 487, 487, 488, 488,
+    488, 489, 492, 493, 494, 495, 496, 500, 528, 537, 554, 557, 560, 561, 566, 569, 573, 604, 606, 612, 624, 634,
+    652, 662, 716, 717, 721, 742, 759, 770, 783, 785, 790, 857, 858, 896, 897, 904, 907, 909, 909, 910, 913, 918,
+    918, 918, 920, 922, 922, 923, 926, 927, 928, 928, 944, 945, 956, 956, 957, 960, 962, 965, 968, 973, 992, 1050,
+    1056, 1057, 1063, 1063, 1065, 1069, 1072, 1072, 1088, 1095, 1200, 1222, 1226, 1276, 1281, 1296, 1800, 1868, 1878,
+)
 
 
 # Draws a gap that falls outside the allowed range are drawn again, never cut to the edge (review rv-t4u2 N6 (b),
@@ -91,12 +106,12 @@ def draw_vm_decoy_gap_within(rng: random.Random, low: int, high: int) -> int | N
     return None
 
 
+VM_DECOY_GAP_JITTER_SEC = 20
+
+
 def draw_vm_decoy_gap(rng: random.Random) -> int:
-    """One apply-to-undo gap from the injection length deciles."""
-    position = rng.random() * (len(VM_DECOY_GAP_DECILES_SEC) - 1)
-    index = min(int(position), len(VM_DECOY_GAP_DECILES_SEC) - 2)
-    low, high = VM_DECOY_GAP_DECILES_SEC[index], VM_DECOY_GAP_DECILES_SEC[index + 1]
-    return round(low + (high - low) * (position - index))
+    """One change-to-revert gap from the recorded injection lengths."""
+    return round(rng.choice(VM_DECOY_RECORDED_GAPS_SEC) + rng.uniform(-VM_DECOY_GAP_JITTER_SEC, VM_DECOY_GAP_JITTER_SEC))
 
 # Drawing a time that keeps min_gap from the others is retried this many times
 # before the draw is dropped (a crowded window then simply yields fewer decoys).
@@ -175,8 +190,8 @@ class DecoyConfigMap(_Strict):
 class DecoyHold(_Strict):
     """Bounds of the gap a VM decoy stays changed (testbed-services policy ``vm_hold_sec``). Gaps are drawn from the
     recorded injection lengths and drawn again when outside these bounds. The CLI's executor guard reverts a change
-    by itself at the max + 600 seconds (2100 seconds with the shipped max of 1500), so a drawn gap never exceeds
-    the max."""
+    by itself at the max + 600 seconds (2478 seconds with the shipped range 96 to 1878, the whole recorded range),
+    so a drawn gap never exceeds the max."""
 
     min: int = Field(gt=0)
     max: int = Field(gt=0)
@@ -725,6 +740,16 @@ def build_schedule(
             room = int((buffer_start - at).total_seconds()) - VM_DECOY_CALL_ROOM_SEC
             gap_sec = draw_vm_decoy_gap_within(rng, bounds.min, min(bounds.max, room))
             if gap_sec is None:
+                # No recorded length fits before the buffer: the decoy is not run, and the record says so.
+                records.append(
+                    DecoyRecord(
+                        id=f"d{index}", window=window_name, planned_at=_format(at), kind=kind,
+                        namespace=target.namespace, deployment=target.deployment, node=target.node,
+                        service_name=target.service_name, target_id=target.target_id, relation=relation,
+                        value=f"{stamp}-{token}", status="skipped",
+                        detail=f"no recorded injection length fits the {max(room, 0)}s left before the buffer",
+                    )
+                )
                 continue
         records.append(
             DecoyRecord(
@@ -843,7 +868,7 @@ class VmDecoyExecutor:
     A change that ends in anything but 0 or 3 may still have left something (a revert cut by the runner's limit,
     124 in the middle of the run, a lock wait that ate the budget; review rv-t4u2 N4), so the revert is called once
     more at once. If that also fails the decoy is recorded as unsettled and the buffer gate restarts the cycle; the
-    CLI's executor guard reverts by itself at the policy max + 600 seconds (2100 seconds with the shipped policy)."""
+    CLI's executor guard reverts by itself at the policy max + 600 seconds (2478 seconds with the shipped policy)."""
 
     def __init__(self, *, process_runner: Callable[..., subprocess.CompletedProcess] | None = None,
                  cli: Path | None = None, clock: Callable[[], datetime] | None = None) -> None:
@@ -860,12 +885,12 @@ class VmDecoyExecutor:
         try:
             result = self.process_runner(
                 ["python3", str(self.cli), "--node", record.node, mode, record.kind],
-                timeout=self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC,
+                timeout=VM_DECOY_CALL_TIMEOUT_SEC,
                 env=self._vm_ops.operator_environment(),
             )
         except subprocess.TimeoutExpired:
             raise VmDecoyCallError(f"operator decoy {mode} on {record.node} did not end within "
-                                   f"{self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC}s", -1) from None
+                                   f"{VM_DECOY_CALL_TIMEOUT_SEC}s", -1) from None
         if result.returncode != 0:
             tail = (result.stderr or result.stdout or "").strip().splitlines()
             words = {**VM_DECOY_EXIT_WORDS, 1: "not healthy, reverted by the CLI" if mode == "--decoy-change" else "failed"}
@@ -902,7 +927,7 @@ class VmDecoyExecutor:
     def timeout_sec(self, record: DecoyRecord, default: int | None = None) -> int:
         """How long the queue lets a VM decoy stay «rolling»: its gap plus the revert call (same call shape as
         CompositeDecoyExecutor.timeout_sec; ``default`` is not used for a VM decoy)."""
-        return int(record.gap_sec or 0) + 2 * self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC
+        return int(record.gap_sec or 0) + 2 * VM_DECOY_CALL_TIMEOUT_SEC
 
 
 class CompositeDecoyExecutor:
