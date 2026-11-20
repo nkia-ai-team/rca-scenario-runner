@@ -835,7 +835,8 @@ def test_run_in_group_ends_the_whole_group_on_timeout(tmp_path: Path) -> None:
     child = int(pid_file.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(child, 0)
-    assert vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC > vm_ops.OPERATOR_SESSION_CLI_LIMIT_SEC
+    # T4S: the CLI ends its own ssh group after 90 seconds (exit 124); the runner waits 150.
+    assert (vm_ops.OPERATOR_SESSION_CLI_LIMIT_SEC, vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC) == (90, 150)
 
 
 @pytest.mark.asyncio

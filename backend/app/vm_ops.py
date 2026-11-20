@@ -910,8 +910,9 @@ OPERATOR_ROUTINE_BUSY_RETRY_SEC = 300
 # After this many busy answers in a row for the same VM, another VM is drawn (a lock held for good, e.g. by an ssh
 # left behind, must not pin the routine to one VM; review rv-t4o M2).
 OPERATOR_ROUTINE_BUSY_LIMIT = 3
-# The CLI's own limit around its ssh session (T4S); the runner waits longer, so the CLI ends its own session first.
-OPERATOR_SESSION_CLI_LIMIT_SEC = 120
+# The CLI's own limit around its ssh session (T4S SESSION_TIMEOUT_SECONDS 90: it ends its ssh group and exits 124);
+# the runner waits longer, so the CLI ends its own session first. 124 is recorded as a failure.
+OPERATOR_SESSION_CLI_LIMIT_SEC = 90
 # With no recorded session (first start) the first one comes 1 to 10 minutes after start.
 OPERATOR_ROUTINE_FIRST_SEC = (60, 600)
 OPERATOR_ROUTINE_TIMEOUT_SEC = OPERATOR_SESSION_CLI_LIMIT_SEC + 60
