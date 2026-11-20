@@ -736,21 +736,34 @@ def build_schedule(
         if target.transport == "vm":
             bounds = policy.vm_hold_sec
             assert bounds is not None  # the policy validator requires it with VM targets
-            # The revert must be over before the buffer opens: two operator calls of room after it.
-            room = int((buffer_start - at).total_seconds()) - VM_DECOY_CALL_ROOM_SEC
-            gap_sec = draw_vm_decoy_gap_within(rng, bounds.min, min(bounds.max, room))
+            # The gap first, then the start (command-session decision on the T4U-3 open question): the revert must
+            # be over VM_DECOY_CALL_ROOM_SEC before the buffer opens, so a decoy whose drawn time leaves too little
+            # room starts that much earlier instead of being dropped. Otherwise nearly every near-fault VM decoy was
+            # skipped and «an operator change near the fault» would mark the cause in this domain (principle 8).
+            latest_revert = buffer_start - timedelta(seconds=VM_DECOY_CALL_ROOM_SEC)
+            earliest = cycle_start + timedelta(seconds=policy.windows["normal"].start_after_cycle_start_sec or 0)
+            span = int((latest_revert - earliest).total_seconds())
+            gap_sec = draw_vm_decoy_gap_within(rng, bounds.min, min(bounds.max, span))
+            moved = None
+            if gap_sec is not None and at + timedelta(seconds=gap_sec) > latest_revert:
+                moved = latest_revert - timedelta(seconds=gap_sec)
+                others = [time for time, _ in timed if time != at] + [_parse(r.planned_at) for r in records]
+                if any(abs(moved - other) < min_gap for other in others):
+                    gap_sec = None  # moving it would crowd another decoy
             if gap_sec is None:
-                # No recorded length fits before the buffer: the decoy is not run, and the record says so.
+                # No recorded length fits: the decoy is not run, and the record says so.
                 records.append(
                     DecoyRecord(
                         id=f"d{index}", window=window_name, planned_at=_format(at), kind=kind,
                         namespace=target.namespace, deployment=target.deployment, node=target.node,
                         service_name=target.service_name, target_id=target.target_id, relation=relation,
                         value=f"{stamp}-{token}", status="skipped",
-                        detail=f"no recorded injection length fits the {max(room, 0)}s left before the buffer",
+                        detail="no recorded injection length fits before the buffer without crowding another decoy",
                     )
                 )
                 continue
+            if moved is not None:
+                at = moved
         records.append(
             DecoyRecord(
                 id=f"d{index}", window=window_name, planned_at=_format(at), kind=kind,
@@ -761,6 +774,9 @@ def build_schedule(
                 value=f"revision {token}" if kind == "annotation" else f"{stamp}-{token}",
             )
         )
+    # The queue runs planned decoys in list order; a VM decoy moved earlier takes its place by time. Without VM
+    # targets nothing moves and the order is the drawn one.
+    records.sort(key=lambda record: record.planned_at)
     return records
 
 

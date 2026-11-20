@@ -1068,7 +1068,7 @@ def test_vm_decoy_gaps_follow_the_injection_lengths_and_end_before_the_buffer() 
                 continue
             if record.status == "skipped":
                 # No recorded length fit before the buffer: not run, and the record says why.
-                assert record.gap_sec is None and "fits the" in (record.detail or "")
+                assert record.gap_sec is None and "fits before the buffer" in (record.detail or "")
                 continue
             planned = datetime.strptime(record.planned_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
             assert 96 <= record.gap_sec <= 1878
@@ -1084,7 +1084,7 @@ def test_a_vm_decoy_with_no_gap_that_fits_is_skipped_and_recorded(monkeypatch) -
     records = [r for seed in range(200) for r in build_schedule(
         _vm_policy(), seed=seed, scenario_id="F99-X", scenario=VM_SCENARIO, cycle_start=CYCLE_START,
         buffer_start=BUFFER_START) if r.node]
-    assert records and all(r.status == "skipped" and r.gap_sec is None and "fits the" in r.detail for r in records)
+    assert records and all(r.status == "skipped" and r.gap_sec is None and "fits before the buffer" in r.detail for r in records)
 
 
 def test_a_vm_decoy_alarm_is_excused_by_its_service_or_target_name() -> None:
@@ -1223,3 +1223,57 @@ def test_the_recorded_gaps_are_the_testbed_services_list_and_its_policy_range() 
     assert (active.vm_hold_sec.min, active.vm_hold_sec.max) == (VM_DECOY_RECORDED_GAPS_SEC[0], VM_DECOY_RECORDED_GAPS_SEC[-1])
     source = (REGISTRY.parent / "profiles" / "operator_session.py").read_text(encoding="utf-8")
     assert f"DECOY_LIMIT_SECONDS = {VM_DECOY_CLI_LIMIT_SEC}" in source
+
+
+def test_near_fault_vm_decoys_move_earlier_instead_of_being_dropped() -> None:
+    """Command-session decision on the T4U-3 open question: a VM decoy draws its gap first and starts earlier when
+    its revert would not end 600 s before the buffer. Near-fault VM decoys then run about as often as near-fault
+    Kubernetes decoys (simulation: VM 34.2% of run VM decoys near the fault against 36.2% for Kubernetes decoys,
+    about 5.5% of near-fault VM decoys skipped because moving them would crowd another decoy, 3000 seeds), so «an
+    operator change near the fault» is no simple rule."""
+    from collections import Counter
+
+    from app.decoys import VM_DECOY_CALL_ROOM_SEC
+
+    policy = _vm_policy()
+    vm, vm_skipped, kubernetes = Counter(), Counter(), Counter()
+    moved = 0
+    for seed in range(1500):
+        records = build_schedule(policy, seed=seed, scenario_id="F99-X", scenario=VM_SCENARIO,
+                                 cycle_start=CYCLE_START, buffer_start=BUFFER_START)
+        assert [r.planned_at for r in records] == sorted(r.planned_at for r in records)  # the queue runs in order
+        starts = [datetime.strptime(r.planned_at, "%Y-%m-%dT%H:%M:%SZ") for r in records if r.status != "skipped"]
+        assert all((b - a).total_seconds() >= 720 for a, b in zip(starts, starts[1:]))  # a move never crowds
+        for record in records:
+            if record.node is None:
+                continue
+            if record.status == "skipped":
+                vm_skipped[record.window] += 1
+                continue
+            vm[record.window] += 1
+            planned = datetime.strptime(record.planned_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            assert planned + timedelta(seconds=record.gap_sec + VM_DECOY_CALL_ROOM_SEC) <= BUFFER_START
+            if planned + timedelta(seconds=record.gap_sec + VM_DECOY_CALL_ROOM_SEC) == BUFFER_START:
+                moved += 1  # moved earlier: its revert ends exactly at the latest allowed time
+        for record in build_schedule(policy, seed=seed, scenario_id="F01-R", scenario=SCENARIO,
+                                     cycle_start=CYCLE_START, buffer_start=BUFFER_START):
+            kubernetes[record.window] += 1
+    share = lambda counts: counts["near_fault"] / sum(counts.values())  # noqa: E731
+    assert share(vm) >= 0.85 * share(kubernetes), (share(vm), share(kubernetes))
+    assert vm_skipped["near_fault"] <= 0.10 * (vm["near_fault"] + vm_skipped["near_fault"])
+    assert moved > 0
+
+
+def test_a_vm_decoy_moved_before_another_takes_its_place_by_time(monkeypatch) -> None:
+    """The queue runs planned decoys in list order, so a VM decoy moved earlier than a decoy drawn before it must
+    come first in the list (long gaps make that happen)."""
+    import app.decoys as decoys
+
+    monkeypatch.setattr(decoys, "draw_vm_decoy_gap_within", lambda rng, low, high: min(high, 1878))
+    reordered = 0
+    for seed in range(600):
+        records = build_schedule(_vm_policy(), seed=seed, scenario_id="F99-X", scenario=VM_SCENARIO,
+                                 cycle_start=CYCLE_START, buffer_start=BUFFER_START)
+        assert [r.planned_at for r in records] == sorted(r.planned_at for r in records)
+        reordered += [r.id for r in records] != sorted((r.id for r in records), key=lambda i: int(i[1:]))
+    assert reordered > 0
