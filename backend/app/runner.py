@@ -44,6 +44,7 @@ from app.production_runtime import (
 )
 from app.watchdog_service import WatchdogService
 from app import dirty_retry
+from app.vm_ops import kill_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -872,6 +873,9 @@ class ScenarioRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=execution_environment(),
+                # Its own process group, so a timeout ends the script and everything it started (an ssh left
+                # behind would keep holding the VM's operator lock, review rv-t4o M2).
+                start_new_session=True,
             )
             if invocation.stdin_bytes is not None:
                 assert proc.stdin is not None
@@ -885,7 +889,7 @@ class ScenarioRunner:
                 )
                 await proc.wait()
             except asyncio.TimeoutError:
-                proc.kill()
+                kill_process_group(proc.pid)
                 await proc.wait()
                 self._append_log("[ERROR] Execution timed out and was killed")
                 return -1

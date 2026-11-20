@@ -155,3 +155,32 @@ async def test_dispatch_preparation_failure_marks_run_failed(
     assert current.status == "failed"
     assert current.exit_code == -1
     assert any("MISSING_RUNNER_TOKEN" in line for line in current.log_tail)
+
+
+async def test_a_timed_out_script_is_ended_with_everything_it_started(tmp_path: Path) -> None:
+    """Review rv-t4o M2: a timeout used to kill only bash, and an ssh it had started stayed behind (on a VM testbed
+    that ssh keeps the VM's operator lock and a session that never closes). The script runs in its own process
+    group and the whole group is ended."""
+    import os
+
+    pid_file = tmp_path / "child.pid"
+    script = tmp_path / "hang.sh"
+    script.write_text(f"#!/usr/bin/env bash\nsleep 60 &\necho $! > {pid_file}\nwait\n", encoding="utf-8")
+    runner = ScenarioRunner(script_dir=tmp_path, log_dir=tmp_path / "logs")
+    with open(tmp_path / "log.txt", "w", encoding="utf-8") as log_file:
+        code = await runner._invoke_once(
+            ExecutionSpec(transport="local", location="runner", timeout_sec=1), script, "F99-X", "run", log_file
+        )
+    assert code == -1
+    child = int(pid_file.read_text())
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        import time
+
+        time.sleep(0.1)
+    else:
+        os.kill(child, 9)
+        raise AssertionError("the script's child outlived the timeout")

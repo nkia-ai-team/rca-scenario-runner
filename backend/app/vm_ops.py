@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -404,6 +405,44 @@ def cpu_busy_percent(older: Sequence[int], newer: Sequence[int]) -> float:
     return 100.0 * (total - idle) / total
 
 
+def kill_process_group(pid: int, *, grace_sec: float = 5.0) -> None:
+    """End a process started with start_new_session=True and everything in its group (an ssh it started included):
+    SIGTERM, then SIGKILL after ``grace_sec``. Only that group, never a pattern."""
+    import signal
+    import time
+
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace_sec
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pid, signal.SIGKILL)
+
+
+def run_in_group(argv: Sequence[str], *, timeout: float, env: Mapping[str, str]) -> subprocess.CompletedProcess:
+    """subprocess.run that, on timeout, ends the whole process group it started (review rv-t4o M2: killing only the
+    CLI left its ssh behind, a session that never closes on the VM and keeps the VM's operator lock).
+    Raises subprocess.TimeoutExpired after the group is gone."""
+    process = subprocess.Popen(
+        list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(env),
+        start_new_session=True, close_fds=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_process_group(process.pid)
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
+
+
 def _atomic_write(path: Path, text: str, *, mode: int = 0o640) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -591,7 +630,7 @@ class VmOps:
         routine: OperatorRoutine | None = None,
     ) -> None:
         self.hosts = tuple(hosts)
-        self.routine = routine or OperatorRoutine(process_runner=process_runner, clock=clock, state_dir=state_dir)
+        self.routine = routine or OperatorRoutine(clock=clock, state_dir=state_dir)
         self.process_runner = process_runner
         self.clock = clock
         self.state_dir = state_dir
@@ -860,15 +899,22 @@ class VmOps:
 # belongs to the testbed-services CLI; the runner only schedules it and records the outcome (T4O contract 3, 4, 6).
 CONTRACT_ROOT = Path(os.environ.get("SCENARIO_CONTRACT_ROOT", "/opt/lucida/scenario-contracts"))
 OPERATOR_SESSION_CLI = CONTRACT_ROOT / "profiles" / "operator_session.py"
+# The VMs the CLI accepts come from the CLI itself (`--list-nodes`, one list in testbed-services, review rv-t4o L3);
+# this is only what the runner expects to see there (the router and the four servers, never the loadgen).
 OPERATOR_ROUTINE_HOSTS = ("rt-core01", "web01", "was01", "was02", "db01")
 OPERATOR_ROUTINE_MIN_SEC = 1800
 OPERATOR_ROUTINE_MAX_SEC = 5400
 # The CLI exits 75 when an executor's operator session holds that VM's lock: same VM again after this.
 OPERATOR_ROUTINE_BUSY_EXIT = 75
 OPERATOR_ROUTINE_BUSY_RETRY_SEC = 300
+# After this many busy answers in a row for the same VM, another VM is drawn (a lock held for good, e.g. by an ssh
+# left behind, must not pin the routine to one VM; review rv-t4o M2).
+OPERATOR_ROUTINE_BUSY_LIMIT = 3
+# The CLI's own limit around its ssh session (T4S); the runner waits longer, so the CLI ends its own session first.
+OPERATOR_SESSION_CLI_LIMIT_SEC = 120
 # With no recorded session (first start) the first one comes 1 to 10 minutes after start.
 OPERATOR_ROUTINE_FIRST_SEC = (60, 600)
-OPERATOR_ROUTINE_TIMEOUT_SEC = 120
+OPERATOR_ROUTINE_TIMEOUT_SEC = OPERATOR_SESSION_CLI_LIMIT_SEC + 60
 # Preflight: the last successful routine session (any VM) at most two longest gaps ago (T4O contract 6).
 OPERATOR_ROUTINE_MAX_AGE_SEC = 2 * OPERATOR_ROUTINE_MAX_SEC
 # What the CLI reads from the environment (same names as the executors).
@@ -881,13 +927,14 @@ class OperatorRoutine:
     def __init__(
         self,
         *,
-        process_runner: ProcessRunner = subprocess.run,
+        process_runner: Callable[..., subprocess.CompletedProcess] = run_in_group,
         clock: Clock = _utc_now,
         state_dir: Path = STATE_DIR,
         rng: Any = None,
         cli: Path = OPERATOR_SESSION_CLI,
     ) -> None:
         self.process_runner = process_runner
+        self._nodes: tuple[str, ...] | None = None
         self.clock = clock
         self.state_dir = state_dir
         self.rng = rng or random.SystemRandom()
@@ -906,12 +953,27 @@ class OperatorRoutine:
     def _save(self, document: Mapping[str, Any]) -> None:
         _atomic_write(self.path, json.dumps(document, indent=2, sort_keys=True) + "\n")
 
-    def _draw(self, now: datetime, *, first: bool = False) -> dict[str, str]:
+    def _call(self, args: Sequence[str]) -> subprocess.CompletedProcess:
+        return self.process_runner(
+            ["python3", str(self.cli), *args], timeout=OPERATOR_ROUTINE_TIMEOUT_SEC, env=self._environment(),
+        )
+
+    def nodes(self) -> tuple[str, ...]:
+        """The VMs the CLI takes (`--list-nodes`), read once per process. Raises when it cannot be read."""
+        if self._nodes is None:
+            result = self._call(["--list-nodes"])
+            if result.returncode != 0:
+                raise VmOpsError(f"node list exited {result.returncode}: {_tail(result.stderr or result.stdout)}")
+            names = json.loads(result.stdout)
+            if not isinstance(names, list) or not names or not all(isinstance(name, str) and name for name in names):
+                raise VmOpsError(f"node list is not a list of names: {_tail(result.stdout)}")
+            self._nodes = tuple(names)
+        return self._nodes
+
+    def _draw(self, now: datetime, *, first: bool = False, avoid: str | None = None) -> dict[str, str]:
         low, high = OPERATOR_ROUTINE_FIRST_SEC if first else (OPERATOR_ROUTINE_MIN_SEC, OPERATOR_ROUTINE_MAX_SEC)
-        return {
-            "at": _format(now + timedelta(seconds=self.rng.uniform(low, high))),
-            "host": self.rng.choice(OPERATOR_ROUTINE_HOSTS),
-        }
+        hosts = [name for name in self.nodes() if name != avoid] or list(self.nodes())
+        return {"at": _format(now + timedelta(seconds=self.rng.uniform(low, high))), "host": self.rng.choice(hosts)}
 
     def _environment(self) -> dict[str, str]:
         env = _environment()
@@ -923,8 +985,16 @@ class OperatorRoutine:
         with self._lock:
             now = self.clock()
             document = self.load()
+            try:
+                self.nodes()
+            except Exception as error:
+                # No list, no session: preflight stops the domain once the last success is 180 minutes old.
+                document["stopped"] = {"at": _format(now), "detail": f"{type(error).__name__}: {error}"[:300]}
+                self._save(document)
+                return document
+            document.pop("stopped", None)
             planned = document.get("next")
-            if not planned:
+            if not planned or planned.get("host") not in self.nodes():
                 document["next"] = self._draw(now, first=document.get("last_ok") is None)
                 self._save(document)
                 return document
@@ -932,10 +1002,7 @@ class OperatorRoutine:
                 return document
             host = planned["host"]
             try:
-                result = self.process_runner(
-                    ["python3", str(self.cli), "--node", host, "--check"], capture_output=True, text=True,
-                    timeout=OPERATOR_ROUTINE_TIMEOUT_SEC, env=self._environment(), check=False,
-                )
+                result = self._call(["--node", host, "--check"])
                 code, detail = result.returncode, _tail(result.stderr or result.stdout)
             except subprocess.TimeoutExpired:
                 code, detail = -1, f"no end within {OPERATOR_ROUTINE_TIMEOUT_SEC}s"
@@ -943,12 +1010,29 @@ class OperatorRoutine:
                 code, detail = -1, f"{type(error).__name__}: {error}"
             stamp = _format(now)
             document["last"] = {"at": stamp, "host": host, "rc": code, "detail": "" if code == 0 else detail[:300]}
+            if code != OPERATOR_ROUTINE_BUSY_EXIT:
+                document.pop("busy_host", None)
+                document.pop("busy_count", None)
             if code == 0:
                 document["last_ok"] = {"at": stamp, "host": host}
                 document["next"] = self._draw(now)
             elif code == OPERATOR_ROUTINE_BUSY_EXIT:
-                # An executor's operator session holds this VM: the same VM a little later.
-                document["next"] = {"at": _format(now + timedelta(seconds=OPERATOR_ROUTINE_BUSY_RETRY_SEC)), "host": host}
+                busy = int(document.get("busy_count", 0)) + 1 if document.get("busy_host") == host else 1
+                if busy >= OPERATOR_ROUTINE_BUSY_LIMIT:
+                    # Held too long: another VM on the normal schedule, and say so.
+                    document["last"]["switched_from"] = host
+                    document["last"]["detail"] = (
+                        f"{host} busy {busy} times in a row; drew another VM. {document['last']['detail']}"[:300]
+                    )
+                    document["next"] = self._draw(now, avoid=host)
+                    document.pop("busy_host", None)
+                    document.pop("busy_count", None)
+                else:
+                    # An executor's operator session holds this VM: the same VM a little later.
+                    document["next"] = {
+                        "at": _format(now + timedelta(seconds=OPERATOR_ROUTINE_BUSY_RETRY_SEC)), "host": host,
+                    }
+                    document["busy_host"], document["busy_count"] = host, busy
             else:
                 logger.warning("routine operator session on %s failed (%s): %s", host, code, detail)
                 document["next"] = self._draw(now)
@@ -981,6 +1065,7 @@ class VmOpsService:
         self._monotonic = monotonic or (lambda: asyncio.get_running_loop().time())
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
+        self._routine_task: asyncio.Task | None = None
 
     async def run(self) -> None:
         next_read = self._monotonic()
@@ -996,6 +1081,15 @@ class VmOpsService:
                 except Exception:
                     logger.exception("periodic management read failed")
             try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.check_interval_sec)
+            except asyncio.TimeoutError:
+                pass
+
+    async def run_routine(self) -> None:
+        """The routine operator session in its own loop (review rv-t4o L4): a session takes up to the CLI limit and
+        must not hold up the master checks."""
+        while not self._stop.is_set():
+            try:
                 await asyncio.to_thread(self.ops.routine.tick)
             except Exception:
                 logger.exception("routine operator session failed")
@@ -1008,6 +1102,7 @@ class VmOpsService:
         if self._task is None or self._task.done():
             self._stop = asyncio.Event()
             self._task = asyncio.create_task(self.run())
+            self._routine_task = asyncio.create_task(self.run_routine())
 
     async def stop(self) -> None:
         """End the loop, then the masters with ``-O exit`` (review rv-t4r3 H1: a master killed by docker's SIGKILL
@@ -1016,11 +1111,13 @@ class VmOpsService:
         MASTER_OPEN_WAIT_SEC). The app stops this service first and compose gives the container stop_grace_period
         60s, longer than this path."""
         self._stop.set()
-        if self._task is not None:
+        for task in (self._task, self._routine_task):
+            if task is None:
+                continue
             try:
-                await asyncio.wait_for(asyncio.shield(self._task), timeout=STOP_LOOP_WAIT_SEC)
+                await asyncio.wait_for(asyncio.shield(task), timeout=STOP_LOOP_WAIT_SEC)
             except Exception:
-                self._task.cancel()
+                task.cancel()
         await asyncio.to_thread(self.ops.supervisor.stop)
 
 

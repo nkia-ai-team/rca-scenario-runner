@@ -689,6 +689,8 @@ def _routine(tmp_path: Path, codes: list, *, clock: Clock | None = None, rng=Non
     calls = []
 
     def run(argv, **kwargs):
+        if argv[-1] == "--list-nodes":  # the CLI's own list (review rv-t4o L3)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(list(vm_ops.OPERATOR_ROUTINE_HOSTS)) + "\n", "")
         calls.append((argv, kwargs))
         code = codes.pop(0) if codes else 0
         return subprocess.CompletedProcess(argv, code, "", "" if code == 0 else "ssh: connect to host 192.168.127.21 port 22: timed out\n")
@@ -752,3 +754,118 @@ def test_routine_operator_sessions_cover_the_router_and_servers_at_30_to_90_minu
     gaps = [(b - a).total_seconds() for a, b in zip(starts, starts[1:])]
     assert gaps and min(gaps) >= 1800 and max(gaps) <= 5400 + 60
     assert len(starts) >= 2000 // 90
+
+
+def test_routine_intervals_are_spread_over_the_whole_30_to_90_minutes(tmp_path: Path) -> None:
+    """Review rv-t4o M4 (mutant R4: a fixed 60-minute gap passed): 2000 draws reach below 35 and above 85 minutes."""
+    import random
+
+    routine, _, clock = _routine(tmp_path, [], rng=random.Random(11))
+    gaps = [(vm_ops._parse(routine._draw(clock.value)["at"]) - clock.value).total_seconds() for _ in range(2000)]
+    assert min(gaps) >= 1800 and max(gaps) <= 5400
+    assert min(gaps) < 35 * 60 and max(gaps) > 85 * 60
+
+
+def test_a_vm_busy_three_times_in_a_row_hands_the_routine_to_another_vm(tmp_path: Path) -> None:
+    """Review rv-t4o M2: a lock held for good (an ssh left behind) must not pin the routine to one VM. After three
+    busy answers in a row the next session goes to another VM, and the record says so."""
+    routine, calls, clock = _routine(tmp_path, [75, 75, 75])
+    routine.tick()  # plans rt-core01
+    for attempt in range(3):
+        clock.value = vm_ops._parse(routine.load()["next"]["at"])
+        document = routine.tick()
+    assert [argv[3] for argv, _ in calls] == ["rt-core01"] * 3
+    assert document["last"]["switched_from"] == "rt-core01"
+    assert "busy 3 times in a row" in document["last"]["detail"]
+    assert document["next"]["host"] != "rt-core01" and "busy_count" not in document
+    # Two busy answers then a success: no switch, the count starts over.
+    (tmp_path / "b").mkdir()
+    routine, calls, clock = _routine(tmp_path / "b", [75, 75, 0, 75])
+    routine.tick()
+    for _ in range(4):
+        clock.value = vm_ops._parse(routine.load()["next"]["at"])
+        document = routine.tick()
+    assert "switched_from" not in document["last"] and document["busy_count"] == 1
+
+
+def test_the_routine_takes_its_vm_list_from_the_cli_and_stops_without_it(tmp_path: Path) -> None:
+    """Review rv-t4o L3: one VM list, the CLI's (`--list-nodes`). Without it no session runs and the record says
+    why (preflight then stops the domain once the last success is 180 minutes old)."""
+    clock = Clock()
+    asked = []
+
+    def run(argv, **kwargs):
+        asked.append(argv[2:])
+        if argv[-1] == "--list-nodes":
+            return subprocess.CompletedProcess(argv, 1, "", "operator_session.py: no inventory\n")
+        raise AssertionError(argv)
+
+    routine = vm_ops.OperatorRoutine(process_runner=run, clock=clock, state_dir=tmp_path / "s", rng=_Draws())
+    document = routine.tick()
+    assert "no inventory" in document["stopped"]["detail"] and "next" not in document
+    assert asked == [["--list-nodes"]]
+
+    listed = ["web01", "db01"]
+
+    def run_listed(argv, **kwargs):
+        if argv[-1] == "--list-nodes":
+            return subprocess.CompletedProcess(argv, 0, json.dumps(listed), "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    routine = vm_ops.OperatorRoutine(process_runner=run_listed, clock=clock, state_dir=tmp_path / "s", rng=_Draws())
+    document = routine.tick()
+    assert "stopped" not in document and document["next"]["host"] in listed
+    # A planned VM the list no longer carries is redrawn from the list, never run.
+    listed[:] = ["db01"]
+    routine._nodes = None
+    document = routine.tick()
+    assert document["next"]["host"] == "db01"
+
+
+def test_run_in_group_ends_the_whole_group_on_timeout(tmp_path: Path) -> None:
+    """Review rv-t4o M2: the routine CLI is ended with the ssh it started."""
+    pid_file = tmp_path / "child.pid"
+    with pytest.raises(subprocess.TimeoutExpired):
+        vm_ops.run_in_group(["bash", "-c", f"sleep 60 & echo $! > {pid_file}; wait"], timeout=1,
+                            env={"PATH": os.environ["PATH"]})
+    child = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+    assert vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC > vm_ops.OPERATOR_SESSION_CLI_LIMIT_SEC
+
+
+@pytest.mark.asyncio
+async def test_the_routine_does_not_hold_up_the_master_checks(tmp_path: Path) -> None:
+    """Review rv-t4o L4: a routine session that takes long runs in its own loop; master checks go on meanwhile."""
+    import threading
+
+    checks: list[float] = []
+    release = threading.Event()
+
+    class Supervisor:
+        def ensure(self):
+            checks.append(1)
+
+        def stop(self):
+            pass
+
+    class Routine:
+        def tick(self):
+            release.wait(5)
+
+    class Ops:
+        supervisor = Supervisor()
+        routine = Routine()
+
+        def read_all(self):
+            pass
+
+    service = vm_ops.VmOpsService(Ops(), check_interval_sec=0.01, read_interval_sec=300)
+    service.ensure_started()
+    for _ in range(100):
+        if len(checks) >= 5:
+            break
+        await asyncio.sleep(0.01)
+    release.set()
+    await service.stop()
+    assert len(checks) >= 5
