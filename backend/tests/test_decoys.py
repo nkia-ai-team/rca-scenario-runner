@@ -373,8 +373,13 @@ def test_the_testbed_registry_policy_plans_for_every_scenario() -> None:
     scenarios = json.loads((root / "scenario-metadata.json").read_text(encoding="utf-8"))["scenarios"]
 
     assert len(digest) == 64
-    # P4 not confirmed yet: the shipped policy rolls pods only by restart.
-    assert {kind for kind, weight in active.kind_weights.items() if weight > 0} == {"restart"}
+    # P4 not confirmed yet: the shipped policy rolls pods only by restart. The VM testbed kinds (review rv-t4o M3,
+    # T4U) are the only others, and only VM targets take them.
+    from app.decoys import VM_KINDS
+
+    enabled = {kind for kind, weight in active.kind_weights.items() if weight > 0}
+    assert "restart" in enabled and enabled - {"restart"} <= VM_KINDS
+    vm_kinds = {target.key: set(target.kinds) for target in active.targets if target.transport == "vm"}
     for scenario_id, scenario in scenarios.items():
         excluded = excluded_targets(active, scenario_id, scenario)
         for seed in range(3):
@@ -382,8 +387,12 @@ def test_the_testbed_registry_policy_plans_for_every_scenario() -> None:
                 active, seed=seed, scenario_id=scenario_id, scenario=scenario,
                 cycle_start=CYCLE_START, buffer_start=BUFFER_START,
             ):
-                assert record.kind == "restart"
-                assert f"{record.namespace}/{record.deployment}" not in excluded, scenario_id
+                key = f"{record.namespace}/{record.deployment}"
+                if record.node is None:
+                    assert record.kind == "restart"
+                else:
+                    assert record.kind in vm_kinds[key], (key, record.kind)
+                assert key not in excluded, scenario_id
 
 
 # --- U7 수정 2회차: review2 B3, B4, M3 -------------------------------------
