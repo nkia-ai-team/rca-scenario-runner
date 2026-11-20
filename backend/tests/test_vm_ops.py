@@ -609,3 +609,50 @@ def test_a_check_that_times_out_does_not_remove_or_reopen_a_socket(tmp_path: Pat
                                   sleep=lambda _: None)
     supervisor.ensure()
     assert opens == [] and socket.exists()
+
+
+# --- Safety rules the review mutants showed unpinned (rv-t4r2 M3, L5) --------------------------------------------
+
+def test_a_live_master_this_process_did_not_open_starts_the_settle_now(tmp_path: Path) -> None:
+    """rv-t4r2 R19: a socket that is alive but was not opened by this runner process (left by an earlier runner
+    process in the same container) has an unknown open time, so the 30-minute settle counts from now, never from
+    an older time that would let a recording start right away."""
+    clock = Clock()
+    opens = []
+    supervisor = MasterSupervisor(
+        hosts=[HOSTS_BY_NAME["db01"]], popen=lambda *a, **k: opens.append(a),
+        process_runner=lambda argv, **k: subprocess.CompletedProcess(argv, 0, "", ""),
+        clock=clock, state_dir=tmp_path / "s", control_dir=tmp_path / "cm", sleep=lambda _: None,
+    )
+    status = supervisor.ensure()["db01"]
+    assert opens == []
+    assert status == {"alive": True, "opened_at": "2026-11-20T06:00:00Z", "detail": "found open"}
+    clock.value += timedelta(minutes=10)
+    assert supervisor.ensure()["db01"]["opened_at"] == "2026-11-20T06:00:00Z"  # kept, not moved later or earlier
+
+
+def test_stale_reads_with_drift_stay_out_of_the_drift_reason(tmp_path: Path) -> None:
+    """rv-t4r2 R24: the drift gate judges only fresh reads. A stale read that once showed drift does not name it
+    (it might be fixed since); preflight refuses the stale facts instead (see test_preflight_probe)."""
+    remote = FakeRemote()
+    clock = Clock()
+    ops = _ops(tmp_path, remote, clock)
+    remote.outputs["192.168.127.31"] = _read_output(HOSTS_BY_NAME["was01"], drift=("petition.war",),
+                                                    sums={"/var/lib/petition-deploy/war.sha256": "rc=1"})
+    ops.read_all()
+    assert "was01 changed since install: petition.war" in ops.drift_detail()
+    clock.value += timedelta(seconds=vm_ops.FACTS_MAX_AGE_SEC + 1)
+    remote.hypervisor = _hypervisor(clock.value)
+    ops.hypervisor_facts()  # 66 fresh, VMs stale
+    assert ops.drift_detail() is None
+
+
+def test_only_the_db01_line_reaches_the_archive_state(tmp_path: Path) -> None:
+    """rv-t4r2 R13: an archive-state file carried by any other VM's read is never delivered as db01's line."""
+    remote = FakeRemote()
+    ops = _ops(tmp_path, remote)
+    forged = '{"host": "db01", "at": "2026-11-20T05:35:02Z"}'
+    remote.outputs["192.168.127.10"] = _read_output(HOSTS_BY_NAME["loadgen"]).replace(
+        "@@ end", f"@@ file archive_state {base64.b64encode(forged.encode()).decode()}\n@@ end")
+    ops.read_all()
+    assert not (tmp_path / "petition-archive" / "last.json").exists()

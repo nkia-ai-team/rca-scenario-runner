@@ -410,3 +410,56 @@ def test_vm_domain_floor_follows_the_loadgen_hour_table() -> None:
     assert vm_domain_rps_floor(datetime(2026, 11, 19, 19, 30, tzinfo=timezone.utc), _LOADGEN_ENV) == 2.5   # 04 KST
     with _pytest.raises(_vm_ops.VmOpsError, match="PEAK_RPS"):
         vm_domain_target_rps(3, "LOADGEN_SEED=42")
+
+
+# --- Safety rules the review mutants showed unpinned (rv-t4r2 M3, L5) --------------------------------------------
+
+def test_vm_domain_guard_residue_counts_a_left_timer_without_a_state_file(tmp_path) -> None:
+    """rv-t4r2 R5: T4S contract 8 is «no *.unit and no run-r* timer». A timer left without its state file (an undo
+    that failed half way) is residue too."""
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    remote.outputs["192.168.127.32"] = _read_output(_vm_ops.HOSTS_BY_NAME["was02"], at=clock.value, guards=(0, 1))
+    remote.outputs["192.168.127.2"] = _read_output(_vm_ops.HOSTS_BY_NAME["rt-core01"], at=clock.value,
+                                                   procstat="cpu  850 0 0 3050 0 0 0 0 0 0")
+    ops.read_all()
+    remote.hypervisor = _hypervisor(clock.value, rx=90_000_000, tx=90_000_000)
+    assert probe.collect(now=clock.value)["residual_guards"] == 1
+
+
+def test_vm_domain_preflight_refuses_stale_reads_even_when_they_showed_drift(tmp_path) -> None:
+    """rv-t4r2 R24, the other half: the drift gate leaves stale reads out (test_vm_ops), and preflight then stops
+    the domain on the staleness itself, so a stale read never opens the way."""
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    remote.outputs["192.168.127.31"] = _read_output(_vm_ops.HOSTS_BY_NAME["was01"], at=clock.value, drift=("petition.war",))
+    ops.read_all()
+    clock.value += _timedelta(seconds=_vm_ops.FACTS_MAX_AGE_SEC + 1)
+    remote.hypervisor = _hypervisor(clock.value, rx=90_000_000, tx=90_000_000)
+    assert ops.drift_detail() is None
+    with _pytest.raises(_vm_ops.VmOpsError, match="periodic management read is stale: rt-core01: last read"):
+        probe.collect(now=clock.value)
+
+
+def test_vm_domain_probe_refuses_a_scenario_loadgen_document(tmp_path) -> None:
+    """rv-t4r2 R16: a live summary that carries a scenario identity is a scenario's own k6 output, not the resident
+    baseline, and is never judged as the domain's normal load."""
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    remote.live = remote.live_document(scenario_id="F99-X")
+    with _pytest.raises(_vm_ops.VmOpsError, match="not this domain's baseline document"):
+        probe.collect(now=clock.value)
+
+
+def test_vm_domain_probe_refuses_a_short_ping_run(tmp_path) -> None:
+    """rv-t4r2 R17: fewer than the 10 pings the design asks for cannot show «10 pings, loss 0»."""
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    remote.hypervisor = {**_hypervisor(clock.value, rx=90_000_000, tx=90_000_000),
+                         "ping": {"sent": 5, "received": 5, "max_ms": 1.0}}
+    with _pytest.raises(_vm_ops.VmOpsError, match="sent 5 pings, expected 10"):
+        probe.collect(now=clock.value)
+
+
+def test_vm_domain_probe_refuses_a_missing_master_status(tmp_path) -> None:
+    """rv-t4r2 R18: a supervised host with no status at all (66 here) is not counted as alive or settled."""
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    del ops.supervisor.status["pve66"]
+    with _pytest.raises(_vm_ops.VmOpsError, match=r"no master status for \['pve66'\]"):
+        probe.collect(now=clock.value)
