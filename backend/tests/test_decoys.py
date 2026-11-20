@@ -1015,14 +1015,21 @@ def test_vm_decoy_executor_applies_holds_then_undoes_like_an_injection() -> None
     assert executor.timeout_sec(_record(), 420) == 420
     executor.undo(record)
     assert calls[-1] == ["was02", "--decoy-revert", "war_redeploy"]
-    answers[:] = [subprocess.CompletedProcess([], 1, "", "petition health did not come back in 60s\n"),
-                  subprocess.CompletedProcess([], 75, "", "operator lock on was02 is held\n"),
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    answers[:] = [subprocess.CompletedProcess([], 1, "", "petition health did not come back in 60s\n"), ok,
+                  subprocess.CompletedProcess([], 4, "", "the executor's run ended with 1\n"), ok,
+                  subprocess.CompletedProcess([], 75, "", "operator lock on was02 is held\n"), ok,
                   subprocess.CompletedProcess([], 124, "", "session limit 90s\n")]
-    with pytest.raises(RuntimeError, match="change on was02 not healthy, reverted by the CLI: petition health"):
+    # Each change failure is recorded by its cause (review rv-t4u2 N5) and followed by one revert (N4).
+    with pytest.raises(RuntimeError, match=r"change on was02 not healthy, reverted by the CLI \(exit 1\): petition "
+                                           r"health.*; reverted again after it"):
         executor.apply(record)
-    with pytest.raises(RuntimeError, match="change on was02 busy: operator lock on was02 is held"):
+    assert calls[-1] == ["was02", "--decoy-revert", "war_redeploy"]
+    with pytest.raises(RuntimeError, match=r"executor failed and reverted as root \(exit 4\)"):
         executor.apply(record)
-    with pytest.raises(RuntimeError, match="revert on was02 exited 124: session limit 90s"):
+    with pytest.raises(RuntimeError, match=r"change on was02 busy \(exit 75\): operator lock on was02 is held"):
+        executor.apply(record)
+    with pytest.raises(RuntimeError, match=r"revert on was02 over the CLI limit \(exit 124\): session limit 90s"):
         executor.undo(record)
     executor.apply(_record())  # a Kubernetes record still goes to kubectl
     assert kube.calls
@@ -1122,3 +1129,53 @@ def test_the_real_policy_keeps_every_kubernetes_scenarios_decoys() -> None:
     if "civil-petition" not in active.domain_namespaces:
         active = _vm_policy()  # this checkout's policy has no VM targets yet: compare with the test policy
     assert _kubernetes_scenarios_keep_their_decoys(active, scenarios, range(3)) > 0
+
+
+def test_a_failed_vm_change_is_reverted_once_and_a_failed_revert_is_unsettled() -> None:
+    """Review rv-t4u2 N4: a change that ends in anything but 0 or 3 may have left something (a revert cut by the
+    runner's limit, 124 in the middle of the run, a lock wait), so the revert is called once more. If it fails too,
+    the decoy is unsettled. A refusal (3) touched nothing and is not followed by a revert."""
+    from app.decoys import VmDecoyExecutor, VmDecoyLeftChanged
+
+    calls, answers = [], []
+
+    def run(argv, **kwargs):
+        calls.append(argv[4])
+        return answers.pop(0)
+
+    vm = VmDecoyExecutor(process_runner=run)
+    record = DecoyRecord(id="d1", window="normal", planned_at="2026-11-10T01:30:00Z", kind="config_reapply",
+                         namespace="civil-petition-vm", deployment="petition-web01", node="web01", gap_sec=300,
+                         service_name="web01", target_id="uuid-web01", relation="same_domain", value="x")
+    answers[:] = [subprocess.CompletedProcess([], 124, "", "limit\n"), subprocess.CompletedProcess([], 1, "", "lock\n")]
+    with pytest.raises(VmDecoyLeftChanged, match="revert after it also failed"):
+        vm.apply(record)
+    assert calls == ["--decoy-change", "--decoy-revert"]
+    calls.clear()
+    answers[:] = [subprocess.CompletedProcess([], 3, "", "web01 does not take war_redeploy\n")]
+    with pytest.raises(RuntimeError, match=r"refused \(exit 3\)") as raised:
+        vm.apply(record)
+    assert calls == ["--decoy-change"] and not isinstance(raised.value, VmDecoyLeftChanged)
+
+
+def test_vm_decoy_gaps_are_drawn_again_never_piled_on_an_edge() -> None:
+    """Review rv-t4u2 N6 (b): cutting to the range piled gaps on exactly 240 and 1500 seconds. Drawn again instead,
+    the gaps keep the recorded shape inside the range."""
+    import random
+    from collections import Counter
+
+    from app.decoys import VM_DECOY_GAP_DECILES_SEC, draw_vm_decoy_gap_within
+
+    for low, high in ((96, 1500), (240, 1500)):
+        rng = random.Random(9)
+        gaps = sorted(draw_vm_decoy_gap_within(rng, low, high) for _ in range(2000))
+        assert low <= gaps[0] and gaps[-1] <= high
+        assert Counter(gaps).most_common(1)[0][1] <= 20  # no value holds even 1% of the draws
+        assert gaps.count(low) <= 5 and gaps.count(high) <= 5
+    # With the range down at the recorded minimum, the draws follow the recorded deciles (only the 2% over 1500 go).
+    rng = random.Random(9)
+    gaps = sorted(draw_vm_decoy_gap_within(rng, 96, 1500) for _ in range(2000))
+    for decile in range(1, 9):
+        drawn = gaps[decile * len(gaps) // 10]
+        assert abs(drawn - VM_DECOY_GAP_DECILES_SEC[decile]) <= 0.15 * VM_DECOY_GAP_DECILES_SEC[decile], decile
+    assert draw_vm_decoy_gap_within(random.Random(1), 300, 200) is None

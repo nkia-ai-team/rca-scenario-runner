@@ -39,6 +39,7 @@ from app.decoys import (
     CompositeDecoyExecutor,
     KubectlDecoyExecutor,
     VmDecoyExecutor,
+    VmDecoyLeftChanged,
     build_schedule,
     cycle_seed,
     decoy_document,
@@ -2711,6 +2712,8 @@ class LiveScenarioQueue:
                     "status": "failed",
                     "finished_at": self._format(self.clock.now()),
                     "detail": f"{type(error).__name__}: {error}",
+                    # A VM decoy whose revert failed too may still hold its change (review rv-t4u2 N4).
+                    "unsettled": True if isinstance(error, VmDecoyLeftChanged) else record.unsettled,
                 }
             )
         if started.kind in ROLLOUT_KINDS or started.kind in VM_KINDS:
@@ -2746,6 +2749,7 @@ class LiveScenarioQueue:
                     "status": "failed",
                     "finished_at": self._format(now),
                     "detail": f"{reason}; undo failed: {type(error).__name__}: {error}",
+                    "unsettled": True if record.node is not None else record.unsettled,
                 }
             )
         return record.model_copy(
@@ -2808,6 +2812,9 @@ class LiveScenarioQueue:
             return None
         executor = self._decoy_executor_for(loaded[0])
         for record in state.cycle_decoys:
+            if record.node is not None and record.unsettled:
+                # A VM decoy whose revert failed: its change may still be on the VM (review rv-t4u2 N4).
+                return f"decoy {record.id} on {record.node} may still hold its change: {record.detail}"
             if record.status not in {"rolled_back", "failed"} or record.deployment is None:
                 continue
             if record.kind not in ROLLOUT_KINDS:

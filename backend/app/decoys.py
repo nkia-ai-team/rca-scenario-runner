@@ -74,6 +74,23 @@ VM_DECOY_CALL_ROOM_SEC = 300
 VM_DECOY_GAP_DECILES_SEC: tuple[int, ...] = (96, 267, 375, 484, 500, 624, 857, 920, 957, 1069, 1878)
 
 
+# Draws a gap that falls outside the allowed range are drawn again, never cut to the edge (review rv-t4u2 N6 (b),
+# command-session decision): cutting piled 8% of the gaps on exactly 240 and 4% on exactly 1500 seconds, a value no
+# injection has. After this many draws outside the range the decoy is not planned.
+VM_DECOY_GAP_DRAWS = 64
+
+
+def draw_vm_decoy_gap_within(rng: random.Random, low: int, high: int) -> int | None:
+    """A gap from the recorded injection lengths that lies in [low, high], or None when none came."""
+    if high < low:
+        return None
+    for _ in range(VM_DECOY_GAP_DRAWS):
+        gap = draw_vm_decoy_gap(rng)
+        if low <= gap <= high:
+            return gap
+    return None
+
+
 def draw_vm_decoy_gap(rng: random.Random) -> int:
     """One apply-to-undo gap from the injection length deciles."""
     position = rng.random() * (len(VM_DECOY_GAP_DECILES_SEC) - 1)
@@ -156,9 +173,10 @@ class DecoyConfigMap(_Strict):
 
 
 class DecoyHold(_Strict):
-    """Bounds of the gap a VM decoy stays changed (testbed-services policy ``vm_hold_sec``: the shortest approved
-    min_hold and the most common max_injection_duration). The CLI's executor guard undoes a change by itself at
-    the max + 600 seconds, so a drawn gap never exceeds the max."""
+    """Bounds of the gap a VM decoy stays changed (testbed-services policy ``vm_hold_sec``). Gaps are drawn from the
+    recorded injection lengths and drawn again when outside these bounds. The CLI's executor guard reverts a change
+    by itself at the max + 600 seconds (2100 seconds with the shipped max of 1500), so a drawn gap never exceeds
+    the max."""
 
     min: int = Field(gt=0)
     max: int = Field(gt=0)
@@ -238,6 +256,8 @@ class DecoyRecord(_Strict):
     # The VM a VM-kind decoy runs on and how long it stays changed before the undo (None for every Kubernetes decoy).
     node: str | None = None
     gap_sec: int | None = None
+    # True when a VM decoy may have left its change on the VM (its revert failed): the buffer gate restarts the cycle.
+    unsettled: bool | None = None
     service_name: str | None = None
     target_id: str | None = None
     relation: DecoyRelation
@@ -701,13 +721,11 @@ def build_schedule(
         if target.transport == "vm":
             bounds = policy.vm_hold_sec
             assert bounds is not None  # the policy validator requires it with VM targets
-            # The shape of the recorded injection lengths, held inside the policy's bounds.
-            gap_sec = min(max(draw_vm_decoy_gap(rng), bounds.min), bounds.max)
             # The revert must be over before the buffer opens: two operator calls of room after it.
             room = int((buffer_start - at).total_seconds()) - VM_DECOY_CALL_ROOM_SEC
-            if room < bounds.min:
+            gap_sec = draw_vm_decoy_gap_within(rng, bounds.min, min(bounds.max, room))
+            if gap_sec is None:
                 continue
-            gap_sec = min(gap_sec, room)
         records.append(
             DecoyRecord(
                 id=f"d{index}", window=window_name, planned_at=_format(at), kind=kind,
@@ -790,15 +808,42 @@ class KubectlDecoyExecutor:
         self._kubectl(record.namespace, "rollout", "undo", f"deployment/{record.deployment}")
 
 
+class VmDecoyCallError(RuntimeError):
+    """A non-zero exit of the operator CLI, with its code."""
+
+    def __init__(self, message: str, code: int) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class VmDecoyLeftChanged(RuntimeError):
+    """A VM decoy whose change failed and whose revert failed too: the change may still be on the VM until the
+    CLI's executor guard reverts it (policy max + 600 seconds)."""
+
+
+# The CLI's exit codes (testbed-services operator_session.py) and what the runner records for each.
+VM_DECOY_EXIT_WORDS = {
+    3: "refused",
+    4: "executor failed and reverted as root",
+    75: "busy",
+    124: "over the CLI limit",
+}
+VM_DECOY_REFUSED_EXIT = 3
+
+
 class VmDecoyExecutor:
     """VM-kind decoys through the operator CLI (testbed-services operator_session.py), two calls like an injection's
     run and cleanup (review rv-t4u R1 (a)): ``--decoy-change <kind>`` when the decoy starts (the vm.service run with
     harmless values, the same sudo lines as an injection; the CLI returns 0 only once the app answers healthy again,
     R4) and, once the record's ``gap_sec`` has passed (the queue polls ``rollout_done``), ``--decoy-revert <kind>``
-    (the vm.service cleanup and recovery; nothing to revert is 0). Exit 0 done; 1 after a change means the app was
-    not healthy and the CLI already reverted it; 3 refused; 75 busy; 124 its own limit; any other failed. Every
-    non-zero exit is raised with the CLI's words; a failed change leaves nothing to revert. If the revert never
-    comes, the CLI's executor guard reverts by itself at the policy max + 600 seconds."""
+    (the vm.service cleanup and recovery; nothing to revert is 0 with no login). Exit codes: 0 done; 1 after a change
+    the app was not healthy and the CLI reverted it; 3 refused; 4 the executor failed (it reverted as root); 75
+    busy; 124 over the CLI limit; any other failed. Each is recorded by its cause.
+
+    A change that ends in anything but 0 or 3 may still have left something (a revert cut by the runner's limit,
+    124 in the middle of the run, a lock wait that ate the budget; review rv-t4u2 N4), so the revert is called once
+    more at once. If that also fails the decoy is recorded as unsettled and the buffer gate restarts the cycle; the
+    CLI's executor guard reverts by itself at the policy max + 600 seconds (2100 seconds with the shipped policy)."""
 
     def __init__(self, *, process_runner: Callable[..., subprocess.CompletedProcess] | None = None,
                  cli: Path | None = None, clock: Callable[[], datetime] | None = None) -> None:
@@ -819,18 +864,29 @@ class VmDecoyExecutor:
                 env=self._vm_ops.operator_environment(),
             )
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"operator decoy {mode} on {record.node} did not end within "
-                               f"{self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC}s") from None
+            raise VmDecoyCallError(f"operator decoy {mode} on {record.node} did not end within "
+                                   f"{self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC}s", -1) from None
         if result.returncode != 0:
             tail = (result.stderr or result.stdout or "").strip().splitlines()
-            what = {
-                self._vm_ops.OPERATOR_ROUTINE_BUSY_EXIT: "busy",
-                1: "not healthy, reverted by the CLI" if mode == "--decoy-change" else "exited 1",
-            }.get(result.returncode, f"exited {result.returncode}")
-            raise RuntimeError(f"operator decoy {mode} on {record.node} {what}: {tail[-1] if tail else 'no output'}")
+            words = {**VM_DECOY_EXIT_WORDS, 1: "not healthy, reverted by the CLI" if mode == "--decoy-change" else "failed"}
+            what = words.get(result.returncode, f"exited {result.returncode}")
+            raise VmDecoyCallError(
+                f"operator decoy {mode} on {record.node} {what} (exit {result.returncode}): "
+                f"{tail[-1] if tail else 'no output'}",
+                result.returncode,
+            )
 
     def apply(self, record: DecoyRecord) -> None:
-        self._call(record, "--decoy-change")
+        try:
+            self._call(record, "--decoy-change")
+        except VmDecoyCallError as error:
+            if error.code == VM_DECOY_REFUSED_EXIT:
+                raise
+            try:
+                self._call(record, "--decoy-revert")
+            except Exception as revert_error:
+                raise VmDecoyLeftChanged(f"{error}; revert after it also failed: {revert_error}") from None
+            raise RuntimeError(f"{error}; reverted again after it") from None
 
     def rollout_done(self, record: DecoyRecord) -> bool:
         """False while the change holds; at the end of its gap the revert call, then True."""
@@ -1013,6 +1069,8 @@ def _record_document(record: DecoyRecord) -> dict[str, Any]:
     if document.get("node") is None:
         document.pop("node", None)
         document.pop("gap_sec", None)
+    if document.get("unsettled") is None:
+        document.pop("unsettled", None)
     return document
 
 

@@ -2779,3 +2779,25 @@ async def test_a_vm_decoy_holds_as_rolling_until_its_revert(tmp_path: Path) -> N
     started = await queue._start_decoy(vm, record, datetime(2026, 7, 16, 8, 30, tzinfo=timezone.utc))
     assert started.status == "rolling" and calls == [["was01", "--decoy-change", "war_redeploy"]]
     assert queue._decoy_timeout(vm, started, SimpleNamespace(rollout_timeout_sec=420)) == 600 + 300
+
+
+
+@pytest.mark.asyncio
+async def test_a_vm_decoy_left_changed_restarts_the_cycle_at_the_buffer(tmp_path: Path) -> None:
+    """Review rv-t4u2 N4: a VM decoy whose revert failed is recorded unsettled; the buffer gate sees it."""
+    from app.decoys import DecoyRecord, VmDecoyExecutor
+
+    queue, *_ = make_cycle_queue(tmp_path)
+    answers = [subprocess.CompletedProcess([], 124, "", "limit\n"), subprocess.CompletedProcess([], 1, "", "lock\n")]
+    vm = VmDecoyExecutor(process_runner=lambda argv, **k: answers.pop(0))
+    record = DecoyRecord(id="d1", window="normal", planned_at="2026-07-16T08:30:00Z", kind="war_redeploy",
+                         namespace="civil-petition-vm", deployment="petition-was01", node="was01", gap_sec=600,
+                         service_name="was01", target_id="uuid-was01", relation="same_domain", value="x")
+    failed = await queue._start_decoy(vm, record, datetime(2026, 7, 16, 8, 30, tzinfo=timezone.utc))
+    assert failed.status == "failed" and failed.unsettled is True
+    queue._decoy_policy = lambda: (SimpleNamespace(), "sha")  # the gate only needs the policy to be loaded
+    queue._decoy_executor_for = lambda policy: vm
+    reason = await queue._unsettled_decoy(SimpleNamespace(cycle_decoys=[failed]))
+    assert reason and "may still hold its change" in reason
+    settled = failed.model_copy(update={"unsettled": None})
+    assert await queue._unsettled_decoy(SimpleNamespace(cycle_decoys=[settled])) is None
