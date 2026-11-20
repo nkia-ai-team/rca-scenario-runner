@@ -889,7 +889,9 @@ class ScenarioRunner:
                 )
                 await proc.wait()
             except asyncio.TimeoutError:
-                kill_process_group(proc.pid)
+                # In a worker thread: the wait must not stop the loop (review rv-t4o2 N4), and the loop's child
+                # watcher reaps the leader meanwhile so the group check sees it gone.
+                await asyncio.to_thread(kill_process_group, proc.pid)
                 await proc.wait()
                 self._append_log("[ERROR] Execution timed out and was killed")
                 return -1

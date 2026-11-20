@@ -405,9 +405,13 @@ def cpu_busy_percent(older: Sequence[int], newer: Sequence[int]) -> float:
     return 100.0 * (total - idle) / total
 
 
-def kill_process_group(pid: int, *, grace_sec: float = 5.0) -> None:
+def kill_process_group(pid: int, *, grace_sec: float = 5.0, leader: Any = None) -> None:
     """End a process started with start_new_session=True and everything in its group (an ssh it started included):
-    SIGTERM, then SIGKILL after ``grace_sec``. Only that group, never a pattern."""
+    SIGTERM, then SIGKILL after ``grace_sec`` to whatever is left. Only that group, never a pattern.
+
+    ``leader`` (a Popen) is reaped while waiting: an unreaped leader is a zombie that keeps the group answering, so
+    the wait always ran the full grace (review rv-t4o2 N4). Blocking: call it from a worker thread inside a loop
+    (``asyncio.to_thread``), where the loop's own child watcher reaps an asyncio process meanwhile."""
     import signal
     import time
 
@@ -416,20 +420,30 @@ def kill_process_group(pid: int, *, grace_sec: float = 5.0) -> None:
     except ProcessLookupError:
         return
     deadline = time.monotonic() + grace_sec
+    if leader is not None:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            leader.wait(timeout=grace_sec)
     while time.monotonic() < deadline:
         try:
             os.killpg(pid, 0)
         except ProcessLookupError:
             return
-        time.sleep(0.1)
+        time.sleep(0.05)
     with contextlib.suppress(ProcessLookupError):
         os.killpg(pid, signal.SIGKILL)
 
 
+# After the group is ended, how long to wait for the output pipes to close. A process that left the group (the CLI
+# starts its ssh in a session of its own) may still hold them; the runner then stops reading instead of waiting for
+# it (review rv-t4o2 N3). The CLI ends that ssh within its own 90-second limit.
+PIPE_DRAIN_SEC = 3
+
+
 def run_in_group(argv: Sequence[str], *, timeout: float, env: Mapping[str, str]) -> subprocess.CompletedProcess:
     """subprocess.run that, on timeout, ends the whole process group it started (review rv-t4o M2: killing only the
-    CLI left its ssh behind, a session that never closes on the VM and keeps the VM's operator lock).
-    Raises subprocess.TimeoutExpired after the group is gone."""
+    CLI left its ssh behind, a session that never closes on the VM and keeps the VM's operator lock), then waits at
+    most PIPE_DRAIN_SEC for the pipes and closes them (N3: a grandchild in another session that kept the pipes made
+    this wait as long as that grandchild lived). Raises subprocess.TimeoutExpired after that."""
     process = subprocess.Popen(
         list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(env),
         start_new_session=True, close_fds=True,
@@ -437,8 +451,14 @@ def run_in_group(argv: Sequence[str], *, timeout: float, env: Mapping[str, str])
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        kill_process_group(process.pid)
-        process.communicate()
+        kill_process_group(process.pid, leader=process)
+        try:
+            process.communicate(timeout=PIPE_DRAIN_SEC)
+        except subprocess.TimeoutExpired:
+            for stream in (process.stdout, process.stderr):
+                with contextlib.suppress(Exception):
+                    stream.close()
+            process.wait()
         raise
     return subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
 

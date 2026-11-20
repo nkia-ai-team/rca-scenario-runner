@@ -169,13 +169,30 @@ async def test_a_timed_out_script_is_ended_with_everything_it_started(tmp_path: 
     runner = ScenarioRunner(script_dir=tmp_path, log_dir=tmp_path / "logs")
     import time as _time
 
+    import asyncio
+
+    gaps: list[float] = []
+
+    async def ticker() -> None:
+        last = _time.monotonic()
+        while True:
+            await asyncio.sleep(0.05)
+            now = _time.monotonic()
+            gaps.append(now - last)
+            last = now
+
+    tick = asyncio.create_task(ticker())
     started = _time.monotonic()
     with open(tmp_path / "log.txt", "w", encoding="utf-8") as log_file:
         code = await runner._invoke_once(
             ExecutionSpec(transport="local", location="runner", timeout_sec=1), script, "F99-X", "run", log_file
         )
-    # Ended with its group, not when the 60-second child happened to finish by itself.
-    assert code == -1 and _time.monotonic() - started < 20
+    elapsed = _time.monotonic() - started
+    tick.cancel()
+    # Ended with its group, not when the 60-second child happened to finish by itself; and without stopping the
+    # event loop or sitting out the whole 5-second grace on a reaped leader (review rv-t4o2 N4).
+    assert code == -1 and elapsed < 4, elapsed
+    assert max(gaps) < 1.0, max(gaps)
     child = int(pid_file.read_text())
     for _ in range(50):
         try:

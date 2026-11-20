@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import shutil
@@ -874,3 +875,42 @@ async def test_the_routine_does_not_hold_up_the_master_checks(tmp_path: Path) ->
     release.set()
     await service.stop()
     assert len(checks) >= 5
+
+
+def test_run_in_group_does_not_wait_for_a_grandchild_in_another_session(tmp_path: Path) -> None:
+    """Review rv-t4o2 N3: the CLI starts its ssh in a session of its own, so ending the CLI's group does not reach
+    it, and that ssh still holds the pipes. The runner waits a few seconds for them and then stops reading."""
+    import sys
+    import time
+
+    pid_file = tmp_path / "grandchild.pid"
+    cli = tmp_path / "cli.py"
+    cli.write_text(
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen(['sleep', '20'], start_new_session=True)\n"
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(60)\n"
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            vm_ops.run_in_group([sys.executable, str(cli)], timeout=1, env={"PATH": os.environ["PATH"]})
+        elapsed = time.monotonic() - started
+        assert elapsed < 1 + 2 + vm_ops.PIPE_DRAIN_SEC + 1, elapsed
+    finally:
+        if pid_file.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), 9)
+
+
+def test_kill_process_group_returns_as_soon_as_a_reaped_group_is_gone(tmp_path: Path) -> None:
+    """Review rv-t4o2 N4: with the leader passed it is reaped while waiting, so a group that died on SIGTERM does not
+    sit out the whole grace."""
+    import time
+
+    process = subprocess.Popen(["bash", "-c", "sleep 60 & wait"], start_new_session=True)
+    time.sleep(0.2)
+    started = time.monotonic()
+    vm_ops.kill_process_group(process.pid, leader=process)
+    assert time.monotonic() - started < 2
+    assert process.returncode is not None
