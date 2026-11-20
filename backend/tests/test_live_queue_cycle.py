@@ -2803,3 +2803,205 @@ async def test_a_vm_decoy_left_changed_restarts_the_cycle_at_the_buffer(tmp_path
     assert reason and "may still hold its change" in reason
     settled = failed.model_copy(update={"unsettled": None})
     assert await queue._unsettled_decoy(SimpleNamespace(cycle_decoys=[settled])) is None
+
+
+def _vm_record(**update):
+    from app.decoys import DecoyRecord
+
+    record = DecoyRecord(id="d1", window="normal", planned_at="2026-07-16T08:30:00Z", kind="config_reapply",
+                         namespace="civil-petition-vm", deployment="petition-web01", node="web01", gap_sec=600,
+                         service_name="web01", target_id="uuid-web01", relation="same_domain", value="x")
+    return record.model_copy(update=update)
+
+
+@pytest.mark.asyncio
+async def test_a_busy_vm_decoy_change_is_skipped_without_a_revert(tmp_path: Path) -> None:
+    """Review rv-t4u3 L1: 75 comes before anything changed, so no revert follows and the cycle is not restarted."""
+    from app.decoys import VmDecoyExecutor
+
+    queue, *_ = make_cycle_queue(tmp_path)
+    calls = []
+    vm = VmDecoyExecutor(process_runner=lambda argv, **k: calls.append(argv[3:])
+                         or subprocess.CompletedProcess(argv, 75, "", "operator lock on web01 is held\n"))
+    record = await queue._start_decoy(vm, _vm_record(), datetime(2026, 7, 16, 8, 30, tzinfo=timezone.utc))
+    assert record.status == "skipped" and record.unsettled is None and "busy (exit 75)" in record.detail
+    assert calls == [["web01", "--decoy-change", "config_reapply"]]
+    queue._decoy_policy = lambda: (SimpleNamespace(), "sha")
+    queue._decoy_executor_for = lambda policy: vm
+    assert await queue._unsettled_decoy(SimpleNamespace(cycle_decoys=[record])) is None
+
+
+@pytest.mark.asyncio
+async def test_a_vm_decoy_whose_timed_out_undo_fails_is_unsettled(tmp_path: Path) -> None:
+    """Review rv-t4u3 L2: the queue gives up on a VM decoy (gap plus the revert call) and its undo fails: the record
+    is unsettled and the buffer gate restarts the cycle with why. A Kubernetes decoy in the same spot is not."""
+    queue, *_ = make_cycle_queue(tmp_path)
+
+    class Failing:
+        def rollout_done(self, record):
+            raise RuntimeError("operator decoy --decoy-revert on web01 failed (exit 1): no route")
+
+        def undo(self, record):
+            raise RuntimeError("operator decoy --decoy-revert on web01 failed (exit 1): no route")
+
+    rolling = _vm_record(status="rolling", started_at="2026-07-16T08:30:00Z")
+    now = datetime(2026, 7, 16, 9, 30, tzinfo=timezone.utc)
+    failed = await queue._poll_decoy(Failing(), rolling, now, 1200)
+    assert failed.status == "failed" and failed.unsettled is True and "undo failed" in failed.detail
+    queue._decoy_policy = lambda: (SimpleNamespace(), "sha")
+    queue._decoy_executor_for = lambda policy: Failing()
+    reason = await queue._unsettled_decoy(SimpleNamespace(cycle_decoys=[failed]))
+    assert reason and "d1 on web01 may still hold its change" in reason
+    kubernetes = rolling.model_copy(update={"node": None, "kind": "rollout_restart"})
+    assert (await queue._poll_decoy(Failing(), kubernetes, now, 1200)).unsettled is None
+
+
+@pytest.mark.asyncio
+async def test_a_held_vm_decoy_stays_changed_through_the_recording_and_is_reverted_after_it(tmp_path: Path) -> None:
+    """Command-session decision D1 (b): a VM decoy drawn «after_recording» is changed with a guard that outlasts the
+    recording, is not polled or reverted at the buffer, is no unsettled residue, goes into the run's decoys.json as
+    held, and is reverted when the cooldown ends (before the capture is waited for)."""
+    from app.decoys import VmDecoyExecutor
+
+    queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
+    calls = []
+    out = "@@ decoy-changed /etc/apache2/sites-available/petition.conf\n"
+    vm = VmDecoyExecutor(process_runner=lambda argv, **k: calls.append(argv[3:])
+                         or subprocess.CompletedProcess(argv, 0, out if "--decoy-change" in argv else "", ""))
+    planned = _vm_record(revert="after_recording", gap_sec=None, guard_sec=9000)
+    held = await queue._start_decoy(vm, planned, datetime(2026, 7, 16, 8, 30, tzinfo=timezone.utc))
+    assert calls == [["web01", "--decoy-change", "config_reapply", "--guard-sec", "9000"]]
+    assert held.status == "held" and held.finished_at and held.changed_paths == [
+        "/etc/apache2/sites-available/petition.conf"]
+    queue._decoy_policy = lambda: (SimpleNamespace(rollout_timeout_sec=420), "sha")
+    queue._decoy_executor_for = lambda policy: vm
+    assert await queue._unsettled_decoy(SimpleNamespace(cycle_decoys=[held])) is None
+    assert vm.rollout_done(held) is False and len(calls) == 1  # never reverted on the gap's clock
+
+    del queue._decoy_policy, queue._decoy_executor_for  # the real plan for the cycle itself
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    queue._decoy_policy = lambda **k: (SimpleNamespace(rollout_timeout_sec=420), "sha")
+    queue._decoy_executor_for = lambda policy: vm
+    state = state.model_copy(update={"cycle_decoys": [held], "cycle_decoy_seed": 7})
+    queue._write(state)
+    settled = await queue._settle_decoys_at_buffer(state)
+    assert settled.cycle_decoys == [held] and len(calls) == 1
+    queue._write_cycle_decoys(state.current_run_id, state)
+    document = json.loads((runner.artifact_store.root / state.current_run_id / "decoys.json").read_text())
+    assert [(r["status"], r["revert"], r["changed_paths"]) for r in document["decoys"]] == [
+        ("held", "after_recording", ["/etc/apache2/sites-available/petition.conf"])]
+
+    run_id = state.current_run_id
+    _complete_injection(runner, scheduler, clock, run_id, t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    state = await queue.tick()
+    assert state.phase == "cycle_cooldown" and len(calls) == 1  # still held through the cooldown
+    clock.value = state_expected(state) - timedelta(seconds=1)
+    state = await queue.tick()
+    assert state.phase == "cycle_cooldown" and len(calls) == 1
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "waiting_capture"
+    assert calls[-1] == ["web01", "--decoy-revert", "config_reapply"]
+    assert [(r.status, r.detail) for r in state.cycle_decoys] == [("applied", "reverted after the recording")]
+
+
+@pytest.mark.asyncio
+async def test_a_held_vm_decoy_that_cannot_be_reverted_after_the_recording_pauses(tmp_path: Path) -> None:
+    from app.decoys import VmDecoyExecutor
+
+    queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
+    vm = VmDecoyExecutor(process_runner=lambda argv, **k: subprocess.CompletedProcess(argv, 4, "", "executor down\n"))
+    held = _vm_record(revert="after_recording", gap_sec=None, guard_sec=9000, status="held",
+                      started_at="2026-07-16T08:30:00Z", finished_at="2026-07-16T08:31:00Z")
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    queue._decoy_policy = lambda **k: (SimpleNamespace(rollout_timeout_sec=420), "sha")
+    queue._decoy_executor_for = lambda policy: vm
+    queue._write(state.model_copy(update={"cycle_decoys": [held], "cycle_decoy_seed": 7}))
+    _complete_injection(runner, scheduler, clock, state.current_run_id,
+                        t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "paused" and "held decoy revert failed" in state.reason and "d1 on web01" in state.reason
+    record = queue.snapshot().cycle_decoys[0]
+    assert record.status == "failed" and record.unsettled is True
+
+
+@pytest.mark.asyncio
+async def test_a_restarted_cycle_reverts_its_held_vm_decoys_first(tmp_path: Path) -> None:
+    from app.decoys import VmDecoyExecutor
+
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    calls = []
+    vm = VmDecoyExecutor(process_runner=lambda argv, **k: calls.append(argv[3:]) or subprocess.CompletedProcess(argv, 0, "", ""))
+    queue._decoy_policy = lambda: (SimpleNamespace(rollout_timeout_sec=420), "sha")
+    queue._decoy_executor_for = lambda policy: vm
+    held = _vm_record(revert="after_recording", gap_sec=None, guard_sec=9000, status="held",
+                      started_at="2026-07-16T08:30:00Z", finished_at="2026-07-16T08:31:00Z")
+    await queue.start()
+    state = await queue.tick()
+    state = state.model_copy(update={"cycle_decoys": [held], "cycle_decoy_seed": 7})
+    queue._write(state)
+    state = queue._restart_cycle(state, "dirty gate")
+    assert calls == [["web01", "--decoy-revert", "config_reapply"]]
+    assert state.phase == "cycle_reset" and state.cycle_decoys == []
+
+
+@pytest.mark.asyncio
+async def test_the_buffer_gate_accepts_a_held_vm_decoy_and_writes_it_into_the_preflight_meta(tmp_path: Path) -> None:
+    """Command-session decision D1 (b): at the buffer gate a VM decoy held through the recording is «a harmless
+    decoy left changed». The drift gate and the probe get exactly what it left (its node, its files, its guard),
+    and the preflight meta lists it. With no held decoy both are asked the old way and the meta keeps its shape."""
+    from tests.test_preflight import VM_CLEAN
+
+    queue, runner, _, _, clock = _vm_cycle_queue(tmp_path)
+
+    class HeldProbe(_ObsProbe):
+        held_seen: list = []
+
+        def set_held_decoys(self, held):
+            self.held_seen.append(held)
+
+    vm_probe = HeldProbe(VM_CLEAN)
+    queue.domain_preflight_probes = {"civil-petition": vm_probe}
+    asked = []
+
+    def state_gate(**kwargs):
+        asked.append(kwargs)
+        return None
+
+    queue.vm_domain_state = state_gate
+    await queue.start()
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "cycle_buffer"
+    site = "/etc/apache2/sites-available/petition.conf"
+    held = _vm_record(revert="after_recording", gap_sec=None, guard_sec=9000, status="held", changed_paths=[site],
+                      started_at="2026-07-16T08:30:00Z", finished_at="2026-07-16T08:31:00Z")
+    queue._write(state.model_copy(update={"cycle_decoys": [held], "cycle_decoy_seed": 7}))
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "running", state.reason
+    expected = {"web01": {"paths": {site}, "guards": 1, "ids": ["d1"]}}
+    assert asked == [{"excused": expected}]
+    assert vm_probe.held_seen == [expected, {}]  # set for the collect, cleared after it
+    verdict = json.loads((runner.artifact_store.root / state.current_run_id / "preflight.json").read_text())
+    assert verdict["held_decoys"] == [{"id": "d1", "node": "web01", "kind": "config_reapply", "changed_paths": [site],
+                                       "started_at": "2026-07-16T08:30:00Z", "revert": "after_recording"}]
+    decoys = json.loads((runner.artifact_store.root / state.current_run_id / "decoys.json").read_text())
+    assert [(r["status"], r["revert"]) for r in decoys["decoys"]] == [("held", "after_recording")]
+
+
+@pytest.mark.asyncio
+async def test_without_a_held_decoy_the_gate_and_its_meta_keep_their_shape(tmp_path: Path) -> None:
+    from tests.test_preflight import VM_CLEAN
+
+    queue, runner, _, _, clock = _vm_cycle_queue(tmp_path)
+    queue.domain_preflight_probes = {"civil-petition": _ObsProbe(VM_CLEAN)}
+    asked = []
+    queue.vm_domain_state = lambda: asked.append(1)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    assert asked == [1]
+    verdict = json.loads((runner.artifact_store.root / state.current_run_id / "preflight.json").read_text())
+    assert "held_decoys" not in verdict

@@ -1022,7 +1022,7 @@ def test_vm_decoy_executor_applies_holds_then_undoes_like_an_injection() -> None
     ok = subprocess.CompletedProcess([], 0, "", "")
     answers[:] = [subprocess.CompletedProcess([], 1, "", "petition health did not come back in 60s\n"), ok,
                   subprocess.CompletedProcess([], 4, "", "the executor's run ended with 1\n"), ok,
-                  subprocess.CompletedProcess([], 75, "", "operator lock on was02 is held\n"), ok,
+                  subprocess.CompletedProcess([], 75, "", "operator lock on was02 is held\n"),
                   subprocess.CompletedProcess([], 124, "", "session limit 90s\n")]
     # Each change failure is recorded by its cause (review rv-t4u2 N5) and followed by one revert (N4).
     with pytest.raises(RuntimeError, match=r"change on was02 not healthy, reverted by the CLI \(exit 1\): petition "
@@ -1031,8 +1031,13 @@ def test_vm_decoy_executor_applies_holds_then_undoes_like_an_injection() -> None
     assert calls[-1] == ["was02", "--decoy-revert", "war_redeploy"]
     with pytest.raises(RuntimeError, match=r"executor failed and reverted as root \(exit 4\)"):
         executor.apply(record)
-    with pytest.raises(RuntimeError, match=r"change on was02 busy \(exit 75\): operator lock on was02 is held"):
+    # 75: nothing was changed, so no revert follows (review rv-t4u3 L1); the queue records the decoy as skipped.
+    from app.decoys import VmDecoyBusy
+
+    before = len(calls)
+    with pytest.raises(VmDecoyBusy, match=r"change on was02 busy \(exit 75\): operator lock on was02 is held"):
         executor.apply(record)
+    assert len(calls) == before + 1 and calls[-1] == ["was02", "--decoy-change", "war_redeploy"]
     with pytest.raises(RuntimeError, match=r"revert on was02 over the CLI limit \(exit 124\): session limit 90s"):
         executor.undo(record)
     executor.apply(_record())  # a Kubernetes record still goes to kubectl
@@ -1066,6 +1071,12 @@ def test_vm_decoy_gaps_follow_the_injection_lengths_and_end_before_the_buffer() 
             if record.node is None:
                 assert record.gap_sec is None
                 continue
+            if record.revert == "after_recording":
+                # Put back after the recording (D1 (b)): no gap, a guard that outlasts the recording.
+                planned = datetime.strptime(record.planned_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                assert record.gap_sec is None
+                assert record.guard_sec == int((BUFFER_START - planned).total_seconds()) + 7800
+                continue
             if record.status == "skipped":
                 # No recorded length fit before the buffer: not run, and the record says why.
                 assert record.gap_sec is None and "fits before the buffer" in (record.detail or "")
@@ -1083,7 +1094,7 @@ def test_a_vm_decoy_with_no_gap_that_fits_is_skipped_and_recorded(monkeypatch) -
     monkeypatch.setattr(decoys, "draw_vm_decoy_gap_within", lambda rng, low, high: None)
     records = [r for seed in range(200) for r in build_schedule(
         _vm_policy(), seed=seed, scenario_id="F99-X", scenario=VM_SCENARIO, cycle_start=CYCLE_START,
-        buffer_start=BUFFER_START) if r.node]
+        buffer_start=BUFFER_START) if r.node and r.revert == "before_fault"]
     assert records and all(r.status == "skipped" and r.gap_sec is None and "fits before the buffer" in r.detail for r in records)
 
 
@@ -1226,18 +1237,18 @@ def test_the_recorded_gaps_are_the_testbed_services_list_and_its_policy_range() 
 
 
 def test_near_fault_vm_decoys_move_earlier_instead_of_being_dropped() -> None:
-    """Command-session decision on the T4U-3 open question: a VM decoy draws its gap first and starts earlier when
-    its revert would not end 600 s before the buffer. Near-fault VM decoys then run about as often as near-fault
-    Kubernetes decoys (simulation: VM 34.2% of run VM decoys near the fault against 36.2% for Kubernetes decoys,
-    about 5.5% of near-fault VM decoys skipped because moving them would crowd another decoy, 3000 seeds), so «an
-    operator change near the fault» is no simple rule."""
+    """Command-session decisions on the T4U-3 open question and on review rv-t4u3 D1, L4. A VM decoy put back before
+    the fault draws its gap first and starts earlier when its revert would not end 600 s before the buffer, at a
+    start drawn evenly over the starts that fit (never pinned to the latest allowed second); half the VM decoys are
+    put back after the recording instead. Near-fault VM decoys then run about as often as near-fault Kubernetes
+    decoys, so «an operator change near the fault» and «a change not reverted at the fault» are no simple rules."""
     from collections import Counter
 
     from app.decoys import VM_DECOY_CALL_ROOM_SEC
 
     policy = _vm_policy()
-    vm, vm_skipped, kubernetes = Counter(), Counter(), Counter()
-    moved = 0
+    vm, vm_skipped, kubernetes, revert = Counter(), Counter(), Counter(), Counter()
+    pinned = before_fault = 0
     for seed in range(1500):
         records = build_schedule(policy, seed=seed, scenario_id="F99-X", scenario=VM_SCENARIO,
                                  cycle_start=CYCLE_START, buffer_start=BUFFER_START)
@@ -1251,17 +1262,23 @@ def test_near_fault_vm_decoys_move_earlier_instead_of_being_dropped() -> None:
                 vm_skipped[record.window] += 1
                 continue
             vm[record.window] += 1
+            revert[record.revert] += 1
+            if record.revert != "before_fault":
+                continue
+            before_fault += 1
             planned = datetime.strptime(record.planned_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            assert planned + timedelta(seconds=record.gap_sec + VM_DECOY_CALL_ROOM_SEC) <= BUFFER_START
-            if planned + timedelta(seconds=record.gap_sec + VM_DECOY_CALL_ROOM_SEC) == BUFFER_START:
-                moved += 1  # moved earlier: its revert ends exactly at the latest allowed time
+            end = planned + timedelta(seconds=record.gap_sec + VM_DECOY_CALL_ROOM_SEC)
+            assert end <= BUFFER_START
+            pinned += end == BUFFER_START
         for record in build_schedule(policy, seed=seed, scenario_id="F01-R", scenario=SCENARIO,
                                      cycle_start=CYCLE_START, buffer_start=BUFFER_START):
             kubernetes[record.window] += 1
     share = lambda counts: counts["near_fault"] / sum(counts.values())  # noqa: E731
     assert share(vm) >= 0.85 * share(kubernetes), (share(vm), share(kubernetes))
     assert vm_skipped["near_fault"] <= 0.10 * (vm["near_fault"] + vm_skipped["near_fault"])
-    assert moved > 0
+    # Half and half (D1), and the reverts are not piled on the latest allowed second (L4).
+    assert 0.4 <= revert["after_recording"] / sum(revert.values()) <= 0.6
+    assert pinned <= 0.01 * before_fault
 
 
 def test_a_vm_decoy_moved_before_another_takes_its_place_by_time(monkeypatch) -> None:
@@ -1277,3 +1294,64 @@ def test_a_vm_decoy_moved_before_another_takes_its_place_by_time(monkeypatch) ->
         assert [r.planned_at for r in records] == sorted(r.planned_at for r in records)
         reordered += [r.id for r in records] != sorted((r.id for r in records), key=lambda i: int(i[1:]))
     assert reordered > 0
+
+
+def test_a_held_vm_decoy_excuses_its_changes_alarm_and_only_on_its_target() -> None:
+    """D1 (b): a VM decoy held through the recording explains an alarm of its change (the service restart) like a
+    finished one, its finish being the end of the change; other states and other targets do not."""
+    held = APPLIED.model_copy(update={"kind": "config_reapply", "status": "held", "node": "web01",
+                                      "revert": "after_recording"})
+    alert = _alert({"service_name": "commerce-order"})
+    assert [item["decoy_id"] for item in _partition([alert], [held])[1]] == ["d1"]
+    for status in ("planned", "rolling", "failed", "skipped"):
+        assert _partition([alert], [held.model_copy(update={"status": status})])[1] == [], status
+    assert _partition([_alert({"service_name": "commerce-payment"})], [held])[1] == []
+    late = datetime(2026, 11, 10, 2, 48, tzinfo=timezone.utc)
+    assert _partition([alert], [held], now=late)[1] == []
+
+
+def test_held_excuses_count_each_held_vm_decoy_on_its_node() -> None:
+    from app.decoys import held_excuses
+
+    def vm(id_, node, status="held", paths=None):
+        return APPLIED.model_copy(update={"id": id_, "kind": "config_reapply", "status": status, "node": node,
+                                          "changed_paths": paths})
+    records = [vm("d1", "web01", paths=["/a"]), vm("d2", "web01", paths=["/b"]), vm("d3", "was01"),
+               vm("d4", "was02", status="applied", paths=["/c"]), APPLIED.model_copy(update={"status": "held"})]
+    assert held_excuses(records) == {
+        "web01": {"paths": {"/a", "/b"}, "guards": 2, "ids": ["d1", "d2"]},
+        "was01": {"paths": set(), "guards": 1, "ids": ["d3"]},
+    }
+
+
+def test_vm_decoy_executor_reads_the_changed_paths_and_passes_the_guard() -> None:
+    from app.decoys import DecoyRecord, VmDecoyExecutor
+
+    calls = []
+    out = ("health ok\n@@ decoy-changed /etc/apache2/sites-available/petition.conf\n"
+           "@@ decoy-changed /etc/apache2/conf-available/x.conf\n@@ decoy-changed \n")
+    vm = VmDecoyExecutor(process_runner=lambda argv, **k: calls.append(argv[3:]) or subprocess.CompletedProcess(argv, 0, out, ""))
+    record = DecoyRecord(id="d1", window="normal", planned_at="2026-11-10T01:30:00Z", kind="config_reapply",
+                         namespace="civil-petition-vm", deployment="petition-web01", node="web01",
+                         service_name="web01", target_id="uuid-web01", relation="same_domain", value="x",
+                         revert="after_recording", guard_sec=12000)
+    assert vm.apply(record) == ["/etc/apache2/sites-available/petition.conf", "/etc/apache2/conf-available/x.conf"]
+    vm.undo(record)
+    assert calls == [["web01", "--decoy-change", "config_reapply", "--guard-sec", "12000"],
+                     ["web01", "--decoy-revert", "config_reapply"]]
+    before = record.model_copy(update={"revert": "before_fault", "guard_sec": None, "gap_sec": 600})
+    calls.clear()
+    vm.apply(before)
+    assert calls == [["web01", "--decoy-change", "config_reapply"]]
+
+
+def test_a_hold_longer_than_the_near_fault_window_allows_is_refused() -> None:
+    """Review rv-t4u3 L8 (D4): a near-fault VM decoy moved earlier stays in its window only while the longest hold
+    plus the revert room fits in it; a policy recounted past that is refused, not run with decoys leaving the window."""
+    document = _vm_policy().model_dump(by_alias=True, exclude_none=True)
+    near = document["windows"]["near_fault"]["start_before_buffer_sec"]
+    document["vm_hold_sec"] = {"min": 96, "max": near - 600}
+    assert DecoyPolicy.model_validate(document).vm_hold_sec.max == near - 600
+    document["vm_hold_sec"] = {"min": 96, "max": near - 599}
+    with pytest.raises(ValueError, match="must not exceed the near_fault window start"):
+        DecoyPolicy.model_validate(document)

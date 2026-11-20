@@ -240,9 +240,15 @@ class VmDomainPreflightProbe:
         self.urlopen = urlopen or self.base.urlopen
         self.incident_count = incident_count or open_incident_count
         self.targets_path = targets_path or VM_DOMAIN_TARGETS_PATH
+        # decoys.held_excuses of the cycle while the queue evaluates (set_held_decoys): the executor guards that VM
+        # decoys held through the recording (D1 (b)) keep on their nodes are no residue.
+        self.held: dict = {}
 
     def set_alarm_filter(self, alarm_filter) -> None:
         self.base.set_alarm_filter(alarm_filter)
+
+    def set_held_decoys(self, held) -> None:
+        self.held = dict(held or {})
 
     @property
     def last_excused_alarms(self) -> list[dict]:
@@ -279,7 +285,11 @@ class VmDomainPreflightProbe:
         if not down:
             opened = [datetime.fromisoformat(str(status["opened_at"]).replace("Z", "+00:00")) for status in masters.values()]
             settle = max(0.0, min((now - at).total_seconds() for at in opened))
-        guards = sum(max(int(f["guards_armed"]), int(f["guard_timers"])) for f in facts.values())
+        # One guard per held decoy is excused on its own node only; never below zero, never moved to another node.
+        guards = sum(
+            max(0, max(int(f["guards_armed"]), int(f["guard_timers"])) - int((self.held.get(host) or {}).get("guards", 0)))
+            for host, f in facts.items()
+        )
         guards += int(hypervisor.get("guards_active", 0))
         freshness = self._freshness()
         return {

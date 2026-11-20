@@ -38,6 +38,8 @@ from app.decoys import (
     DecoyRecord,
     CompositeDecoyExecutor,
     KubectlDecoyExecutor,
+    VmDecoyBusy,
+    held_excuses,
     VmDecoyExecutor,
     VmDecoyLeftChanged,
     build_schedule,
@@ -164,6 +166,15 @@ VM_DOMAIN_STATE_CHECK_NAME = "vm_domain_state"
 # The scenario's domain decides its preflight probe, signal set and drift gate, so a domain that cannot be read
 # (registry unreadable, no entry for the scenario) stops the injection with why (review rv-t4r3 M2).
 SCENARIO_METADATA_CHECK_NAME = "scenario_metadata"
+
+
+def _held_decoy_meta(decoys: "list[DecoyRecord]") -> list[dict[str, object]]:
+    """The VM decoys the gate accepted as «harmless decoy left changed» (D1 (b)), for preflight meta."""
+    return [
+        {"id": record.id, "node": record.node, "kind": record.kind, "changed_paths": list(record.changed_paths or []),
+         "started_at": record.started_at, "revert": "after_recording"}
+        for record in decoys if record.status == "held"
+    ]
 
 
 class ScenarioMetadataError(RuntimeError):
@@ -1722,8 +1733,11 @@ class LiveScenarioQueue:
             return f"operational readiness failed: {SCENARIO_METADATA_CHECK_NAME} ({SCENARIO_METADATA_CHECK_NAME}: {error})"
         return None
 
-    def _vm_domain_state_blocker(self, scenario_id: str | None) -> str | None:
-        """Pause reason when a VM testbed scenario would start on drifted VMs (VM_DOMAIN_STATE_CHECK_NAME)."""
+    def _vm_domain_state_blocker(
+        self, scenario_id: str | None, decoys: "list[DecoyRecord] | None" = None
+    ) -> str | None:
+        """Pause reason when a VM testbed scenario would start on drifted VMs (VM_DOMAIN_STATE_CHECK_NAME). The files
+        a held VM decoy of the cycle changed are excused on its node (D1 (b), decoys.held_excuses)."""
         metadata = self._scenario_metadata_blocker(scenario_id) if scenario_id else None
         if metadata is not None:
             return metadata
@@ -1731,8 +1745,9 @@ class LiveScenarioQueue:
             return None
         if self.vm_domain_state is None:
             return None
+        held = held_excuses(decoys or [])
         try:
-            detail = self.vm_domain_state()
+            detail = self.vm_domain_state(excused=held) if held else self.vm_domain_state()
         except Exception as error:
             detail = f"state unreadable: {type(error).__name__}: {error}"
         if detail is None:
@@ -1801,11 +1816,11 @@ class LiveScenarioQueue:
             return state, None
         if verdict_pods == "pause":
             return self._pause(state, detail or DOMAIN_PODS_CHECK_NAME), None
-        vm_state = self._vm_domain_state_blocker(scenario_id)
-        if vm_state is not None:
-            return self._pause(state, vm_state), None
         # None = decoys off; a list (possibly empty) = decoys on for this cycle.
         decoys = state.cycle_decoys if state.cycle_decoy_seed is not None else None
+        vm_state = self._vm_domain_state_blocker(scenario_id, decoys)
+        if vm_state is not None:
+            return self._pause(state, vm_state), None
         if self._preflight_applies(scenario_id):
             now = self.clock.now().astimezone(timezone.utc)
             buffer_start = (
@@ -1929,6 +1944,10 @@ class LiveScenarioQueue:
         that skipped the entry write."""
         if not self._transition_due(state):
             return state
+        # Decoys left changed through the recording are put back now, after it (D1 (b)).
+        state, failed = self._revert_held_decoys(state)
+        if failed is not None:
+            return self._pause(state, failed)
         if capture_enabled():
             self._write_cycle_phases(state)
         now = self.clock.now()
@@ -2159,6 +2178,10 @@ class LiveScenarioQueue:
         """Restart the current scenario's cycle from trainer_reset. Two
         consecutive restarts are allowed; the third pauses (spec §2.2)."""
         scenario_id = state.current_scenario_id or state.scenario_ids[state.next_index]
+        # Held VM decoys of the abandoned cycle are put back before its records are dropped (D1 (b)).
+        state, held_failure = self._revert_held_decoys(state)
+        if held_failure is not None:
+            return self._pause(state, held_failure)
         # The abandoned cycle's topology collector stops now; the fresh cycle_reset
         # starts a new one.
         self._stop_cycle_topology()
@@ -2705,7 +2728,12 @@ class LiveScenarioQueue:
     async def _start_decoy(self, executor, record: DecoyRecord, now: datetime) -> DecoyRecord:
         started = record.model_copy(update={"started_at": self._format(now)})
         try:
-            await asyncio.to_thread(executor.apply, started)
+            changed = await asyncio.to_thread(executor.apply, started)
+        except VmDecoyBusy as error:
+            # Nothing was changed (an executor's operator session held the VM): skipped, not unsettled (L1).
+            return started.model_copy(
+                update={"status": "skipped", "finished_at": self._format(self.clock.now()), "detail": str(error)}
+            )
         except Exception as error:
             return started.model_copy(
                 update={
@@ -2715,6 +2743,13 @@ class LiveScenarioQueue:
                     # A VM decoy whose revert failed too may still hold its change (review rv-t4u2 N4).
                     "unsettled": True if isinstance(error, VmDecoyLeftChanged) else record.unsettled,
                 }
+            )
+        if started.kind in VM_KINDS and started.revert == "after_recording":
+            # Changed and left so through the buffer, the injection and the cooldown (D1 (b)); reverted when the
+            # cooldown ends (_revert_held_decoys). Its finish is the end of the change (the alarm excuse span).
+            return started.model_copy(
+                update={"status": "held", "finished_at": self._format(self.clock.now()),
+                        "changed_paths": list(changed or []), "detail": "changed, held until after the recording"}
             )
         if started.kind in ROLLOUT_KINDS or started.kind in VM_KINDS:
             # A VM decoy holds its change until gap_sec has passed, then the undo call (T4U).
@@ -2782,6 +2817,41 @@ class LiveScenarioQueue:
                 )
             records.append(record)
         return self._store_decoys(state, records)
+
+    def _revert_held_decoys(self, state: LiveQueueState) -> "tuple[LiveQueueState, str | None]":
+        """Revert every held VM decoy of this cycle (command-session decision D1 (b)): at the end of the cooldown,
+        or when the cycle is abandoned. Returns a pause reason when one could not be reverted (a person has to look;
+        the CLI's guard reverts it by itself at guard_sec), else None, with the state holding the new records."""
+        if not any(record.status == "held" for record in state.cycle_decoys):
+            return state, None
+        loaded = self._decoy_policy()
+        if loaded is None:
+            return state, "held decoys but the decoy policy cannot be read to revert them"
+        executor = self._decoy_executor_for(loaded[0])
+        records, failures = [], []
+        for record in state.cycle_decoys:
+            if record.status == "held":
+                now = self._format(self.clock.now())
+                try:
+                    executor.undo(record)
+                    record = record.model_copy(
+                        update={"status": "applied", "finished_at": now, "detail": "reverted after the recording"}
+                    )
+                except Exception as error:
+                    failures.append(f"{record.id} on {record.node}: {error}")
+                    record = record.model_copy(
+                        update={"status": "failed", "finished_at": now, "unsettled": True,
+                                "detail": f"revert after the recording failed: {type(error).__name__}: {error}"}
+                    )
+            records.append(record)
+        state = self._store_decoys(state, records)
+        if state.current_run_id is not None:
+            self._write_cycle_decoys(state.current_run_id, state)  # the run's record says how each one ended
+        if failures:
+            return state, (
+                "held decoy revert failed (the CLI guard reverts it by itself later): " + "; ".join(failures)[:500]
+            )
+        return state, None
 
     def _store_decoys(self, state: LiveQueueState, records: list[DecoyRecord]) -> LiveQueueState:
         state = state.model_copy(
@@ -3011,13 +3081,19 @@ class LiveScenarioQueue:
         decoy_filter = (
             None if decoys is None else self._decoy_alarm_filter(decoys, now, buffer_start)
         )
+        held = held_excuses(decoys or [])
+        set_held = getattr(probe, "set_held_decoys", None)
         if callable(set_filter):
             set_filter(decoy_filter)
+        if callable(set_held):
+            set_held(held)
         try:
             observations = probe.collect(now=now)
         finally:
             if callable(set_filter):
                 set_filter(None)
+            if callable(set_held):
+                set_held({})
         excused = None
         if decoy_filter is not None and callable(set_filter):
             excused = list(getattr(probe, "last_excused_alarms", None) or [])
@@ -3030,6 +3106,7 @@ class LiveScenarioQueue:
             waited_sec=waited_sec,
             ai_judge=self.preflight_ai_judge,
             excused_alarms=excused,
+            held_decoys=_held_decoy_meta(decoys or []) or None,
         )
 
     def _sweep_lingering_incidents(self, verdict: PreflightVerdict) -> bool:

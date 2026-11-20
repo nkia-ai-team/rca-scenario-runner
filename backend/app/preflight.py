@@ -124,6 +124,9 @@ class PreflightVerdict(StrictModel):
     # Firing alarms a decoy deployment of this cycle explains (U7). None when
     # the cycle had no decoy feature; the key then stays out of meta.json.
     excused_alarms: list[dict[str, object]] | None = None
+    # VM decoys changed and held through this recording that the gate accepted (D1 (b): their changed files and
+    # guards are no residue). None when there are none; the key then stays out of meta.json.
+    held_decoys: list[dict[str, object]] | None = None
 
     @property
     def is_clean(self) -> bool:
@@ -149,6 +152,8 @@ class PreflightVerdict(StrictModel):
         }
         if self.excused_alarms is not None:
             document["excused_alarms"] = [dict(item) for item in self.excused_alarms]
+        if self.held_decoys:
+            document["held_decoys"] = [dict(item) for item in self.held_decoys]
         return document
 
 
@@ -160,6 +165,7 @@ def evaluate_preflight(
     waited_sec: int = 0,
     ai_judge: AiJudge | None = None,
     excused_alarms: list[dict[str, object]] | None = None,
+    held_decoys: list[dict[str, object]] | None = None,
 ) -> PreflightVerdict:
     """Run the deterministic gate and map it to a verdict.
 
@@ -198,6 +204,7 @@ def evaluate_preflight(
         checks=evaluated,
         ai_judgement=ai_judgement,
         excused_alarms=excused_alarms,
+        held_decoys=held_decoys,
     )
 
 

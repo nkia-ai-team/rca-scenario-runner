@@ -50,7 +50,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 DecoyKind = Literal["restart", "config_rollout", "configmap", "annotation", "war_redeploy", "config_reapply"]
 DecoyWindowName = Literal["normal", "near_fault"]
 DecoyRelation = Literal["on_path", "same_domain", "off_domain"]
-DecoyStatus = Literal["planned", "rolling", "applied", "failed", "rolled_back", "skipped"]
+# "held": a VM decoy changed and left so until the recording is over (review rv-t4u3 D1 (b)).
+DecoyStatus = Literal["planned", "rolling", "applied", "failed", "rolled_back", "skipped", "held"]
+DecoyRevert = Literal["before_fault", "after_recording"]
 
 ROLLOUT_KINDS: frozenset[str] = frozenset({"restart", "config_rollout"})
 WINDOW_ORDER: tuple[DecoyWindowName, ...] = ("normal", "near_fault")
@@ -73,6 +75,16 @@ VM_DECOY_CALL_TIMEOUT_SEC = VM_DECOY_CLI_LIMIT_SEC + 60
 # Room kept after a VM decoy's revert before the buffer opens: the change and the revert call each take at most the
 # runner's decoy call limit.
 VM_DECOY_CALL_ROOM_SEC = 2 * VM_DECOY_CALL_TIMEOUT_SEC
+# Half the VM decoys are put back after the recording instead of before the fault (command-session decision on review
+# rv-t4u3 D1: when every VM decoy is reverted before the fault, «an operator change not reverted when the fault
+# starts» marks the cause). Drawn evenly per VM decoy.
+VM_DECOY_AFTER_RECORDING_SHARE = 0.5
+# The CLI executor guard of a decoy reverted after the recording, a backstop for a runner that is gone (the queue
+# reverts it at the end of the cooldown): from the change to the buffer start, then the buffer (600 s), an hour for
+# the gate's holds and the injection (the longest recorded is 1878 s), the cooldown (1800 s) and 1800 s more.
+VM_DECOY_HELD_GUARD_AFTER_BUFFER_SEC = 600 + 3600 + 1800 + 1800
+# Draws of a moved start that would crowd another decoy are tried this many times before the decoy is skipped.
+VM_DECOY_MOVE_DRAWS = 16
 # The gap between a VM decoy's change and its revert follows the injection lengths (review rv-t4u R1 (a),
 # command-session decision: drawn by the runner). Every injection length (t2 - t1, seconds) of the 129 recorded
 # cases under /data/eval-cases on 104 (meta.json, measured 2026-11-21 KST; testbed-services keeps the same list in
@@ -246,6 +258,14 @@ class DecoyPolicy(_Strict):
             raise ValueError("rollout_timeout_sec must end before the buffer opens")
         if any(target.transport == "vm" for target in self.targets) and self.vm_hold_sec is None:
             raise ValueError("VM decoy targets need vm_hold_sec (how long a VM decoy stays changed)")
+        near = self.windows["near_fault"].start_before_buffer_sec
+        if self.vm_hold_sec is not None and near is not None and self.vm_hold_sec.max + VM_DECOY_CALL_ROOM_SEC > near:
+            # Review rv-t4u3 L8/D4: a near-fault VM decoy is moved earlier so its revert ends VM_DECOY_CALL_ROOM_SEC
+            # before the buffer; with a longer hold the move would leave the near-fault window it was drawn for.
+            raise ValueError(
+                f"vm_hold_sec.max {self.vm_hold_sec.max} + {VM_DECOY_CALL_ROOM_SEC} must not exceed the near_fault "
+                f"window start {near}s before the buffer"
+            )
         missing = sorted(set(self.domain_namespaces) - set(_DOMAIN_WORDS))
         if missing:
             # U7b review M2: a domain without words would be read as "never
@@ -273,6 +293,15 @@ class DecoyRecord(_Strict):
     gap_sec: int | None = None
     # True when a VM decoy may have left its change on the VM (its revert failed): the buffer gate restarts the cycle.
     unsettled: bool | None = None
+    # When a VM decoy is put back (command-session decision on review rv-t4u3 D1): before the fault (after gap_sec)
+    # or after the recording (at the end of the cooldown, the change stays through the buffer, the injection and the
+    # cooldown, as an injection's change stays until its cleanup). guard_sec is the CLI executor guard for the
+    # latter (it must not revert inside the recording).
+    revert: DecoyRevert | None = None
+    guard_sec: int | None = None
+    # The files a VM decoy's change left different from the install (the CLI's `@@ decoy-changed <path>` lines): a
+    # held decoy excuses exactly these on its node in the drift gate, and one executor guard there (held_excuses).
+    changed_paths: list[str] | None = None
     service_name: str | None = None
     target_id: str | None = None
     relation: DecoyRelation
@@ -733,41 +762,59 @@ def build_schedule(
             )
             continue
         gap_sec = None
+        revert = None
+        guard_sec = None
         if target.transport == "vm":
             bounds = policy.vm_hold_sec
             assert bounds is not None  # the policy validator requires it with VM targets
-            # The gap first, then the start (command-session decision on the T4U-3 open question): the revert must
-            # be over VM_DECOY_CALL_ROOM_SEC before the buffer opens, so a decoy whose drawn time leaves too little
-            # room starts that much earlier instead of being dropped. Otherwise nearly every near-fault VM decoy was
-            # skipped and «an operator change near the fault» would mark the cause in this domain (principle 8).
-            latest_revert = buffer_start - timedelta(seconds=VM_DECOY_CALL_ROOM_SEC)
-            earliest = cycle_start + timedelta(seconds=policy.windows["normal"].start_after_cycle_start_sec or 0)
-            span = int((latest_revert - earliest).total_seconds())
-            gap_sec = draw_vm_decoy_gap_within(rng, bounds.min, min(bounds.max, span))
-            moved = None
-            if gap_sec is not None and at + timedelta(seconds=gap_sec) > latest_revert:
-                moved = latest_revert - timedelta(seconds=gap_sec)
-                others = [time for time, _ in timed if time != at] + [_parse(r.planned_at) for r in records]
-                if any(abs(moved - other) < min_gap for other in others):
-                    gap_sec = None  # moving it would crowd another decoy
-            if gap_sec is None:
+            if rng.random() < VM_DECOY_AFTER_RECORDING_SHARE:
+                # Put back after the recording: no gap before the buffer, a guard that outlasts the recording.
+                revert = "after_recording"
+                guard_sec = int((buffer_start - at).total_seconds()) + VM_DECOY_HELD_GUARD_AFTER_BUFFER_SEC
+            else:
+                revert = "before_fault"
+                # The gap first, then the start (command-session decision on the T4U-3 open question): the revert
+                # must be over VM_DECOY_CALL_ROOM_SEC before the buffer opens, so a decoy whose drawn time leaves too
+                # little room starts earlier instead of being dropped. The earlier start is drawn evenly over the
+                # starts that fit (review rv-t4u3 L4: pinning the revert to the latest allowed second marked it).
+                latest_revert = buffer_start - timedelta(seconds=VM_DECOY_CALL_ROOM_SEC)
+                earliest = cycle_start + timedelta(seconds=policy.windows["normal"].start_after_cycle_start_sec or 0)
+                span = int((latest_revert - earliest).total_seconds())
+                gap_sec = draw_vm_decoy_gap_within(rng, bounds.min, min(bounds.max, span))
+                if gap_sec is not None and at + timedelta(seconds=gap_sec) > latest_revert:
+                    window_low, _ = policy.windows[window_name].bounds(cycle_start, buffer_start)
+                    low = max(window_low, earliest)
+                    high = latest_revert - timedelta(seconds=gap_sec)
+                    if high < low:
+                        low = earliest
+                    others = [time for time, _ in timed if time != at] + [_parse(r.planned_at) for r in records]
+                    moved = None
+                    for _attempt in range(VM_DECOY_MOVE_DRAWS):
+                        candidate = low + timedelta(seconds=rng.randint(0, max(0, int((high - low).total_seconds()))))
+                        if all(abs(candidate - other) >= min_gap for other in others):
+                            moved = candidate
+                            break
+                    if moved is None:
+                        gap_sec = None  # every earlier start would crowd another decoy
+                    else:
+                        at = moved
+            if revert == "before_fault" and gap_sec is None:
                 # No recorded length fits: the decoy is not run, and the record says so.
                 records.append(
                     DecoyRecord(
                         id=f"d{index}", window=window_name, planned_at=_format(at), kind=kind,
                         namespace=target.namespace, deployment=target.deployment, node=target.node,
                         service_name=target.service_name, target_id=target.target_id, relation=relation,
-                        value=f"{stamp}-{token}", status="skipped",
+                        value=f"{stamp}-{token}", status="skipped", revert=revert,
                         detail="no recorded injection length fits before the buffer without crowding another decoy",
                     )
                 )
                 continue
-            if moved is not None:
-                at = moved
         records.append(
             DecoyRecord(
                 id=f"d{index}", window=window_name, planned_at=_format(at), kind=kind,
                 namespace=target.namespace, deployment=target.deployment, node=target.node, gap_sec=gap_sec,
+                revert=revert, guard_sec=guard_sec,
                 service_name=target.service_name, target_id=target.target_id,
                 relation=relation,
                 configmap=policy.configmap.name if kind == "config_rollout" else None,
@@ -857,6 +904,11 @@ class VmDecoyCallError(RuntimeError):
         self.code = code
 
 
+class VmDecoyBusy(RuntimeError):
+    """The CLI answered 75 to a change: an executor's operator session holds that VM and nothing was changed, so
+    there is nothing to revert (review rv-t4u3 L1). The decoy is skipped, not unsettled."""
+
+
 class VmDecoyLeftChanged(RuntimeError):
     """A VM decoy whose change failed and whose revert failed too: the change may still be on the VM until the
     CLI's executor guard reverts it (policy max + 600 seconds)."""
@@ -870,6 +922,9 @@ VM_DECOY_EXIT_WORDS = {
     124: "over the CLI limit",
 }
 VM_DECOY_REFUSED_EXIT = 3
+VM_DECOY_BUSY_EXIT = 75
+# The CLI's line for each file a successful change left different from the install (testbed-services contract, T4U-4).
+VM_DECOY_CHANGED_PREFIX = "@@ decoy-changed "
 
 
 class VmDecoyExecutor:
@@ -898,9 +953,10 @@ class VmDecoyExecutor:
     def _call(self, record: DecoyRecord, mode: str) -> None:
         if record.kind not in VM_KINDS or not record.node:
             raise RuntimeError(f"not a VM decoy: {record.kind} on {record.node}")
+        extra = ["--guard-sec", str(record.guard_sec)] if mode == "--decoy-change" and record.guard_sec else []
         try:
             result = self.process_runner(
-                ["python3", str(self.cli), "--node", record.node, mode, record.kind],
+                ["python3", str(self.cli), "--node", record.node, mode, record.kind, *extra],
                 timeout=VM_DECOY_CALL_TIMEOUT_SEC,
                 env=self._vm_ops.operator_environment(),
             )
@@ -916,11 +972,15 @@ class VmDecoyExecutor:
                 f"{tail[-1] if tail else 'no output'}",
                 result.returncode,
             )
+        return result.stdout or ""
 
-    def apply(self, record: DecoyRecord) -> None:
+    def apply(self, record: DecoyRecord) -> list[str]:
+        """The change; returns the paths it left different from the install (the CLI's `@@ decoy-changed` lines)."""
         try:
-            self._call(record, "--decoy-change")
+            out = self._call(record, "--decoy-change")
         except VmDecoyCallError as error:
+            if error.code == VM_DECOY_BUSY_EXIT:
+                raise VmDecoyBusy(str(error)) from None
             if error.code == VM_DECOY_REFUSED_EXIT:
                 raise
             try:
@@ -928,9 +988,15 @@ class VmDecoyExecutor:
             except Exception as revert_error:
                 raise VmDecoyLeftChanged(f"{error}; revert after it also failed: {revert_error}") from None
             raise RuntimeError(f"{error}; reverted again after it") from None
+        paths = (line[len(VM_DECOY_CHANGED_PREFIX):].strip() for line in out.splitlines()
+                 if line.startswith(VM_DECOY_CHANGED_PREFIX))
+        return [path for path in paths if path]
 
     def rollout_done(self, record: DecoyRecord) -> bool:
-        """False while the change holds; at the end of its gap the revert call, then True."""
+        """False while the change holds; at the end of its gap the revert call, then True. A decoy put back after
+        the recording is never reverted here (the queue reverts it at the end of the cooldown)."""
+        if record.revert == "after_recording":
+            return False
         started = _parse(record.started_at) if record.started_at else self.clock()
         if self.clock() < started + timedelta(seconds=record.gap_sec or 0):
             return False
@@ -956,8 +1022,8 @@ class CompositeDecoyExecutor:
     def _for(self, record: DecoyRecord) -> Any:
         return self.vm if record.node is not None else self.kubernetes
 
-    def apply(self, record: DecoyRecord) -> None:
-        self._for(record).apply(record)
+    def apply(self, record: DecoyRecord) -> list[str] | None:
+        return self._for(record).apply(record)
 
     def rollout_done(self, record: DecoyRecord) -> bool:
         return self._for(record).rollout_done(record)
@@ -1023,6 +1089,21 @@ def _alert_started(alert: Mapping[str, Any]) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def held_excuses(records: Iterable[DecoyRecord]) -> dict[str, dict[str, Any]]:
+    """What the VM decoys left changed through this recording (D1 (b)) leave on each node: {node: {"paths": set of
+    the files they changed, "guards": how many executor guards they hold}}. The drift gate and the preflight
+    residual_guards signal excuse exactly these, and nothing on any other node."""
+    excuses: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if record.status != "held" or not record.node:
+            continue
+        entry = excuses.setdefault(record.node, {"paths": set(), "guards": 0, "ids": []})
+        entry["paths"].update(record.changed_paths or [])
+        entry["guards"] += 1
+        entry["ids"].append(record.id)
+    return excuses
+
+
 def partition_decoy_alarms(
     alerts: Iterable[Mapping[str, Any]],
     decoys: Iterable[DecoyRecord],
@@ -1036,7 +1117,8 @@ def partition_decoy_alarms(
     ``now`` is the preflight time and is required: a silent wall-clock default
     made a forgotten argument look like a fix (review2). An alert is explained only when all hold, otherwise it blocks:
     - the decoy rolled pods (restart kinds) or redeployed or reapplied on a VM (VM kinds: the service reloads)
-      and finished healthy (``applied``).
+      and finished healthy (``applied``), or a VM decoy changed and held through the recording (``held``: its
+      finish is the end of the change, D1 (b)).
       A metadata-only decoy cannot cause an alarm, and a failed, undone or
       unfinished one explains nothing;
     - the alert names the decoy's target through its own subject labels
@@ -1051,7 +1133,7 @@ def partition_decoy_alarms(
     now = now.astimezone(timezone.utc)
     applied = [
         record for record in decoys
-        if record.kind in ALARM_KINDS and record.status == "applied"
+        if record.kind in ALARM_KINDS and record.status in ("applied", "held")
         and record.started_at and record.finished_at and record.deployment
     ]
     remaining: list[Mapping[str, Any]] = []
@@ -1110,8 +1192,9 @@ def _record_document(record: DecoyRecord) -> dict[str, Any]:
     if document.get("node") is None:
         document.pop("node", None)
         document.pop("gap_sec", None)
-    if document.get("unsettled") is None:
-        document.pop("unsettled", None)
+    for key in ("unsettled", "revert", "guard_sec", "changed_paths"):
+        if document.get(key) is None:
+            document.pop(key, None)
     return document
 
 

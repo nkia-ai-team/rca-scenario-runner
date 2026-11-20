@@ -193,6 +193,12 @@ echo "@@ end"
 '''
 
 
+def _drift_absolute(path: str) -> str:
+    """A drift line as an absolute path: expected.sha256 names absolute paths, war.sha256 names the WAR relative to
+    its base (CHECKSUM_RECORDS)."""
+    return path if path.startswith("/") else f"{CHECKSUM_RECORDS[0][1]}/{path}"
+
+
 class VmOpsError(RuntimeError):
     """A management-network read failed; the message carries the remote's own words (U3)."""
 
@@ -861,10 +867,11 @@ class VmOps:
             raise VmOpsError(f"helper checksums at {HELPER_CHECKSUMS} lack {missing}")
         return {name: files[name] for name in HELPER_FILES}
 
-    def drift_detail(self) -> str | None:
+    def drift_detail(self, excused: Mapping[str, Mapping[str, Any]] | None = None) -> str | None:
         """What differs from the install on the VMs and 66, or None (live_queue VM_DOMAIN_STATE_CHECK_NAME).
 
-        Judged on the latest periodic read. A host whose read is missing or stale is left to preflight, which
+        ``excused`` is decoys.held_excuses of the cycle: a file a VM decoy held through the recording changed
+        (D1 (b)) is no drift, on that node only. Judged on the latest periodic read. A host whose read is missing or stale is left to preflight, which
         refuses to judge on stale facts and waits (then pauses) with the read error."""
         document = self.load()
         now = self.clock()
@@ -876,11 +883,17 @@ class VmOps:
             for unit, state in sorted(facts["units"].items()):
                 if state != "active":
                     problems.append(f"{host.name} {unit} {state}")
+            held = set((excused or {}).get(host.name, {}).get("paths") or ())
+            # war.sha256 names the WAR relative to the webapps directory; the CLI names files absolute.
+            unexcused = [path for path in facts["drift"] if _drift_absolute(path) not in held]
             for record in (*REQUIRED_RECORDS_BY_ROLE.get(host.role, ()), *REQUIRED_RECORDS_ALL):
                 verdict = facts["sums"].get(record, "not read")
+                # sha256sum -c ends 1 on any differing line; when every such line is a held decoy's file, that is it.
+                if verdict == "rc=1" and held and facts["drift"] and not unexcused:
+                    continue
                 if verdict != "rc=0":
                     problems.append(f"{host.name} {record} {verdict}")
-            for path in facts["drift"]:
+            for path in unexcused:
                 problems.append(f"{host.name} changed since install: {path}")
         history = document["hypervisor"].get("history") or []
         if self.hypervisor_target and history:

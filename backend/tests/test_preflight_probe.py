@@ -479,3 +479,29 @@ def test_vm_domain_preflight_stops_when_the_routine_operator_session_stopped(tmp
     assert {c.name for c in verdict.checks if c.status == "fail"} == {"operator_routine_age_sec"}
     (tmp_path / "vm-ops" / "operator-routine.json").unlink()
     assert probe.collect(now=clock.value)["operator_routine_age_sec"] == 10801
+
+
+def test_vm_domain_guard_residue_excuses_one_guard_per_held_decoy_on_its_own_node(tmp_path) -> None:
+    """Command-session decision D1 (b): a VM decoy held through the recording keeps one executor guard on its node.
+    That one is no residue; a second guard there, or any guard on another node, still is."""
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    remote.outputs["192.168.127.32"] = _read_output(_vm_ops.HOSTS_BY_NAME["was02"], at=clock.value, guards=(1, 1))
+    remote.outputs["192.168.127.2"] = _read_output(_vm_ops.HOSTS_BY_NAME["rt-core01"], at=clock.value,
+                                                   procstat="cpu  850 0 0 3050 0 0 0 0 0 0")
+    ops.read_all()
+    remote.hypervisor = _hypervisor(clock.value, rx=90_000_000, tx=90_000_000)
+    assert probe.collect(now=clock.value)["residual_guards"] == 1
+    probe.set_held_decoys({"was02": {"paths": set(), "guards": 1}})
+    assert probe.collect(now=clock.value)["residual_guards"] == 0
+    probe.set_held_decoys({"was01": {"paths": set(), "guards": 1}})  # another node's decoy excuses nothing here
+    assert probe.collect(now=clock.value)["residual_guards"] == 1
+    probe, ops, remote, clock = _vm_probe(tmp_path / "two")
+    remote.outputs["192.168.127.32"] = _read_output(_vm_ops.HOSTS_BY_NAME["was02"], at=clock.value, guards=(2, 2))
+    remote.outputs["192.168.127.2"] = _read_output(_vm_ops.HOSTS_BY_NAME["rt-core01"], at=clock.value,
+                                                   procstat="cpu  850 0 0 3050 0 0 0 0 0 0")
+    ops.read_all()
+    remote.hypervisor = _hypervisor(clock.value, rx=90_000_000, tx=90_000_000)
+    probe.set_held_decoys({"was02": {"paths": set(), "guards": 1}, "was01": {"paths": set(), "guards": 3}})
+    assert probe.collect(now=clock.value)["residual_guards"] == 1
+    probe.set_held_decoys({})
+    assert probe.collect(now=clock.value)["residual_guards"] == 2

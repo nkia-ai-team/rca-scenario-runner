@@ -914,3 +914,49 @@ def test_kill_process_group_returns_as_soon_as_a_reaped_group_is_gone(tmp_path: 
     vm_ops.kill_process_group(process.pid, leader=process)
     assert time.monotonic() - started < 2
     assert process.returncode is not None
+
+
+def test_drift_detail_excuses_only_a_held_decoys_files_on_its_node(tmp_path: Path) -> None:
+    """Command-session decision D1 (b): the file a VM decoy held through the recording changed is no drift on its
+    node (nor the record's rc=1 it causes); another file there, or the same file on another node, still is."""
+    remote = FakeRemote()
+    clock = Clock()
+    ops = _ops(tmp_path, remote, clock)
+    site = "/etc/apache2/sites-available/petition.conf"
+    remote.outputs["192.168.127.21"] = _read_output(
+        HOSTS_BY_NAME["web01"], sums={"/var/lib/petition-deploy/expected.sha256": "rc=1"}, drift=(site,),
+    )
+    ops.read_all()
+    assert "web01 changed since install: " + site in ops.drift_detail()
+    assert ops.drift_detail(excused={"web01": {"paths": {site}, "guards": 1}}) is None
+    detail = ops.drift_detail(excused={"web02": {"paths": {site}, "guards": 1}})
+    assert "web01 changed since install: " + site in detail and "web01 /var/lib/petition-deploy/expected.sha256 rc=1" in detail
+    remote.outputs["192.168.127.21"] = _read_output(
+        HOSTS_BY_NAME["web01"], sums={"/var/lib/petition-deploy/expected.sha256": "rc=1"},
+        drift=(site, "/etc/apache2/apache2.conf"),
+    )
+    ops.read_all()
+    detail = ops.drift_detail(excused={"web01": {"paths": {site}, "guards": 1}})
+    assert detail == ("web01 /var/lib/petition-deploy/expected.sha256 rc=1; "
+                      "web01 changed since install: /etc/apache2/apache2.conf")
+    # A record that cannot be read is never a decoy's doing.
+    remote.outputs["192.168.127.21"] = _read_output(
+        HOSTS_BY_NAME["web01"], sums={"/var/lib/petition-deploy/expected.sha256": "missing"}, drift=(site,),
+    )
+    ops.read_all()
+    assert "expected.sha256 missing" in ops.drift_detail(excused={"web01": {"paths": {site}, "guards": 1}})
+
+
+def test_drift_detail_excuses_a_held_war_decoy_on_the_war_record(tmp_path: Path) -> None:
+    """war.sha256 names the WAR relative to webapps; the CLI's changed line is absolute. A held war decoy excuses it
+    on its own node, not on the other WAS."""
+    remote = FakeRemote()
+    clock = Clock()
+    ops = _ops(tmp_path, remote, clock)
+    for name, address in (("was01", "192.168.127.31"), ("was02", "192.168.127.32")):
+        remote.outputs[address] = _read_output(
+            HOSTS_BY_NAME[name], sums={"/var/lib/petition-deploy/war.sha256": "rc=1"}, drift=("petition.war",),
+        )
+    ops.read_all()
+    detail = ops.drift_detail(excused={"was01": {"paths": {"/var/lib/tomcat10/webapps/petition.war"}, "guards": 1}})
+    assert detail == ("was02 /var/lib/petition-deploy/war.sha256 rc=1; was02 changed since install: petition.war")
