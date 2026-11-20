@@ -843,8 +843,9 @@ class VmDecoyExecutor:
     def undo(self, record: DecoyRecord) -> None:
         self._call(record, "--decoy-revert")
 
-    def timeout_sec(self, record: DecoyRecord) -> int:
-        """How long the queue lets a VM decoy stay «rolling»: its gap plus the revert call."""
+    def timeout_sec(self, record: DecoyRecord, default: int | None = None) -> int:
+        """How long the queue lets a VM decoy stay «rolling»: its gap plus the revert call (same call shape as
+        CompositeDecoyExecutor.timeout_sec; ``default`` is not used for a VM decoy)."""
         return int(record.gap_sec or 0) + 2 * self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC
 
 
