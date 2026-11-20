@@ -922,6 +922,13 @@ OPERATOR_ROUTINE_MAX_AGE_SEC = 2 * OPERATOR_ROUTINE_MAX_SEC
 OPERATOR_ENV_PASSTHROUGH = ("VM_OPS_KEY_DIR", "CIVIL_PETITION_SSH_CONTROL_DIR", "CIVIL_PETITION_DEPLOY_DIR")
 
 
+def operator_environment() -> dict[str, str]:
+    """What the operator CLI runs with: a plain PATH plus the key, socket and deploy directories it reads."""
+    env = _environment()
+    env.update({name: os.environ[name] for name in OPERATOR_ENV_PASSTHROUGH if os.environ.get(name)})
+    return env
+
+
 class OperatorRoutine:
     """Schedules routine operator sessions and keeps their record (state_dir/operator-routine.json)."""
 
@@ -977,9 +984,7 @@ class OperatorRoutine:
         return {"at": _format(now + timedelta(seconds=self.rng.uniform(low, high))), "host": self.rng.choice(hosts)}
 
     def _environment(self) -> dict[str, str]:
-        env = _environment()
-        env.update({name: os.environ[name] for name in OPERATOR_ENV_PASSTHROUGH if os.environ.get(name)})
-        return env
+        return operator_environment()
 
     def tick(self) -> dict[str, Any]:
         """Run the session that is due, if any, and schedule the next. Returns the record."""

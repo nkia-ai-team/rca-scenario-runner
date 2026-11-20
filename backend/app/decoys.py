@@ -47,7 +47,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-DecoyKind = Literal["restart", "config_rollout", "configmap", "annotation"]
+DecoyKind = Literal["restart", "config_rollout", "configmap", "annotation", "war_redeploy", "config_reapply"]
 DecoyWindowName = Literal["normal", "near_fault"]
 DecoyRelation = Literal["on_path", "same_domain", "off_domain"]
 DecoyStatus = Literal["planned", "rolling", "applied", "failed", "rolled_back", "skipped"]
@@ -55,7 +55,16 @@ DecoyStatus = Literal["planned", "rolling", "applied", "failed", "rolled_back", 
 ROLLOUT_KINDS: frozenset[str] = frozenset({"restart", "config_rollout"})
 WINDOW_ORDER: tuple[DecoyWindowName, ...] = ("normal", "near_fault")
 RELATION_ORDER: tuple[DecoyRelation, ...] = ("on_path", "same_domain", "off_domain")
-KIND_ORDER: tuple[DecoyKind, ...] = ("restart", "config_rollout", "configmap", "annotation")
+KIND_ORDER: tuple[DecoyKind, ...] = (
+    "restart", "config_rollout", "configmap", "annotation", "war_redeploy", "config_reapply",
+)
+# VM testbed (civil-petition, review rv-t4o M3, Q35 answer condition ②): the harmless changes a VM target takes, run
+# by the operator the same way the change-cause executor runs a real one (testbed-services operator_session.py
+# --decoy <kind>: the same WAR deployed again, the same configuration applied again). Each leaves the VM as it was,
+# so there is nothing to undo and nothing to poll.
+VM_KINDS: frozenset[str] = frozenset({"war_redeploy", "config_reapply"})
+# Kinds whose run can raise an alarm on its target (a rollout, or a VM service that reloads); only these excuse one.
+ALARM_KINDS: frozenset[str] = ROLLOUT_KINDS | VM_KINDS
 # Drawing a time that keeps min_gap from the others is retried this many times
 # before the draw is dropped (a crowded window then simply yields fewer decoys).
 _TIME_DRAW_ATTEMPTS = 64
@@ -101,13 +110,28 @@ class DecoyTarget(_Strict):
     target_id: str = Field(min_length=1)
     rollout_ok: bool
     aliases: list[str] = Field(default_factory=list)
+    # A VM of the VM testbed instead of a Deployment: ``node`` is the guest name the operator CLI takes,
+    # ``namespace`` the domain value, ``deployment`` the app's name there, ``kinds`` the VM kinds it accepts.
+    transport: Literal["kubernetes", "vm"] = "kubernetes"
+    node: str | None = None
+    kinds: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _transport_fields(self) -> "DecoyTarget":
+        if self.transport == "vm":
+            if not self.node or not self.kinds or not set(self.kinds) <= VM_KINDS:
+                raise ValueError(f"a VM decoy target needs a node and kinds among {sorted(VM_KINDS)}")
+        elif self.node is not None or self.kinds:
+            raise ValueError("node and kinds belong to VM decoy targets only")
+        return self
 
     @property
     def key(self) -> str:
         return f"{self.namespace}/{self.deployment}"
 
     def names(self) -> set[str]:
-        return {self.service_name, self.target_id, *self.aliases}
+        # A VM is also named by its guest name in the answer keys (was01), so it stays off the fault path then.
+        return {self.service_name, self.target_id, *self.aliases, *([self.node] if self.node else [])}
 
 
 class DecoyConfigMap(_Strict):
@@ -177,6 +201,8 @@ class DecoyRecord(_Strict):
     namespace: str
     # None for a ConfigMap-only change (no Deployment is touched).
     deployment: str | None = None
+    # The VM a VM-kind decoy runs on (None for every Kubernetes decoy).
+    node: str | None = None
     service_name: str | None = None
     target_id: str | None = None
     relation: DecoyRelation
@@ -293,6 +319,7 @@ _DOMAIN_WORDS: dict[str, tuple[str, ...]] = {
     "commerce": ("커머스", "checkout", "체크아웃"),
     "core-banking": ("banking", "은행"),
     "food-delivery": ("food", "배달", "음식"),
+    "civil-petition": ("민원", "petition"),
 }
 # Short names that also mean something else: everyday words an answer key uses
 # for data, not apps ("in order", "application account", "ledger window").
@@ -535,10 +562,12 @@ def excluded_targets(
 
 
 def _usable_kinds(policy: DecoyPolicy, target: DecoyTarget) -> dict[str, int]:
+    if target.transport == "vm":
+        return {kind: weight for kind, weight in policy.kind_weights.items() if weight > 0 and kind in target.kinds}
     return {
         kind: weight
         for kind, weight in policy.kind_weights.items()
-        if weight > 0 and (target.rollout_ok or kind not in ROLLOUT_KINDS)
+        if weight > 0 and kind not in VM_KINDS and (target.rollout_ok or kind not in ROLLOUT_KINDS)
     }
 
 
@@ -632,7 +661,7 @@ def build_schedule(
         records.append(
             DecoyRecord(
                 id=f"d{index}", window=window_name, planned_at=_format(at), kind=kind,
-                namespace=target.namespace, deployment=target.deployment,
+                namespace=target.namespace, deployment=target.deployment, node=target.node,
                 service_name=target.service_name, target_id=target.target_id,
                 relation=relation,
                 configmap=policy.configmap.name if kind == "config_rollout" else None,
@@ -711,6 +740,64 @@ class KubectlDecoyExecutor:
         self._kubectl(record.namespace, "rollout", "undo", f"deployment/{record.deployment}")
 
 
+class VmDecoyExecutor:
+    """VM-kind decoys through the operator CLI (testbed-services operator_session.py --node <VM> --decoy <kind>):
+    an operator login, the harmless change, the session closed, all inside one call. Exit 0 applied, 75 busy (an
+    executor's operator session holds that VM), anything else failed; both are raised with the CLI's words and
+    the queue records the decoy as failed, as for a Kubernetes decoy."""
+
+    def __init__(self, *, process_runner: Callable[..., subprocess.CompletedProcess] | None = None,
+                 cli: Path | None = None) -> None:
+        from app import vm_ops
+
+        self.process_runner = process_runner or vm_ops.run_in_group
+        self.cli = cli or vm_ops.OPERATOR_SESSION_CLI
+        self._vm_ops = vm_ops
+
+    def apply(self, record: DecoyRecord) -> None:
+        if record.kind not in VM_KINDS or not record.node:
+            raise RuntimeError(f"not a VM decoy: {record.kind} on {record.node}")
+        try:
+            result = self.process_runner(
+                ["python3", str(self.cli), "--node", record.node, "--decoy", record.kind],
+                timeout=self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC,
+                env=self._vm_ops.operator_environment(),
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"operator decoy on {record.node} did not end within "
+                               f"{self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC}s") from None
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "").strip().splitlines()
+            what = "busy" if result.returncode == self._vm_ops.OPERATOR_ROUTINE_BUSY_EXIT else f"exited {result.returncode}"
+            raise RuntimeError(f"operator decoy on {record.node} {what}: {tail[-1] if tail else 'no output'}")
+
+    def rollout_done(self, record: DecoyRecord) -> bool:
+        return True
+
+    def undo(self, record: DecoyRecord) -> None:
+        """Nothing to undo: the change put back the same WAR or the same values."""
+
+
+class CompositeDecoyExecutor:
+    """Kubernetes decoys to kubectl, VM decoys to the operator CLI."""
+
+    def __init__(self, kubernetes: Any, vm: Any) -> None:
+        self.kubernetes = kubernetes
+        self.vm = vm
+
+    def _for(self, record: DecoyRecord) -> Any:
+        return self.vm if record.node is not None else self.kubernetes
+
+    def apply(self, record: DecoyRecord) -> None:
+        self._for(record).apply(record)
+
+    def rollout_done(self, record: DecoyRecord) -> bool:
+        return self._for(record).rollout_done(record)
+
+    def undo(self, record: DecoyRecord) -> None:
+        self._for(record).undo(record)
+
+
 # ---------------------------------------------------------------------------
 # Preflight: which firing alarms a decoy explains
 # ---------------------------------------------------------------------------
@@ -776,7 +863,8 @@ def partition_decoy_alarms(
 
     ``now`` is the preflight time and is required: a silent wall-clock default
     made a forgotten argument look like a fix (review2). An alert is explained only when all hold, otherwise it blocks:
-    - the decoy rolled pods (restart kinds) and finished healthy (``applied``).
+    - the decoy rolled pods (restart kinds) or redeployed or reapplied on a VM (VM kinds: the service reloads)
+      and finished healthy (``applied``).
       A metadata-only decoy cannot cause an alarm, and a failed, undone or
       unfinished one explains nothing;
     - the alert names the decoy's target through its own subject labels
@@ -791,7 +879,7 @@ def partition_decoy_alarms(
     now = now.astimezone(timezone.utc)
     applied = [
         record for record in decoys
-        if record.kind in ROLLOUT_KINDS and record.status == "applied"
+        if record.kind in ALARM_KINDS and record.status == "applied"
         and record.started_at and record.finished_at and record.deployment
     ]
     remaining: list[Mapping[str, Any]] = []
@@ -839,8 +927,17 @@ def decoy_document(
         "seed": seed,
         "policy_sha256": policy_sha256,
         "cycle_start": cycle_start,
-        "decoys": [record.model_dump(mode="json") for record in records],
+        "decoys": [_record_document(record) for record in records],
     }
+
+
+def _record_document(record: DecoyRecord) -> dict[str, Any]:
+    """A record as meta.json carries it. ``node`` only on VM decoys, so a Kubernetes decoy keeps the exact shape
+    recordings had before VM decoys existed (same meta items across recordings, R4)."""
+    document = record.model_dump(mode="json")
+    if document.get("node") is None:
+        document.pop("node", None)
+    return document
 
 
 # ---------------------------------------------------------------------------

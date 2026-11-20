@@ -892,3 +892,127 @@ def test_a_non_app_target_name_names_no_app_and_a_bare_namespace_names_all() -> 
     ):
         assert mentioned_targets(active, name) == set(), name
     assert mentioned_targets(active, "rca-testbed-food 의 앱이 모두 재시작") == FOOD_APPS
+
+
+# --- VM testbed decoys (civil-petition, review rv-t4o M3, Q35 answer condition ②) --------------------------------
+
+def _vm_target(node, *, kinds=("war_redeploy", "config_reapply"), service=None):
+    return {
+        # The namespace key must not be the domain value itself: answer keys carry their domain as text, and a
+        # target whose namespace appears in the text is read as named (every VM target would be excluded).
+        "namespace": "civil-petition-vm", "deployment": f"petition-{node}", "container": "petition",
+        "service_name": service or f"civil-petition-{node}", "target_id": f"uuid-{node}", "rollout_ok": True,
+        "aliases": [], "transport": "vm", "node": node, "kinds": list(kinds),
+    }
+
+
+def _vm_policy(**overrides) -> DecoyPolicy:
+    document = policy_document()
+    document["domain_namespaces"]["civil-petition"] = "civil-petition-vm"
+    document["targets"] += [_vm_target("was01"), _vm_target("was02"), _vm_target("web01", kinds=("config_reapply",))]
+    document["kind_weights"].update({"war_redeploy": 20, "config_reapply": 20})
+    document.update(overrides)
+    return DecoyPolicy.model_validate(document)
+
+
+VM_SCENARIO = {
+    "domain": "civil-petition",
+    "root_cause": {"target_id": "uuid-db01"},
+    "scoring": {"accept": ["uuid-db01"], "partial": []},
+    "description": "db01 데이터 디스크가 가득 찬다. was01 은 피해자다.",
+}
+
+
+def test_vm_targets_take_only_vm_kinds_and_kubernetes_targets_never_do() -> None:
+    from app.decoys import VM_KINDS
+
+    policy = _vm_policy()
+    kinds_by_target: dict[str, set[str]] = {}
+    for seed in range(400):
+        for scenario in (VM_SCENARIO, SCENARIO):
+            for record in build_schedule(policy, seed=seed, scenario_id="F99-X" if scenario is VM_SCENARIO else "F01-R",
+                                         scenario=scenario, cycle_start=CYCLE_START, buffer_start=BUFFER_START):
+                kinds_by_target.setdefault(f"{record.namespace}/{record.deployment}", set()).add(record.kind)
+                assert (record.node is not None) == (record.kind in VM_KINDS)
+    assert kinds_by_target["civil-petition-vm/petition-web01"] == {"config_reapply"}
+    assert kinds_by_target["civil-petition-vm/petition-was02"] <= VM_KINDS
+    assert all(not (kinds & VM_KINDS) for key, kinds in kinds_by_target.items() if not key.startswith("civil-petition-vm/"))
+    # The same windows, counts and relations as every domain: VM decoys also land in other domains' cycles.
+    assert any(key.startswith("civil-petition-vm/") for key in kinds_by_target)
+    with pytest.raises(ValueError, match="VM decoy target needs a node"):
+        _vm_policy(targets=[*policy_document()["targets"], {**_vm_target("db01"), "kinds": ["restart"]}])
+    with pytest.raises(ValueError, match="belong to VM decoy targets only"):
+        DecoyPolicy.model_validate({**policy_document(), "targets": [
+            {**policy_document()["targets"][0], "node": "was01"}]})
+
+
+def test_a_vm_decoy_stays_off_the_fault_path_like_any_decoy() -> None:
+    """was01 is named in the answer key (a victim) and db01 is the cause: neither carries a decoy in this scenario;
+    was02 and web01 may (same domain), Kubernetes apps may (other domains)."""
+    policy = _vm_policy()
+    excluded = excluded_targets(policy, "F99-X", VM_SCENARIO)
+    assert "civil-petition-vm/petition-was01" in excluded
+    groups = decoy_candidates(policy, "F99-X", VM_SCENARIO)
+    assert {t.key for t in groups["same_domain"]} == {"civil-petition-vm/petition-was02", "civil-petition-vm/petition-web01"}
+    assert groups["off_domain"] and all(t.transport == "kubernetes" for t in groups["off_domain"])
+
+
+def test_vm_decoy_executor_runs_the_operator_cli_and_reports_its_words() -> None:
+    from app.decoys import CompositeDecoyExecutor, VmDecoyExecutor
+
+    calls = []
+    answers = [subprocess.CompletedProcess([], 0, "", ""),
+               subprocess.CompletedProcess([], 75, "", "operator lock on was02 is held\n"),
+               subprocess.CompletedProcess([], 1, "", "sudo: a password is required\n")]
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return answers.pop(0)
+
+    vm = VmDecoyExecutor(process_runner=run, cli=Path("/opt/lucida/scenario-contracts/profiles/operator_session.py"))
+    kube = Recorder()
+    executor = CompositeDecoyExecutor(KubectlDecoyExecutor(_vm_policy(), process_runner=kube), vm)
+    record = DecoyRecord(id="d1", window="normal", planned_at="2026-11-10T01:30:00Z", kind="war_redeploy",
+                         namespace="civil-petition-vm", deployment="petition-was02", node="was02",
+                         service_name="civil-petition-was02", target_id="uuid-was02", relation="same_domain",
+                         value="x")
+    executor.apply(record)
+    assert calls[0][0] == ["python3", "/opt/lucida/scenario-contracts/profiles/operator_session.py",
+                           "--node", "was02", "--decoy", "war_redeploy"]
+    assert executor.rollout_done(record) is True and kube.calls == []
+    executor.undo(record)  # nothing to undo, nothing called
+    assert len(calls) == 1 and kube.calls == []
+    with pytest.raises(RuntimeError, match="busy: operator lock on was02 is held"):
+        executor.apply(record)
+    with pytest.raises(RuntimeError, match="exited 1: sudo: a password is required"):
+        executor.apply(record)
+    # A Kubernetes record still goes to kubectl.
+    executor.apply(_record())
+    assert kube.calls and len(calls) == 3
+
+
+def test_a_vm_decoy_alarm_is_excused_by_its_service_or_target_name() -> None:
+    record = DecoyRecord(id="d1", window="normal", planned_at="2026-11-10T02:30:00Z", kind="config_reapply",
+                         namespace="civil-petition-vm", deployment="petition-web01", node="web01",
+                         service_name="civil-petition-web01", target_id="uuid-web01", relation="same_domain",
+                         value="x", status="applied", started_at="2026-11-10T02:30:00Z",
+                         finished_at="2026-11-10T02:32:00Z")
+    remaining, excused = _partition([_alert({"target_id": "uuid-web01"}), _alert({"target_id": "uuid-db01"})],
+                                    decoys=(record,))
+    assert [a["labels"]["target_id"] for a in remaining] == ["uuid-db01"]
+    assert len(excused) == 1
+
+
+def test_a_kubernetes_decoy_keeps_its_recorded_shape_and_a_vm_decoy_names_its_node() -> None:
+    from app.decoys import decoy_document
+
+    vm = DecoyRecord(id="d2", window="normal", planned_at="2026-11-10T01:40:00Z", kind="war_redeploy",
+                     namespace="civil-petition-vm", deployment="petition-was02", node="was02",
+                     service_name="civil-petition-was02", target_id="uuid-was02", relation="off_domain", value="x")
+    document = decoy_document(scenario_id="F01-R", seed=1, policy_sha256="a", cycle_start="2026-11-10T01:00:00Z",
+                              records=[_record(), vm])
+    assert set(document["decoys"][0]) == {
+        "id", "window", "planned_at", "kind", "namespace", "deployment", "service_name", "target_id", "relation",
+        "configmap", "value", "status", "started_at", "finished_at", "detail",
+    }
+    assert document["decoys"][1]["node"] == "was02"

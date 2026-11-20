@@ -35,7 +35,9 @@ from app.capture_orchestration import (
 from app.decoys import (
     ROLLOUT_KINDS,
     DecoyRecord,
+    CompositeDecoyExecutor,
     KubectlDecoyExecutor,
+    VmDecoyExecutor,
     build_schedule,
     cycle_seed,
     decoy_document,
@@ -2618,7 +2620,8 @@ class LiveScenarioQueue:
 
     def _decoy_executor_for(self, policy) -> object:
         if self._decoy_executor is None:
-            self._decoy_executor = KubectlDecoyExecutor(policy)
+            # VM targets (civil-petition, review rv-t4o M3) go through the operator CLI, the rest through kubectl.
+            self._decoy_executor = CompositeDecoyExecutor(KubectlDecoyExecutor(policy), VmDecoyExecutor())
         return self._decoy_executor
 
     def _plan_cycle_decoys(
