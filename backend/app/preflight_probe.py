@@ -166,6 +166,7 @@ class ProductionPreflightProbe:
 #   nms.network.snmp_status of the router's target from the target table).
 # - router CPU, guards, clock: the periodic read (app.vm_ops), two router /proc/stat lines about 5 minutes apart.
 # - management connections: the ControlMaster supervisor, six VMs and 66 (down count, time since the last reopen).
+# - routine operator session: seconds since the last successful one (app.vm_ops.OperatorRoutine, Q35 condition ②).
 # Anything missing or stale raises with the remote's own words, so the gate waits and then pauses with the reason
 # (U3) instead of judging on a guess.
 # ---------------------------------------------------------------------------------------------------------------
@@ -304,6 +305,8 @@ class VmDomainPreflightProbe:
             "mgmt_ssh_down": float(down),
             "mgmt_ssh_settle_sec": settle,
             "clock_offset_ms": max(_vm_ops.chrony_offset_ms(f["chrony"]) for f in facts.values()),
+            # Q35 condition ②: the routine operator session keeps running (any VM).
+            "operator_routine_age_sec": self.ops.routine.last_ok_age_sec(now),
         }
 
     def _fresh_facts(self, now: datetime) -> dict[str, dict]:

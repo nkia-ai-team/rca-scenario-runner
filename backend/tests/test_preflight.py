@@ -146,6 +146,7 @@ VM_CLEAN = {
     "mgmt_ssh_down": 0,
     "mgmt_ssh_settle_sec": 7200,
     "clock_offset_ms": 0.4,
+    "operator_routine_age_sec": 1200,
 }
 
 
@@ -195,6 +196,7 @@ def test_vm_domain_has_its_own_signal_set_and_keeps_r6_for_the_others() -> None:
         ({"mgmt_ssh_settle_sec": 1799}, "mgmt_ssh_settle_sec"),
         ({"residual_guards": 1}, "residual_guards"),
         ({"prev_pool_pending": 1}, "prev_pool_pending"),
+        ({"operator_routine_age_sec": 10801}, "operator_routine_age_sec"),
         ({"clock_offset_ms": 50.1}, "clock_offset_ms"),
         ({"achieved_rps": 7.9}, "diurnal_band_rps"),
         ({"baseline_loadgen_alive": 0}, "baseline_loadgen_alive"),

@@ -260,6 +260,9 @@ def _vm_probe(tmp_path: _Path, *, answers=None, reads: int = 3, settle_min: int 
         ops.read_all()
         if index < reads - 1:
             clock.value += _timedelta(minutes=5)
+    # The last routine operator session (Q35 condition ②) succeeded 20 minutes before the probe.
+    (tmp_path / "vm-ops" / "operator-routine.json").write_text(json.dumps({"last_ok": {
+        "at": (clock.value - _timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"), "host": "was01"}}))
     opened = (clock.value - _timedelta(minutes=settle_min)).strftime("%Y-%m-%dT%H:%M:%SZ")
     ops.supervisor.status = {host.name: {"alive": True, "opened_at": opened, "detail": ""} for host in ops.supervisor.hosts}
     clock.value += _timedelta(minutes=5)  # the injection-time fresh 66 read is 5 minutes after the last periodic one
@@ -294,6 +297,7 @@ def test_vm_domain_probe_reads_every_signal_and_passes_a_healthy_testbed(tmp_pat
     assert observations["mgmt_ssh_down"] == 0 and observations["mgmt_ssh_settle_sec"] == 65 * 60
     assert observations["clock_offset_ms"] == _pytest.approx(0.012345)
     assert observations["sms_cpu_sample_age_sec"] == 15 and observations["router_snmp_down"] == 0
+    assert observations["operator_routine_age_sec"] == 20 * 60
     verdict = _vm_gate(observations, clock.value)
     assert verdict.verdict == "clean", [c for c in verdict.checks if c.status != "pass"]
     # The loadgen read and every VM read go over the shared socket as the executor account.
@@ -463,3 +467,15 @@ def test_vm_domain_probe_refuses_a_missing_master_status(tmp_path) -> None:
     del ops.supervisor.status["pve66"]
     with _pytest.raises(_vm_ops.VmOpsError, match=r"no master status for \['pve66'\]"):
         probe.collect(now=clock.value)
+
+
+def test_vm_domain_preflight_stops_when_the_routine_operator_session_stopped(tmp_path) -> None:
+    """Q35 condition ②: with no routine operator session for two of its longest gaps (or none ever), operator
+    logins would happen only at injections, so this domain's preflight is dirty."""
+    probe, ops, remote, clock = _vm_probe(tmp_path)
+    (tmp_path / "vm-ops" / "operator-routine.json").write_text(json.dumps({"last_ok": {
+        "at": (clock.value - _timedelta(seconds=10801)).strftime("%Y-%m-%dT%H:%M:%SZ"), "host": "db01"}}))
+    verdict = _vm_gate(probe.collect(now=clock.value), clock.value)
+    assert {c.name for c in verdict.checks if c.status == "fail"} == {"operator_routine_age_sec"}
+    (tmp_path / "vm-ops" / "operator-routine.json").unlink()
+    assert probe.collect(now=clock.value)["operator_routine_age_sec"] == 10801

@@ -242,6 +242,9 @@ ROUTER_CPU_MAX_PCT = 50.0
 # 30 minutes of a reopen.
 MGMT_SSH_SETTLE_SEC = 1800.0
 CLOCK_OFFSET_MAX_MS = 50.0
+# Q35 answer condition ②: operator logins must not happen only at injections, so the routine operator session
+# (app.vm_ops.OperatorRoutine, every 30 to 90 minutes) must have succeeded within two of its longest gaps.
+OPERATOR_ROUTINE_MAX_AGE_SEC = 10800.0
 VM_DOMAIN_REQUIRED_SIGNALS: frozenset[str] = frozenset(
     {
         "baseline_loadgen_alive",
@@ -266,6 +269,7 @@ VM_DOMAIN_REQUIRED_SIGNALS: frozenset[str] = frozenset(
         "mgmt_ssh_down",
         "mgmt_ssh_settle_sec",
         "clock_offset_ms",
+        "operator_routine_age_sec",
     }
 )
 DOMAIN_REQUIRED_SIGNALS: dict[str, frozenset[str]] = {VM_DOMAIN: VM_DOMAIN_REQUIRED_SIGNALS}
@@ -383,4 +387,5 @@ def _vm_domain_checks(observations: Mapping[str, float]) -> list[PreflightCheckI
         check("mgmt_ssh_down", 0.0, "eq"),
         check("mgmt_ssh_settle_sec", MGMT_SSH_SETTLE_SEC, "gte"),
         check("clock_offset_ms", CLOCK_OFFSET_MAX_MS, "lte"),
+        check("operator_routine_age_sec", OPERATOR_ROUTINE_MAX_AGE_SEC, "lte"),
     ]

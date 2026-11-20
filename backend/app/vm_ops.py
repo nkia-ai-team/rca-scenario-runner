@@ -41,6 +41,7 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -587,8 +588,10 @@ class VmOps:
         archive_state_dir: Path | None = None,
         hypervisor_target: str = HYPERVISOR_TARGET,
         supervisor: MasterSupervisor | None = None,
+        routine: OperatorRoutine | None = None,
     ) -> None:
         self.hosts = tuple(hosts)
+        self.routine = routine or OperatorRoutine(process_runner=process_runner, clock=clock, state_dir=state_dir)
         self.process_runner = process_runner
         self.clock = clock
         self.state_dir = state_dir
@@ -848,8 +851,121 @@ class VmOps:
         _atomic_write(self.archive_state_dir / "last.json", text if text.endswith("\n") else text + "\n")
 
 
+# Routine operator sessions (testbed-services docs/spec-testbed-vm-3tier.md operator path, Q35 answer condition ②).
+# Change-cause executors (router.config, vm.service, the U7 decoy WAR swap) log in as the operator (sysop) from the
+# operator terminal address with a real pts session. If that login only happened at injections, «an operator
+# login» would mark the cause time. So the runner opens the same session, the same way, read-only, all the time:
+# one VM drawn evenly from the router and the four servers, every 30 to 90 minutes drawn evenly, recordings
+# included. The session itself (ssh form, source address, role commands, the lock it shares with the executors)
+# belongs to the testbed-services CLI; the runner only schedules it and records the outcome (T4O contract 3, 4, 6).
+CONTRACT_ROOT = Path(os.environ.get("SCENARIO_CONTRACT_ROOT", "/opt/lucida/scenario-contracts"))
+OPERATOR_SESSION_CLI = CONTRACT_ROOT / "profiles" / "operator_session.py"
+OPERATOR_ROUTINE_HOSTS = ("rt-core01", "web01", "was01", "was02", "db01")
+OPERATOR_ROUTINE_MIN_SEC = 1800
+OPERATOR_ROUTINE_MAX_SEC = 5400
+# The CLI exits 75 when an executor's operator session holds that VM's lock: same VM again after this.
+OPERATOR_ROUTINE_BUSY_EXIT = 75
+OPERATOR_ROUTINE_BUSY_RETRY_SEC = 300
+# With no recorded session (first start) the first one comes 1 to 10 minutes after start.
+OPERATOR_ROUTINE_FIRST_SEC = (60, 600)
+OPERATOR_ROUTINE_TIMEOUT_SEC = 120
+# Preflight: the last successful routine session (any VM) at most two longest gaps ago (T4O contract 6).
+OPERATOR_ROUTINE_MAX_AGE_SEC = 2 * OPERATOR_ROUTINE_MAX_SEC
+# What the CLI reads from the environment (same names as the executors).
+OPERATOR_ENV_PASSTHROUGH = ("VM_OPS_KEY_DIR", "CIVIL_PETITION_SSH_CONTROL_DIR", "CIVIL_PETITION_DEPLOY_DIR")
+
+
+class OperatorRoutine:
+    """Schedules routine operator sessions and keeps their record (state_dir/operator-routine.json)."""
+
+    def __init__(
+        self,
+        *,
+        process_runner: ProcessRunner = subprocess.run,
+        clock: Clock = _utc_now,
+        state_dir: Path = STATE_DIR,
+        rng: Any = None,
+        cli: Path = OPERATOR_SESSION_CLI,
+    ) -> None:
+        self.process_runner = process_runner
+        self.clock = clock
+        self.state_dir = state_dir
+        self.rng = rng or random.SystemRandom()
+        self.cli = cli
+        self._lock = threading.Lock()
+
+    @property
+    def path(self) -> Path:
+        return self.state_dir / "operator-routine.json"
+
+    def load(self) -> dict[str, Any]:
+        if not self.path.is_file():
+            return {}
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def _save(self, document: Mapping[str, Any]) -> None:
+        _atomic_write(self.path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+
+    def _draw(self, now: datetime, *, first: bool = False) -> dict[str, str]:
+        low, high = OPERATOR_ROUTINE_FIRST_SEC if first else (OPERATOR_ROUTINE_MIN_SEC, OPERATOR_ROUTINE_MAX_SEC)
+        return {
+            "at": _format(now + timedelta(seconds=self.rng.uniform(low, high))),
+            "host": self.rng.choice(OPERATOR_ROUTINE_HOSTS),
+        }
+
+    def _environment(self) -> dict[str, str]:
+        env = _environment()
+        env.update({name: os.environ[name] for name in OPERATOR_ENV_PASSTHROUGH if os.environ.get(name)})
+        return env
+
+    def tick(self) -> dict[str, Any]:
+        """Run the session that is due, if any, and schedule the next. Returns the record."""
+        with self._lock:
+            now = self.clock()
+            document = self.load()
+            planned = document.get("next")
+            if not planned:
+                document["next"] = self._draw(now, first=document.get("last_ok") is None)
+                self._save(document)
+                return document
+            if now < _parse(planned["at"]):
+                return document
+            host = planned["host"]
+            try:
+                result = self.process_runner(
+                    ["python3", str(self.cli), "--node", host, "--check"], capture_output=True, text=True,
+                    timeout=OPERATOR_ROUTINE_TIMEOUT_SEC, env=self._environment(), check=False,
+                )
+                code, detail = result.returncode, _tail(result.stderr or result.stdout)
+            except subprocess.TimeoutExpired:
+                code, detail = -1, f"no end within {OPERATOR_ROUTINE_TIMEOUT_SEC}s"
+            except Exception as error:
+                code, detail = -1, f"{type(error).__name__}: {error}"
+            stamp = _format(now)
+            document["last"] = {"at": stamp, "host": host, "rc": code, "detail": "" if code == 0 else detail[:300]}
+            if code == 0:
+                document["last_ok"] = {"at": stamp, "host": host}
+                document["next"] = self._draw(now)
+            elif code == OPERATOR_ROUTINE_BUSY_EXIT:
+                # An executor's operator session holds this VM: the same VM a little later.
+                document["next"] = {"at": _format(now + timedelta(seconds=OPERATOR_ROUTINE_BUSY_RETRY_SEC)), "host": host}
+            else:
+                logger.warning("routine operator session on %s failed (%s): %s", host, code, detail)
+                document["next"] = self._draw(now)
+            self._save(document)
+            return document
+
+    def last_ok_age_sec(self, now: datetime) -> float:
+        """Seconds since the last successful routine session, the limit + 1 when there was none."""
+        last = self.load().get("last_ok")
+        if not last:
+            return float(OPERATOR_ROUTINE_MAX_AGE_SEC + 1)
+        return max(0.0, (now - _parse(last["at"])).total_seconds())
+
+
 class VmOpsService:
-    """Background loop: master check every 30s, periodic read every 5 minutes. Started from the app lifespan."""
+    """Background loop: master check every 30s, periodic read every 5 minutes, the routine operator session when it
+    is due. Started from the app lifespan."""
 
     def __init__(
         self,
@@ -879,6 +995,10 @@ class VmOpsService:
                     await asyncio.to_thread(self.ops.read_all)
                 except Exception:
                     logger.exception("periodic management read failed")
+            try:
+                await asyncio.to_thread(self.ops.routine.tick)
+            except Exception:
+                logger.exception("routine operator session failed")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.check_interval_sec)
             except asyncio.TimeoutError:

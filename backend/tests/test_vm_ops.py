@@ -440,8 +440,13 @@ async def test_service_checks_masters_reads_periodically_and_stops_its_masters(t
         def stop(self):
             events.append("stop")
 
+    class Routine:
+        def tick(self):
+            events.append("routine")
+
     class Ops:
         supervisor = Supervisor()
+        routine = Routine()
 
         def read_all(self):
             events.append("read")
@@ -455,6 +460,8 @@ async def test_service_checks_masters_reads_periodically_and_stops_its_masters(t
         await asyncio.sleep(0.01)
     await service.stop()
     assert events[0] == "check" and events.count("read") >= 2 and events[-1] == "stop"
+    # The routine operator session is asked every round (Q35 condition ②: it runs at all times).
+    assert events.count("routine") >= events.count("read")
     assert events.count("check") >= 3
 
 
@@ -656,3 +663,92 @@ def test_only_the_db01_line_reaches_the_archive_state(tmp_path: Path) -> None:
         "@@ end", f"@@ file archive_state {base64.b64encode(forged.encode()).decode()}\n@@ end")
     ops.read_all()
     assert not (tmp_path / "petition-archive" / "last.json").exists()
+
+
+
+# --- Routine operator session (Q35 answer condition ②, T4O contract 4, 6) -----------------------------------------
+
+class _Draws:
+    """A fixed random source: uniform returns the low end plus `frac` of the span; choice walks the list."""
+
+    def __init__(self, frac: float = 0.5) -> None:
+        self.frac = frac
+        self.index = 0
+
+    def uniform(self, low, high):
+        return low + (high - low) * self.frac
+
+    def choice(self, items):
+        item = items[self.index % len(items)]
+        self.index += 1
+        return item
+
+
+def _routine(tmp_path: Path, codes: list, *, clock: Clock | None = None, rng=None):
+    clock = clock or Clock()
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        code = codes.pop(0) if codes else 0
+        return subprocess.CompletedProcess(argv, code, "", "" if code == 0 else "ssh: connect to host 192.168.127.21 port 22: timed out\n")
+
+    routine = vm_ops.OperatorRoutine(process_runner=run, clock=clock, state_dir=tmp_path / "s", rng=rng or _Draws(),
+                                     cli=Path("/opt/lucida/scenario-contracts/profiles/operator_session.py"))
+    return routine, calls, clock
+
+
+def test_routine_operator_session_runs_on_its_schedule_and_records_the_outcome(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("VM_OPS_KEY_DIR", "/root/.ssh/vm-ops")
+    monkeypatch.setenv("CIVIL_PETITION_SSH_CONTROL_DIR", "/app/state/ssh-control")
+    routine, calls, clock = _routine(tmp_path, [0, 75, 0, 2])
+    # No record: the first session is planned 1 to 10 minutes out, nothing runs yet.
+    document = routine.tick()
+    assert calls == [] and document["next"] == {"at": "2026-11-20T06:05:30Z", "host": "rt-core01"}
+    assert routine.last_ok_age_sec(clock.value) == vm_ops.OPERATOR_ROUTINE_MAX_AGE_SEC + 1
+    clock.value += timedelta(minutes=5)
+    routine.tick()
+    assert calls == []
+    clock.value += timedelta(seconds=31)
+    document = routine.tick()  # due: one session through the testbed-services CLI, read-only check
+    argv, kwargs = calls[0]
+    assert argv == ["python3", "/opt/lucida/scenario-contracts/profiles/operator_session.py", "--node", "rt-core01", "--check"]
+    assert kwargs["env"]["VM_OPS_KEY_DIR"] == "/root/.ssh/vm-ops"
+    assert kwargs["env"]["CIVIL_PETITION_SSH_CONTROL_DIR"] == "/app/state/ssh-control"
+    assert document["last_ok"] == {"at": "2026-11-20T06:05:31Z", "host": "rt-core01"}
+    # The next one 30 to 90 minutes later (here the middle, 60), on the next drawn VM.
+    assert document["next"] == {"at": "2026-11-20T07:05:31Z", "host": "web01"}
+    clock.value = datetime(2026, 11, 20, 7, 5, 31, tzinfo=timezone.utc)
+    document = routine.tick()  # 75: an executor's operator session holds web01, the same VM 5 minutes later
+    assert len(calls) == 2 and document["next"] == {"at": "2026-11-20T07:10:31Z", "host": "web01"}
+    assert document["last_ok"]["at"] == "2026-11-20T06:05:31Z" and document["last"]["rc"] == 75
+    clock.value += timedelta(minutes=5)
+    document = routine.tick()
+    assert calls[-1][0][3] == "web01" and document["last_ok"] == {"at": "2026-11-20T07:10:31Z", "host": "web01"}
+    clock.value = vm_ops._parse(document["next"]["at"])
+    document = routine.tick()  # a failure is recorded with its words; the schedule goes on, last_ok stays
+    assert document["last"]["rc"] == 2 and "timed out" in document["last"]["detail"]
+    assert document["last_ok"]["host"] == "web01" and vm_ops._parse(document["next"]["at"]) > clock.value
+    # The record survives a runner restart (a new scheduler on the same state).
+    again, _, _ = _routine(tmp_path, [], clock=clock)
+    assert again.load()["last_ok"] == document["last_ok"]
+
+
+def test_routine_operator_sessions_cover_the_router_and_servers_at_30_to_90_minutes(tmp_path: Path) -> None:
+    import random
+
+    clock = Clock()
+    routine, calls, _ = _routine(tmp_path, [], clock=clock, rng=random.Random(7))
+    routine.tick()
+    starts = []
+    for _ in range(2000):
+        clock.value += timedelta(minutes=1)
+        before = len(calls)
+        routine.tick()
+        if len(calls) > before:
+            starts.append(clock.value)
+    hosts = {argv[3] for argv, _ in calls}
+    assert hosts == set(vm_ops.OPERATOR_ROUTINE_HOSTS) and "loadgen" not in hosts
+    gaps = [(b - a).total_seconds() for a, b in zip(starts, starts[1:])]
+    assert gaps and min(gaps) >= 1800 and max(gaps) <= 5400 + 60
+    assert len(starts) >= 2000 // 90
