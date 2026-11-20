@@ -167,11 +167,15 @@ async def test_a_timed_out_script_is_ended_with_everything_it_started(tmp_path: 
     script = tmp_path / "hang.sh"
     script.write_text(f"#!/usr/bin/env bash\nsleep 60 &\necho $! > {pid_file}\nwait\n", encoding="utf-8")
     runner = ScenarioRunner(script_dir=tmp_path, log_dir=tmp_path / "logs")
+    import time as _time
+
+    started = _time.monotonic()
     with open(tmp_path / "log.txt", "w", encoding="utf-8") as log_file:
         code = await runner._invoke_once(
             ExecutionSpec(transport="local", location="runner", timeout_sec=1), script, "F99-X", "run", log_file
         )
-    assert code == -1
+    # Ended with its group, not when the 60-second child happened to finish by itself.
+    assert code == -1 and _time.monotonic() - started < 20
     child = int(pid_file.read_text())
     for _ in range(50):
         try:

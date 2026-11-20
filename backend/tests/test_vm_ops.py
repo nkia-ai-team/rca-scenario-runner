@@ -824,10 +824,14 @@ def test_the_routine_takes_its_vm_list_from_the_cli_and_stops_without_it(tmp_pat
 
 def test_run_in_group_ends_the_whole_group_on_timeout(tmp_path: Path) -> None:
     """Review rv-t4o M2: the routine CLI is ended with the ssh it started."""
+    import time
+
     pid_file = tmp_path / "child.pid"
+    started = time.monotonic()
     with pytest.raises(subprocess.TimeoutExpired):
         vm_ops.run_in_group(["bash", "-c", f"sleep 60 & echo $! > {pid_file}; wait"], timeout=1,
                             env={"PATH": os.environ["PATH"]})
+    assert time.monotonic() - started < 20  # the group was ended, the 60-second child did not run out
     child = int(pid_file.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(child, 0)
