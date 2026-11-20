@@ -65,6 +65,22 @@ KIND_ORDER: tuple[DecoyKind, ...] = (
 VM_KINDS: frozenset[str] = frozenset({"war_redeploy", "config_reapply"})
 # Kinds whose run can raise an alarm on its target (a rollout, or a VM service that reloads); only these excuse one.
 ALARM_KINDS: frozenset[str] = ROLLOUT_KINDS | VM_KINDS
+# Room kept after a VM decoy's revert before the buffer opens: the change and the revert call each take at most the
+# runner's operator CLI limit (150s).
+VM_DECOY_CALL_ROOM_SEC = 300
+# The gap between a VM decoy's apply and its undo follows the injection lengths (review rv-t4u R1 (a), command-session
+# decision: drawn by the runner). Deciles of the injection length (t2 - t1) of the 129 recorded cases under
+# /data/eval-cases on 104 (meta.json, measured 2026-11-21 KST); a draw is uniform within a randomly chosen decile.
+VM_DECOY_GAP_DECILES_SEC: tuple[int, ...] = (96, 267, 375, 484, 500, 624, 857, 920, 957, 1069, 1878)
+
+
+def draw_vm_decoy_gap(rng: random.Random) -> int:
+    """One apply-to-undo gap from the injection length deciles."""
+    position = rng.random() * (len(VM_DECOY_GAP_DECILES_SEC) - 1)
+    index = min(int(position), len(VM_DECOY_GAP_DECILES_SEC) - 2)
+    low, high = VM_DECOY_GAP_DECILES_SEC[index], VM_DECOY_GAP_DECILES_SEC[index + 1]
+    return round(low + (high - low) * (position - index))
+
 # Drawing a time that keeps min_gap from the others is retried this many times
 # before the draw is dropped (a crowded window then simply yields fewer decoys).
 _TIME_DRAW_ATTEMPTS = 64
@@ -139,6 +155,21 @@ class DecoyConfigMap(_Strict):
     key: str = Field(min_length=1)
 
 
+class DecoyHold(_Strict):
+    """Bounds of the gap a VM decoy stays changed (testbed-services policy ``vm_hold_sec``: the shortest approved
+    min_hold and the most common max_injection_duration). The CLI's executor guard undoes a change by itself at
+    the max + 600 seconds, so a drawn gap never exceeds the max."""
+
+    min: int = Field(gt=0)
+    max: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "DecoyHold":
+        if self.max < self.min:
+            raise ValueError("vm_hold_sec.max must not be below its min")
+        return self
+
+
 class DecoyPolicy(_Strict):
     schema_version: Literal[1]
     note: str = Field(default="", alias="_note")
@@ -160,6 +191,7 @@ class DecoyPolicy(_Strict):
     path_scope: Literal["mentioned", "scored"] = "mentioned"
     domain_namespaces: dict[str, str]
     targets: list[DecoyTarget] = Field(min_length=1)
+    vm_hold_sec: DecoyHold | None = None
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -179,6 +211,8 @@ class DecoyPolicy(_Strict):
             # A rollout started at the last allowed moment must be over before
             # the buffer opens, or it bleeds into the preflight window.
             raise ValueError("rollout_timeout_sec must end before the buffer opens")
+        if any(target.transport == "vm" for target in self.targets) and self.vm_hold_sec is None:
+            raise ValueError("VM decoy targets need vm_hold_sec (how long a VM decoy stays changed)")
         missing = sorted(set(self.domain_namespaces) - set(_DOMAIN_WORDS))
         if missing:
             # U7b review M2: a domain without words would be read as "never
@@ -201,8 +235,9 @@ class DecoyRecord(_Strict):
     namespace: str
     # None for a ConfigMap-only change (no Deployment is touched).
     deployment: str | None = None
-    # The VM a VM-kind decoy runs on (None for every Kubernetes decoy).
+    # The VM a VM-kind decoy runs on and how long it stays changed before the undo (None for every Kubernetes decoy).
     node: str | None = None
+    gap_sec: int | None = None
     service_name: str | None = None
     target_id: str | None = None
     relation: DecoyRelation
@@ -588,6 +623,10 @@ def decoy_candidates(
         if target.key in excluded or not _usable_kinds(policy, target):
             continue
         relation: DecoyRelation = "same_domain" if target.namespace == namespace else "off_domain"
+        if target.transport == "vm" and relation != "same_domain":
+            # Command-session decision on review rv-t4u R2 (a): a VM decoy only in its own domain's recordings, so
+            # the Kubernetes domains keep the decoy share and meaning they had (same seed, same decoys).
+            continue
         groups[relation].append(target)
     return groups
 
@@ -658,10 +697,21 @@ def build_schedule(
                 )
             )
             continue
+        gap_sec = None
+        if target.transport == "vm":
+            bounds = policy.vm_hold_sec
+            assert bounds is not None  # the policy validator requires it with VM targets
+            # The shape of the recorded injection lengths, held inside the policy's bounds.
+            gap_sec = min(max(draw_vm_decoy_gap(rng), bounds.min), bounds.max)
+            # The revert must be over before the buffer opens: two operator calls of room after it.
+            room = int((buffer_start - at).total_seconds()) - VM_DECOY_CALL_ROOM_SEC
+            if room < bounds.min:
+                continue
+            gap_sec = min(gap_sec, room)
         records.append(
             DecoyRecord(
                 id=f"d{index}", window=window_name, planned_at=_format(at), kind=kind,
-                namespace=target.namespace, deployment=target.deployment, node=target.node,
+                namespace=target.namespace, deployment=target.deployment, node=target.node, gap_sec=gap_sec,
                 service_name=target.service_name, target_id=target.target_id,
                 relation=relation,
                 configmap=policy.configmap.name if kind == "config_rollout" else None,
@@ -741,41 +791,61 @@ class KubectlDecoyExecutor:
 
 
 class VmDecoyExecutor:
-    """VM-kind decoys through the operator CLI (testbed-services operator_session.py --node <VM> --decoy <kind>):
-    an operator login, the harmless change, the session closed, all inside one call. Exit 0 applied, 75 busy (an
-    executor's operator session holds that VM), anything else failed; both are raised with the CLI's words and
-    the queue records the decoy as failed, as for a Kubernetes decoy."""
+    """VM-kind decoys through the operator CLI (testbed-services operator_session.py), two calls like an injection's
+    run and cleanup (review rv-t4u R1 (a)): ``--decoy-change <kind>`` when the decoy starts (the vm.service run with
+    harmless values, the same sudo lines as an injection; the CLI returns 0 only once the app answers healthy again,
+    R4) and, once the record's ``gap_sec`` has passed (the queue polls ``rollout_done``), ``--decoy-revert <kind>``
+    (the vm.service cleanup and recovery; nothing to revert is 0). Exit 0 done; 1 after a change means the app was
+    not healthy and the CLI already reverted it; 3 refused; 75 busy; 124 its own limit; any other failed. Every
+    non-zero exit is raised with the CLI's words; a failed change leaves nothing to revert. If the revert never
+    comes, the CLI's executor guard reverts by itself at the policy max + 600 seconds."""
 
     def __init__(self, *, process_runner: Callable[..., subprocess.CompletedProcess] | None = None,
-                 cli: Path | None = None) -> None:
+                 cli: Path | None = None, clock: Callable[[], datetime] | None = None) -> None:
         from app import vm_ops
 
         self.process_runner = process_runner or vm_ops.run_in_group
         self.cli = cli or vm_ops.OPERATOR_SESSION_CLI
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._vm_ops = vm_ops
 
-    def apply(self, record: DecoyRecord) -> None:
+    def _call(self, record: DecoyRecord, mode: str) -> None:
         if record.kind not in VM_KINDS or not record.node:
             raise RuntimeError(f"not a VM decoy: {record.kind} on {record.node}")
         try:
             result = self.process_runner(
-                ["python3", str(self.cli), "--node", record.node, "--decoy", record.kind],
+                ["python3", str(self.cli), "--node", record.node, mode, record.kind],
                 timeout=self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC,
                 env=self._vm_ops.operator_environment(),
             )
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"operator decoy on {record.node} did not end within "
+            raise RuntimeError(f"operator decoy {mode} on {record.node} did not end within "
                                f"{self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC}s") from None
         if result.returncode != 0:
             tail = (result.stderr or result.stdout or "").strip().splitlines()
-            what = "busy" if result.returncode == self._vm_ops.OPERATOR_ROUTINE_BUSY_EXIT else f"exited {result.returncode}"
-            raise RuntimeError(f"operator decoy on {record.node} {what}: {tail[-1] if tail else 'no output'}")
+            what = {
+                self._vm_ops.OPERATOR_ROUTINE_BUSY_EXIT: "busy",
+                1: "not healthy, reverted by the CLI" if mode == "--decoy-change" else "exited 1",
+            }.get(result.returncode, f"exited {result.returncode}")
+            raise RuntimeError(f"operator decoy {mode} on {record.node} {what}: {tail[-1] if tail else 'no output'}")
+
+    def apply(self, record: DecoyRecord) -> None:
+        self._call(record, "--decoy-change")
 
     def rollout_done(self, record: DecoyRecord) -> bool:
+        """False while the change holds; at the end of its gap the revert call, then True."""
+        started = _parse(record.started_at) if record.started_at else self.clock()
+        if self.clock() < started + timedelta(seconds=record.gap_sec or 0):
+            return False
+        self._call(record, "--decoy-revert")
         return True
 
     def undo(self, record: DecoyRecord) -> None:
-        """Nothing to undo: the change put back the same WAR or the same values."""
+        self._call(record, "--decoy-revert")
+
+    def timeout_sec(self, record: DecoyRecord) -> int:
+        """How long the queue lets a VM decoy stay «rolling»: its gap plus the revert call."""
+        return int(record.gap_sec or 0) + 2 * self._vm_ops.OPERATOR_ROUTINE_TIMEOUT_SEC
 
 
 class CompositeDecoyExecutor:
@@ -796,6 +866,10 @@ class CompositeDecoyExecutor:
 
     def undo(self, record: DecoyRecord) -> None:
         self._for(record).undo(record)
+
+    def timeout_sec(self, record: DecoyRecord, default: int) -> int:
+        executor = self._for(record)
+        return executor.timeout_sec(record) if hasattr(executor, "timeout_sec") else default
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +1011,7 @@ def _record_document(record: DecoyRecord) -> dict[str, Any]:
     document = record.model_dump(mode="json")
     if document.get("node") is None:
         document.pop("node", None)
+        document.pop("gap_sec", None)
     return document
 
 

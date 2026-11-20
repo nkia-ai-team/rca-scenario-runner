@@ -34,6 +34,7 @@ from app.capture_orchestration import (
 )
 from app.decoys import (
     ROLLOUT_KINDS,
+    VM_KINDS,
     DecoyRecord,
     CompositeDecoyExecutor,
     KubectlDecoyExecutor,
@@ -2667,7 +2668,7 @@ class LiveScenarioQueue:
         for index, record in enumerate(records):
             if record.status != "rolling":
                 continue
-            records[index] = await self._poll_decoy(executor, record, now, policy.rollout_timeout_sec)
+            records[index] = await self._poll_decoy(executor, record, now, self._decoy_timeout(executor, record, policy))
             changed = changed or records[index] != record
             if records[index].status == "rolling":
                 return self._store_decoys(state, records) if changed else state
@@ -2694,6 +2695,12 @@ class LiveScenarioQueue:
             break
         return self._store_decoys(state, records) if changed else state
 
+    @staticmethod
+    def _decoy_timeout(executor, record: DecoyRecord, policy) -> int:
+        """A rollout's timeout from the policy; a VM decoy holds its drawn time plus the revert call (T4U)."""
+        timeout = getattr(executor, "timeout_sec", None)
+        return timeout(record, policy.rollout_timeout_sec) if callable(timeout) else policy.rollout_timeout_sec
+
     async def _start_decoy(self, executor, record: DecoyRecord, now: datetime) -> DecoyRecord:
         started = record.model_copy(update={"started_at": self._format(now)})
         try:
@@ -2706,7 +2713,8 @@ class LiveScenarioQueue:
                     "detail": f"{type(error).__name__}: {error}",
                 }
             )
-        if started.kind in ROLLOUT_KINDS:
+        if started.kind in ROLLOUT_KINDS or started.kind in VM_KINDS:
+            # A VM decoy holds its change until gap_sec has passed, then the undo call (T4U).
             return started.model_copy(update={"status": "rolling"})
         return started.model_copy(
             update={"status": "applied", "finished_at": self._format(self.clock.now())}
