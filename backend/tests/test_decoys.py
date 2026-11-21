@@ -1262,7 +1262,7 @@ def test_near_fault_vm_decoys_move_earlier_instead_of_being_dropped() -> None:
                 vm_skipped[record.window] += 1
                 continue
             vm[record.window] += 1
-            revert[record.revert] += 1
+            revert[(record.kind, record.revert)] += 1
             if record.revert != "before_fault":
                 continue
             before_fault += 1
@@ -1276,8 +1276,11 @@ def test_near_fault_vm_decoys_move_earlier_instead_of_being_dropped() -> None:
     share = lambda counts: counts["near_fault"] / sum(counts.values())  # noqa: E731
     assert share(vm) >= 0.85 * share(kubernetes), (share(vm), share(kubernetes))
     assert vm_skipped["near_fault"] <= 0.10 * (vm["near_fault"] + vm_skipped["near_fault"])
-    # Half and half (D1), and the reverts are not piled on the latest allowed second (L4).
-    assert 0.4 <= revert["after_recording"] / sum(revert.values()) <= 0.6
+    # Half and half for the WAR variant (D1), never for a configuration value (D-A (a)), and the reverts are not piled
+    # on the latest allowed second (L4).
+    war = revert[("war_redeploy", "after_recording")] + revert[("war_redeploy", "before_fault")]
+    assert war and 0.4 <= revert[("war_redeploy", "after_recording")] / war <= 0.6
+    assert revert[("config_reapply", "before_fault")] > 0 and revert[("config_reapply", "after_recording")] == 0
     assert pinned <= 0.01 * before_fault
 
 

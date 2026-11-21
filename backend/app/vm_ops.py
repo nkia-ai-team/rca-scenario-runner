@@ -158,6 +158,7 @@ CHECKSUM_RECORDS = (
     ("/var/lib/petition-deploy/war.sha256", "/var/lib/tomcat10/webapps"),
     ("/var/lib/petition-deploy/expected.sha256", "/"),
 )
+CHECKSUM_RECORD_NAMES = frozenset(record for record, _ in CHECKSUM_RECORDS)
 # The executor guard's state root (testbed-services executor_common GUARD_FUNCTIONS: <job>.unit while armed;
 # T4S contract 8: no *.unit and no run-r* timer = no residue).
 GUARD_STATE_ROOT = "/var/lib/opsjobs"
@@ -176,7 +177,7 @@ check_sums() {
   if [[ ! -r "$record" ]]; then echo "@@ sums $record missing"; return; fi
   out=$(cd "$base" && sha256sum -c --quiet "$record" 2>/dev/null) && rc=0 || rc=$?
   echo "@@ sums $record rc=$rc"
-  while IFS= read -r line; do [[ -n "$line" ]] && echo "@@ drift ${line%%: *}"; done <<<"$out"
+  while IFS= read -r line; do [[ -n "$line" ]] && echo "@@ drift $record ${line%%: *}"; done <<<"$out"
 }
 '''.replace("\r", "") + "".join(
     f"check_sums {shlex.quote(record)} {shlex.quote(base)}\n" for record, base in CHECKSUM_RECORDS
@@ -311,6 +312,9 @@ class HostFacts:
     units: dict[str, str] = field(default_factory=dict)
     sums: dict[str, str] = field(default_factory=dict)
     drift: list[str] = field(default_factory=list)
+    # The same lines by the record that named them (review rv-t4u4 L-D: a record's rc=1 is a held decoy's doing
+    # only when every line of that record is).
+    drift_records: dict[str, list[str]] = field(default_factory=dict)
     guards_armed: int = 0
     guard_timers: int = 0
     chrony: str = ""
@@ -323,7 +327,7 @@ _LINE = re.compile(r"^@@ (\S+)(?: (.*))?$")
 
 def parse_read(host: VmHost, text: str) -> HostFacts:
     """Parse one periodic read. A read that did not reach its end marker is a failed read, not partial facts."""
-    values: dict[str, Any] = {"units": {}, "sums": {}, "drift": [], "files": {}}
+    values: dict[str, Any] = {"units": {}, "sums": {}, "drift": [], "drift_records": {}, "files": {}}
     ended = False
     at = hostname = ""
     for raw in text.splitlines():
@@ -342,7 +346,12 @@ def parse_read(host: VmHost, text: str) -> HostFacts:
             record, _, verdict = rest.partition(" ")
             values["sums"][record] = verdict.strip()
         elif key == "drift":
-            values["drift"].append(rest.strip())
+            # `@@ drift <record> <path>`: the record is one of CHECKSUM_RECORDS.
+            record, _, path = rest.strip().partition(" ")
+            if record not in CHECKSUM_RECORD_NAMES or not path.strip():
+                raise VmOpsError(f"{host.name}: unexpected drift line {rest[:120]!r}")
+            values["drift"].append(path.strip())
+            values["drift_records"].setdefault(record, []).append(path.strip())
         elif key == "guards":
             parts = rest.split()
             values["guards"] = (int(parts[0]), int(parts[1]))
@@ -372,6 +381,7 @@ def parse_read(host: VmHost, text: str) -> HostFacts:
         units=values["units"],
         sums=values["sums"],
         drift=values["drift"],
+        drift_records=values["drift_records"],
         guards_armed=guards[0],
         guard_timers=guards[1],
         chrony=values.get("chrony", ""),
@@ -840,6 +850,7 @@ class VmOps:
                                 "units": result.units,
                                 "sums": result.sums,
                                 "drift": result.drift,
+                                "drift_records": result.drift_records,
                                 "guards_armed": result.guards_armed,
                                 "guard_timers": result.guard_timers,
                                 "chrony": result.chrony,
@@ -886,10 +897,13 @@ class VmOps:
             held = set((excused or {}).get(host.name, {}).get("paths") or ())
             # war.sha256 names the WAR relative to the webapps directory; the CLI names files absolute.
             unexcused = [path for path in facts["drift"] if _drift_absolute(path) not in held]
+            by_record = facts.get("drift_records") or {}  # facts read before L-D have none: nothing is excused
             for record in (*REQUIRED_RECORDS_BY_ROLE.get(host.role, ()), *REQUIRED_RECORDS_ALL):
                 verdict = facts["sums"].get(record, "not read")
-                # sha256sum -c ends 1 on any differing line; when every such line is a held decoy's file, that is it.
-                if verdict == "rc=1" and held and facts["drift"] and not unexcused:
+                # sha256sum -c ends 1 on any differing line; only a record whose every line is a held decoy's file
+                # had its rc=1 from the decoy (review rv-t4u4 L-D: an rc=1 with no line of its own is not).
+                lines = by_record.get(record) or []
+                if verdict == "rc=1" and held and lines and all(_drift_absolute(path) in held for path in lines):
                     continue
                 if verdict != "rc=0":
                     problems.append(f"{host.name} {record} {verdict}")

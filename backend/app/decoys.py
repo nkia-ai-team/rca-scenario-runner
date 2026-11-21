@@ -77,8 +77,13 @@ VM_DECOY_CALL_TIMEOUT_SEC = VM_DECOY_CLI_LIMIT_SEC + 60
 VM_DECOY_CALL_ROOM_SEC = 2 * VM_DECOY_CALL_TIMEOUT_SEC
 # Half the VM decoys are put back after the recording instead of before the fault (command-session decision on review
 # rv-t4u3 D1: when every VM decoy is reverted before the fault, «an operator change not reverted when the fault
-# starts» marks the cause). Drawn evenly per VM decoy.
+# starts» marks the cause). Drawn evenly per VM decoy of a kind in VM_HELD_KINDS.
 VM_DECOY_AFTER_RECORDING_SHARE = 0.5
+# Only a WAR variant may stay changed through the fault (command-session decision D-A (a) on review rv-t4u4): its
+# build-stamp variants run the same application, so the fault looks the same; a proxy timeout value left on
+# through a slow-WAS fault would change when the balancer gives up, i.e. the fault's shape. A decoy must never change
+# the fault's shape, which comes before telling decoy kinds apart. config_reapply is always reverted before the fault.
+VM_HELD_KINDS = frozenset({"war_redeploy"})
 # The CLI executor guard of a decoy reverted after the recording, a backstop for a runner that is gone (the queue
 # reverts it at the end of the cooldown): from the change to the buffer start, then the buffer (600 s), an hour for
 # the gate's holds and the injection (the longest recorded is 1878 s), the cooldown (1800 s) and 1800 s more.
@@ -767,7 +772,7 @@ def build_schedule(
         if target.transport == "vm":
             bounds = policy.vm_hold_sec
             assert bounds is not None  # the policy validator requires it with VM targets
-            if rng.random() < VM_DECOY_AFTER_RECORDING_SHARE:
+            if kind in VM_HELD_KINDS and rng.random() < VM_DECOY_AFTER_RECORDING_SHARE:
                 # Put back after the recording: no gap before the buffer, a guard that outlasts the recording.
                 revert = "after_recording"
                 guard_sec = int((buffer_start - at).total_seconds()) + VM_DECOY_HELD_GUARD_AFTER_BUFFER_SEC

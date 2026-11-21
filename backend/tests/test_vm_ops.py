@@ -53,7 +53,13 @@ def _read_output(host, *, at: datetime = NOW, units: dict | None = None, sums: d
                     "/var/lib/petition-deploy/expected.sha256": "rc=0"}
     for record, verdict in {**default_sums, **(sums or {})}.items():
         lines.append(f"@@ sums {record} {verdict}")
-    lines += [f"@@ drift {path}" for path in drift]
+    # A plain path is named by its record the way the read body names it: absolute paths come from
+    # expected.sha256, the WAR (relative to webapps) from war.sha256; a (record, path) pair names it directly.
+    lines += [
+        f"@@ drift {item[0]} {item[1]}" if isinstance(item, tuple) else
+        f"@@ drift /var/lib/petition-deploy/{'expected' if item.startswith('/') else 'war'}.sha256 {item}"
+        for item in drift
+    ]
     lines.append(f"@@ guards {guards[0]} {guards[1]}")
     lines.append(f"@@ chrony {chrony}")
     lines.append(f"@@ procstat {procstat}")
@@ -960,3 +966,50 @@ def test_drift_detail_excuses_a_held_war_decoy_on_the_war_record(tmp_path: Path)
     ops.read_all()
     detail = ops.drift_detail(excused={"was01": {"paths": {"/var/lib/tomcat10/webapps/petition.war"}, "guards": 1}})
     assert detail == ("was02 /var/lib/petition-deploy/war.sha256 rc=1; was02 changed since install: petition.war")
+
+
+def test_the_read_names_each_drift_line_by_its_record(tmp_path: Path) -> None:
+    """Review rv-t4u4 L-D: the read body says which record a differing file came from (run under bash on a scratch
+    record), and the parser refuses a drift line without one."""
+    import hashlib
+    import subprocess as sp
+
+    body = vm_ops.READ_BODY
+    function = body[body.index("check_sums() {"): body.index("\n}\n", body.index("check_sums() {")) + 3]
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "a.conf").write_text("one\n")
+    (base / "b.conf").write_text("two\n")
+    record = tmp_path / "rec.sha256"
+    stale, kept = hashlib.sha256(b"one").hexdigest(), hashlib.sha256((base / "b.conf").read_bytes()).hexdigest()
+    record.write_text(f"{stale}  a.conf\n{kept}  b.conf\n")
+    out = sp.run(["bash", "-c", function + f'check_sums "{record}" "{base}"'], capture_output=True, text=True).stdout
+    assert out.splitlines() == [f"@@ sums {record} rc=1", f"@@ drift {record} a.conf"]
+
+    text = _read_output(HOSTS_BY_NAME["web01"])
+    with pytest.raises(VmOpsError, match="unexpected drift line"):
+        vm_ops.parse_read(HOSTS_BY_NAME["web01"], text.replace("@@ end", "@@ drift /etc/x.conf\n@@ end"))
+    facts = vm_ops.parse_read(HOSTS_BY_NAME["web01"], _read_output(HOSTS_BY_NAME["web01"], drift=("/etc/x.conf",)))
+    assert facts.drift == ["/etc/x.conf"]
+    assert facts.drift_records == {"/var/lib/petition-deploy/expected.sha256": ["/etc/x.conf"]}
+
+
+def test_a_records_rc1_is_excused_only_when_its_own_lines_are_all_the_held_decoys(tmp_path: Path) -> None:
+    """Review rv-t4u4 L-D (reproduced there): a held war decoy on was01 excuses war.sha256's line and its rc=1; an
+    expected.sha256 rc=1 with no line of its own (a broken or empty record) still stops the injection."""
+    remote = FakeRemote()
+    clock = Clock()
+    ops = _ops(tmp_path, remote, clock)
+    remote.outputs["192.168.127.31"] = _read_output(
+        HOSTS_BY_NAME["was01"],
+        sums={"/var/lib/petition-deploy/war.sha256": "rc=1", "/var/lib/petition-deploy/expected.sha256": "rc=1"},
+        drift=("petition.war",),
+    )
+    ops.read_all()
+    war = {"was01": {"paths": {"/var/lib/tomcat10/webapps/petition.war"}, "guards": 1}}
+    assert ops.drift_detail(excused=war) == "was01 /var/lib/petition-deploy/expected.sha256 rc=1"
+    # Facts stored before the read named records: nothing is excused on the record line.
+    document = ops.load()
+    document["hosts"]["was01"]["facts"].pop("drift_records")
+    ops.load = lambda: document
+    assert "was01 /var/lib/petition-deploy/war.sha256 rc=1" in ops.drift_detail(excused=war)

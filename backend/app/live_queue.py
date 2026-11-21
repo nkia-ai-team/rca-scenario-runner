@@ -67,6 +67,7 @@ from app.runner import ScenarioRunner, get_runner
 from app.preflight_probe import vm_domain_probes
 from app.vm_ops import get_vm_ops
 from app import seasonal_window
+from app.controller import duration_seconds
 
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -163,6 +164,15 @@ ORACLE_CHECK_DEFAULT_PERIOD = timedelta(hours=6)
 # image drift check; a decoy deployment (U7) or a cleanup that did not finish leaves exactly this. Never
 # transient: a person has to put the file or the service back, so the queue pauses with what differs.
 VM_DOMAIN_STATE_CHECK_NAME = "vm_domain_state"
+# A held VM decoy is reverted this long after the recording window ends (review rv-t4u4 L-C: the capture exports the
+# window's last second inclusively, so the operator login must not land on it).
+HELD_REVERT_AFTER_CAPTURE_END = timedelta(seconds=60)
+# Room a held decoy's guard must leave past the recording and its revert (review rv-t4u4 L-A).
+HELD_GUARD_MARGIN = timedelta(seconds=600)
+# The controller's default max_injection_duration (app.controller), for a manifest that leaves it out.
+DEFAULT_MAX_INJECTION_SEC = 1200
+# No manifest to read: the hour decoys.VM_DECOY_HELD_GUARD_AFTER_BUFFER_SEC gives the gate's holds and the injection.
+UNKNOWN_MAX_INJECTION_SEC = 3600
 # The scenario's domain decides its preflight probe, signal set and drift gate, so a domain that cannot be read
 # (registry unreadable, no entry for the scenario) stops the injection with why (review rv-t4r3 M2).
 SCENARIO_METADATA_CHECK_NAME = "scenario_metadata"
@@ -175,6 +185,11 @@ def _held_decoy_meta(decoys: "list[DecoyRecord]") -> list[dict[str, object]]:
          "started_at": record.started_at, "revert": "after_recording"}
         for record in decoys if record.status == "held"
     ]
+
+
+def _may_hold_change(record: DecoyRecord) -> bool:
+    """A VM decoy whose change may still be on its VM: held through the recording, still rolling, or unsettled."""
+    return record.node is not None and (record.status in ("held", "rolling") or bool(record.unsettled))
 
 
 class ScenarioMetadataError(RuntimeError):
@@ -1168,6 +1183,12 @@ class LiveScenarioQueue:
             if state.phase != "paused":
                 raise RuntimeError("only a paused live queue can be cancelled")
             previous = state.reason or "no pause reason"
+            # A VM decoy that may still hold its change is put back first; one that cannot be put back keeps the
+            # queue paused with its record, so nothing starts on top of it (review rv-t4u4 M1).
+            state, failed = await asyncio.to_thread(self._revert_held_decoys, state, "on cancel")
+            if failed is not None:
+                self._write(state.model_copy(update={"reason": f"{failed} (paused: {previous})"}))
+                raise RuntimeError(f"cancel refused: {failed}")
             state = await asyncio.to_thread(self._complete, state)
             note = f"cancelled by operator: {reason}" if reason else "cancelled by operator"
             state = state.model_copy(update={"reason": f"{note} (paused: {previous})"})
@@ -1536,6 +1557,11 @@ class LiveScenarioQueue:
             return self._complete(state)
         if self._runner_engaged():
             return state
+        # A resume re-enters here with the paused cycle's records: a VM decoy that may still hold its change is put
+        # back before the new plan drops them (review rv-t4u4 M1). One that cannot be put back stops the queue.
+        state, failed = self._revert_held_decoys(state, "before the next cycle")
+        if failed is not None:
+            return self._pause(state, failed)
         # A restart or resume schedules this phase for after the previous
         # run's effect has ended and cooled down (see _settle_not_before); the
         # 2h normal window must not begin before then.
@@ -1642,6 +1668,9 @@ class LiveScenarioQueue:
             unsettled = await self._unsettled_decoy(state)
             if unsettled is not None:
                 return await asyncio.to_thread(self._restart_cycle, state, unsettled)
+            short = self._held_guard_blocker(state, scenario_id)
+            if short is not None:
+                return await asyncio.to_thread(self._restart_cycle, state, short)
             early, verdict = await asyncio.to_thread(self._cycle_buffer_gate, state, scenario_id)
             if early is not None:
                 return early
@@ -1944,7 +1973,11 @@ class LiveScenarioQueue:
         that skipped the entry write."""
         if not self._transition_due(state):
             return state
-        # Decoys left changed through the recording are put back now, after it (D1 (b)).
+        # Decoys left changed through the recording are put back after it (D1 (b)), a minute past its end (L-C).
+        if any(_may_hold_change(record) for record in state.cycle_decoys) and self.clock.now() < (
+            parse_utc(state.expected_transition_at, field="expected_transition_at") + HELD_REVERT_AFTER_CAPTURE_END
+        ):
+            return state
         state, failed = self._revert_held_decoys(state)
         if failed is not None:
             return self._pause(state, failed)
@@ -2179,7 +2212,7 @@ class LiveScenarioQueue:
         consecutive restarts are allowed; the third pauses (spec §2.2)."""
         scenario_id = state.current_scenario_id or state.scenario_ids[state.next_index]
         # Held VM decoys of the abandoned cycle are put back before its records are dropped (D1 (b)).
-        state, held_failure = self._revert_held_decoys(state)
+        state, held_failure = self._revert_held_decoys(state, "before the cycle restart")
         if held_failure is not None:
             return self._pause(state, held_failure)
         # The abandoned cycle's topology collector stops now; the fresh cycle_reset
@@ -2818,30 +2851,35 @@ class LiveScenarioQueue:
             records.append(record)
         return self._store_decoys(state, records)
 
-    def _revert_held_decoys(self, state: LiveQueueState) -> "tuple[LiveQueueState, str | None]":
-        """Revert every held VM decoy of this cycle (command-session decision D1 (b)): at the end of the cooldown,
-        or when the cycle is abandoned. Returns a pause reason when one could not be reverted (a person has to look;
-        the CLI's guard reverts it by itself at guard_sec), else None, with the state holding the new records."""
-        if not any(record.status == "held" for record in state.cycle_decoys):
+    def _revert_held_decoys(
+        self, state: LiveQueueState, when: str = "after the recording"
+    ) -> "tuple[LiveQueueState, str | None]":
+        """Put back every VM decoy of this cycle that may still hold its change: a held one (D1 (b)), one still
+        rolling, one whose revert failed (unsettled). At the end of the cooldown (``when`` "after the recording"),
+        and before the cycle's records are dropped: a cycle restart, the reset after a resume, a cancel (review
+        rv-t4u4 M1). Returns a pause reason when one could not be put back (a person has to look; the CLI's guard
+        reverts it by itself at its deadline), else None, with the state holding the new records."""
+        if not any(_may_hold_change(record) for record in state.cycle_decoys):
             return state, None
         loaded = self._decoy_policy()
         if loaded is None:
-            return state, "held decoys but the decoy policy cannot be read to revert them"
+            return state, "VM decoys may hold their change but the decoy policy cannot be read to revert them"
         executor = self._decoy_executor_for(loaded[0])
         records, failures = [], []
         for record in state.cycle_decoys:
-            if record.status == "held":
+            if _may_hold_change(record):
                 now = self._format(self.clock.now())
                 try:
                     executor.undo(record)
                     record = record.model_copy(
-                        update={"status": "applied", "finished_at": now, "detail": "reverted after the recording"}
+                        update={"status": "applied" if record.status == "held" else "rolled_back",
+                                "finished_at": now, "unsettled": None, "detail": f"reverted {when}"}
                     )
                 except Exception as error:
                     failures.append(f"{record.id} on {record.node}: {error}")
                     record = record.model_copy(
                         update={"status": "failed", "finished_at": now, "unsettled": True,
-                                "detail": f"revert after the recording failed: {type(error).__name__}: {error}"}
+                                "detail": f"revert {when} failed: {type(error).__name__}: {error}"}
                     )
             records.append(record)
         state = self._store_decoys(state, records)
@@ -2849,9 +2887,49 @@ class LiveScenarioQueue:
             self._write_cycle_decoys(state.current_run_id, state)  # the run's record says how each one ended
         if failures:
             return state, (
-                "held decoy revert failed (the CLI guard reverts it by itself later): " + "; ".join(failures)[:500]
+                "decoy revert failed (the CLI guard reverts it by itself later): " + "; ".join(failures)[:500]
             )
         return state, None
+
+    def _held_guard_blocker(self, state: LiveQueueState, scenario_id: str) -> str | None:
+        """Review rv-t4u4 L-A: a held decoy's CLI guard is an absolute deadline drawn from the plan. When the runner
+        stood still before the recording (or the gate held), the guard could fall inside this recording and revert
+        as root there. Right before the injection, every held guard must outlast the recording: the injection at
+        its longest, the cooldown, the revert's wait after it, and a margin. Else the cycle restarts (the restart
+        puts the decoy back first)."""
+        held = [record for record in state.cycle_decoys if record.status == "held" and record.guard_sec]
+        if not held:
+            return None
+        now = self.clock.now().astimezone(timezone.utc)
+        need = now + timedelta(seconds=self._scenario_max_injection_sec(scenario_id)) + CYCLE_COOLDOWN_DURATION
+        need += HELD_REVERT_AFTER_CAPTURE_END + HELD_GUARD_MARGIN
+        for record in held:
+            deadline = parse_utc(record.started_at or self._format(now), field="decoy started_at") + timedelta(
+                seconds=record.guard_sec
+            )
+            if deadline < need:
+                return (
+                    f"decoy {record.id} on {record.node}: its guard ends {self._format(deadline)}, before the "
+                    f"recording and its revert would ({self._format(need)})"
+                )
+        return None
+
+    def _scenario_max_injection_sec(self, scenario_id: str) -> int:
+        """The scenario's ``execution.controller.max_injection_duration`` (the controller's default when the manifest
+        leaves it out). A manifest that cannot be found counts as the longest the held guard was sized for."""
+        if self.manifest_root is None:
+            return UNKNOWN_MAX_INJECTION_SEC
+        for path in sorted([*self.manifest_root.glob("*.yaml"), *self.manifest_root.glob("*.yml")]):
+            try:
+                document = json.loads(path.read_bytes())
+            except (OSError, ValueError):
+                continue
+            if document.get("id") == scenario_id:
+                controller = (document.get("execution") or {}).get("controller") or {}
+                return duration_seconds(
+                    controller.get("max_injection_duration", DEFAULT_MAX_INJECTION_SEC), field="max_injection_duration"
+                )
+        return UNKNOWN_MAX_INJECTION_SEC
 
     def _store_decoys(self, state: LiveQueueState, records: list[DecoyRecord]) -> LiveQueueState:
         state = state.model_copy(
