@@ -3130,10 +3130,35 @@ def test_the_held_guard_reads_the_scenarios_longest_injection(tmp_path: Path) ->
     queue, *_ = make_cycle_queue(tmp_path)
     root = tmp_path / "manifests"
     root.mkdir()
-    (root / "a.yaml").write_text(json.dumps({"id": "F01-R", "execution": {"controller": {"max_injection_duration": "25m"}}}))
-    (root / "b.yaml").write_text(json.dumps({"id": "F02-R", "execution": {"controller": {}}}))
+    (root / "a.yaml").write_text(json.dumps(
+        {"id": "F01-R", "execution": {"controller": {"runtime": {"max_injection_duration": "25m"}}}}))
+    (root / "b.yaml").write_text(json.dumps({"id": "F02-R", "execution": {"controller": {"runtime": {}}}}))
     (root / "c.yaml").write_text("not json")
     queue.manifest_root = root
     assert queue._scenario_max_injection_sec("F01-R") == 1500
     assert queue._scenario_max_injection_sec("F02-R") == 1200  # the controller's default
     assert queue._scenario_max_injection_sec("F99-X") == 3600  # unknown: the longest the guard was sized for
+
+
+def test_the_held_guard_reads_the_approved_manifests_where_the_controller_does(tmp_path: Path) -> None:
+    """Review rv-t4u5 N1: the injection length is read from the approved manifests as they are, at the place
+    manifests.py hands to parse_controller (execution.controller.runtime). Reading another place gives the
+    controller's default 1200 for every one of them."""
+    from app.controller import parse_controller
+
+    root = Path(__file__).resolve().parents[2].parent / "testbed-services/scripts/scenarios/manifests"
+    if not (root / "f08-h-rollout-plus-external-fault.yaml").is_file():
+        pytest.skip("testbed-services manifests are not checked out next to the runner")
+    queue, *_ = make_cycle_queue(tmp_path)
+    queue.manifest_root = root
+    assert queue._scenario_max_injection_sec("F08-H") == 900  # its runtime says 15m
+    seen = set()
+    for path in sorted(root.glob("*.yaml")):
+        document = json.loads(path.read_text())
+        controller = document["execution"]["controller"]
+        if controller.get("live_enabled") is not True:
+            continue
+        expected = parse_controller(controller["runtime"]).max_injection_duration_sec
+        assert queue._scenario_max_injection_sec(document["id"]) == expected, document["id"]
+        seen.add(expected)
+    assert len(seen) > 1, seen

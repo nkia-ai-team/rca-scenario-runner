@@ -2915,7 +2915,8 @@ class LiveScenarioQueue:
         return None
 
     def _scenario_max_injection_sec(self, scenario_id: str) -> int:
-        """The scenario's ``execution.controller.max_injection_duration`` (the controller's default when the manifest
+        """The scenario's ``execution.controller.runtime.max_injection_duration``, where manifests.py hands it to
+        parse_controller (the controller's default when the manifest
         leaves it out). A manifest that cannot be found counts as the longest the held guard was sized for."""
         if self.manifest_root is None:
             return UNKNOWN_MAX_INJECTION_SEC
@@ -2925,7 +2926,7 @@ class LiveScenarioQueue:
             except (OSError, ValueError):
                 continue
             if document.get("id") == scenario_id:
-                controller = (document.get("execution") or {}).get("controller") or {}
+                controller = ((document.get("execution") or {}).get("controller") or {}).get("runtime") or {}
                 return duration_seconds(
                     controller.get("max_injection_duration", DEFAULT_MAX_INJECTION_SEC), field="max_injection_duration"
                 )
