@@ -1097,7 +1097,7 @@ def test_every_live_controller_observation_binds_against_the_runner_registry():
     assert not problems, "\n".join(problems)
 
 
-def test_every_live_controller_observation_passes_the_probe_allowlists():
+def test_every_live_controller_observation_passes_the_probe_allowlists(monkeypatch, tmp_path):
     """Binding at the query registry is not enough: the live probes re-check the
     resolved parameters against their own allowlists (APPROVED_APM_SERVICES,
     THROTTLE_TARGETS, APPROVED_NODE_TARGETS, ...) just before issuing the query.
@@ -1129,6 +1129,17 @@ def test_every_live_controller_observation_passes_the_probe_allowlists():
     }
     controllers = json.loads(controllers_path.read_text())["controllers"]
     registry = ApprovedQueryRegistry.from_path()
+    # The SMS testbed's probes answer only while its operations are on (CIVIL_PETITION_SMS_OPS, as on tb-ops), its VMs
+    # read from its inventory. Turn them on against the sibling checkout's inventory so an S controller (2026-11-25
+    # F80-P, the first) is checked like the others instead of being refused as «operations off».
+    from app import vm_ops as _vm_ops
+
+    s_inventory = controllers_path.parents[3] / "civil-petition/deploy/inventory/s.json"
+    if s_inventory.is_file():
+        monkeypatch.setattr(_vm_ops, "SMS_INVENTORY", s_inventory)
+        monkeypatch.setattr(_vm_ops, "STATE_DIR", tmp_path / "state")
+        monkeypatch.setattr(_vm_ops, "_sms_ops", None)
+        monkeypatch.setenv("CIVIL_PETITION_SMS_OPS", "1")
 
     class _Reached(Exception):
         """Raised by the stub transport once parameter validation has passed."""
