@@ -1134,6 +1134,12 @@ def test_every_live_controller_observation_passes_the_probe_allowlists():
         """Raised by the stub transport once parameter validation has passed."""
 
     def _stub(*args, **kwargs):
+        # The VM testbed's reads (civil-petition loadgen summary, 2026-11-25 F72-P the first controller to use one) first
+        # ask the local ControlMaster socket (`ssh -O check`, nothing leaves the runner) and only then read over it.
+        # Answer that local check as up so the stub is reached at the read itself, after the allowlist, like the rest.
+        argv = args[0] if args else kwargs.get("args")
+        if isinstance(argv, (list, tuple)) and "-O" in argv and "check" in argv:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise _Reached()
 
     probes = LiveProbeSet(
