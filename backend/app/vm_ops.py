@@ -120,10 +120,22 @@ class VmHost:
 # install starts. Fixed here like every other runner allowlist: a scenario cannot name another host.
 LOADGEN_LIVE_PATH = f"/tmp/k6-{DOMAIN}-live.json"
 ARCHIVE_FACTS_PATH = "/var/lib/pg-table-stats/last.json"
-# The pair condition 1 record the runner compares across T and S (ST4 contract 3): the WAR record line, read whole
-# from every server (only the WAS pair has one; the others read as «-»). The configuration files' normalized
-# checksums are held equal by the testbed-services repository test, not read here.
-PAIR_FILES: tuple[tuple[str, str], ...] = (("pair_war", "/var/lib/petition-deploy/war.sha256"),)
+# Pair condition 1 (S design §2-4, §7-4; ST4 contract 3, round 2 after review rv-st4r M2): what every VM of both
+# testbeds installed, read whole by the periodic read and compared with the one expected value in the repository
+# (PAIR_EXPECTED): the WAR record (the WAS pair) and the normalized checksums of every rendered file, the load
+# scripts on the loadgen included (record step: `<normalized_sha256>  <dest>`, addresses and names replaced by
+# placeholders at render time; the loadgen adds `<sha256>  loadgen/script.js` and `loadgen/entrypoint.sh`). A VM
+# without the file reads as «-» (no pair).
+NORMALIZED_RECORD = "/var/lib/petition-deploy/normalized.sha256"
+PAIR_FILES: tuple[tuple[str, str], ...] = (
+    ("pair_war", "/var/lib/petition-deploy/war.sha256"),
+    ("pair_normalized", NORMALIZED_RECORD),
+)
+# The one expected value both testbeds are held to, pair by pair (testbed-services civil-petition/deploy/
+# pair-expected.json, made by render.py from the repository's templates and both inventories; read from the mounted
+# deploy folder; ST4 contract M2).
+PAIR_EXPECTED = DEPLOY_DIR / "pair-expected.json"
+PAIR_ROLES = ("web", "was", "db", "loadgen")
 # The units the install starts per role, the same on every VM testbed (one install code, S design decision 5).
 ROLE_UNITS: dict[str, tuple[str, ...]] = {
     "router": ("snmpd.service", "nftables.service"),
@@ -139,7 +151,9 @@ HOSTS: tuple[VmHost, ...] = (
     VmHost("was01", "192.168.127.31", "was", ROLE_UNITS["was"], PAIR_FILES),
     VmHost("was02", "192.168.127.32", "was", ROLE_UNITS["was"], PAIR_FILES),
     VmHost("db01", "192.168.127.41", "db", ROLE_UNITS["db"], (("archive_state", ARCHIVE_FACTS_PATH), *PAIR_FILES)),
-    VmHost("loadgen", "192.168.127.10", "loadgen", ROLE_UNITS["loadgen"], (("loadgen_live", LOADGEN_LIVE_PATH),)),
+    VmHost(
+        "loadgen", "192.168.127.10", "loadgen", ROLE_UNITS["loadgen"], (("loadgen_live", LOADGEN_LIVE_PATH), *PAIR_FILES)
+    ),
 )
 HOSTS_BY_NAME = {host.name: host for host in HOSTS}
 
@@ -246,7 +260,7 @@ def load_inventory_domain(path: Path, *, key: str | None = None) -> VmDomain:
         if role == "db":
             files = (("archive_state", ARCHIVE_FACTS_PATH), *files)
         if role == "loadgen":
-            files = (("loadgen_live", loadgen_live),)
+            files = (("loadgen_live", loadgen_live), *PAIR_FILES)
         hosts.append(VmHost(name, mgmt[0], role, ROLE_UNITS[role], files, user, private_key, known_hosts))
     names = [host.name for host in hosts]
     if len(names) != len(set(names)):
@@ -1095,42 +1109,116 @@ def server_pairs(first: VmDomain, second: VmDomain) -> list[tuple[str, str]]:
     ]
 
 
+def load_pair_expected(path: Path | None = None) -> dict[str, Any]:
+    """The one expected value of pair condition 1 (PAIR_EXPECTED, made by testbed-services render.py; ST4 contract
+    M2): ``pairs`` [{t, s, files {dest: normalized sha256}, t_only [dest], differs [dest]}] in the role order of
+    pair_packages.py, and ``loadgen_files`` {name: sha256} for the load scripts. Raises with why when it cannot be
+    read or has the wrong shape."""
+    path = path or PAIR_EXPECTED
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        pairs = [
+            {"t": str(row["t"]), "s": str(row["s"]),
+             "files": {str(dest): str(value) for dest, value in dict(row["files"]).items()},
+             "skip": {str(dest) for dest in [*row.get("t_only", []), *row.get("differs", []), *row.get("secrets", [])]}}
+            for row in document["pairs"]
+        ]
+        loadgen = {str(name): str(value) for name, value in dict(document["loadgen_files"]).items()}
+    except Exception as error:
+        raise VmOpsError(f"pair expected values unreadable at {path}: {type(error).__name__}: {error}") from None
+    if not pairs or not all(row["files"] for row in pairs) or not loadgen:
+        raise VmOpsError(f"pair expected values at {path} have no pairs, an empty pair or no loadgen_files")
+    return {"pairs": pairs, "loadgen_files": loadgen}
+
+
+def _sum_lines(text: str | None) -> dict[str, str] | None:
+    """`<sha256>  <path>` lines as {path: sha256}; None when the file is missing or has no line."""
+    if not text:
+        return None
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        value, _, name = line.strip().partition("  ")
+        if value and name:
+            out[name.strip()] = value.strip()
+    return out or None
+
+
+LOADGEN_PREFIX = "loadgen/"
+
+
 def pair_verdict(
     first: "VmOps", second: "VmOps", *, now: datetime | None = None,
-    excused: Mapping[str, Mapping[str, Any]] | None = None,
+    excused: Mapping[str, Mapping[str, Any]] | None = None, expected_path: Path | None = None,
 ) -> dict[str, Any]:
-    """S design §2-4 condition 1 and §7-4 as the runner can see it before a recording (ST4 contract 3): on fresh
-    periodic reads of both testbeds, every server runs what its install left (host_drift empty: role units active,
-    war.sha256 and expected.sha256 pass, no file changed; a held decoy's file excused as in the drift gate) and every
-    WAS of both carries the same WAR record line (one build). The normalized configuration checksums are held equal
-    by the testbed-services repository test (SharedCodeTests), not here. Not a gate: a run of either domain is
-    recorded with ``pair`` true or false and why."""
+    """S design §2-4 condition 1 and §7-4 «the expected value is one, T's» as the runner can see it before a
+    recording (ST4 contract M2). ``first`` is T, ``second`` S. On fresh periodic reads, for every pair of the
+    repository's expected value (pair-expected.json): both VMs run what their own install left (host_drift empty;
+    a held decoy's file excused as in the drift gate), and each VM's normalized checksums, without the pair's
+    t_only and differs files, are exactly the pair's ``files``; the loadgens' load scripts are ``loadgen_files``;
+    S's two WAS carry the WAR record line T's two WAS carry (one line). A missing expected file or record is «no
+    pair». Not a gate: a run of either domain is recorded with ``pair`` true or false and why."""
     now = now or first.clock()
     differences: list[str] = []
-    wars: dict[str, str | None] = {}
-    servers: list[str] = []
-    for ops in (first, second):
-        document = ops.load()
-        for host in ops.domain.servers:
-            servers.append(f"{ops.domain.key}/{host.name}")
-            facts = (document["hosts"].get(host.name) or {}).get("facts")
-            if facts is None or (now - _parse(facts["read_at"])).total_seconds() > FACTS_MAX_AGE_SEC:
-                differences.append(f"{host.name}: no fresh periodic read")
+    checked: list[str] = []
+    try:
+        expected = load_pair_expected(expected_path)
+    except VmOpsError as error:
+        return {"pair": False, "domains": [first.domain.key, second.domain.key], "checked": [],
+                "differences": [str(error)], "checked_at": _format(now)}
+    documents = {id(first): first.load(), id(second): second.load()}
+
+    def facts_of(ops: "VmOps", name: str) -> tuple[VmHost | None, dict[str, Any] | None]:
+        host = next((item for item in ops.hosts if item.name == name), None)
+        if host is None:
+            differences.append(f"{name}: not a VM of {ops.domain.key}")
+            return None, None
+        checked.append(f"{ops.domain.key}/{name}")
+        facts = (documents[id(ops)]["hosts"].get(name) or {}).get("facts")
+        if facts is None or (now - _parse(facts["read_at"])).total_seconds() > FACTS_MAX_AGE_SEC:
+            differences.append(f"{name}: no fresh periodic read")
+            return host, None
+        differences.extend(host_drift(host, facts, excused))
+        return host, facts
+
+    wars: dict[str, dict[str, str | None]] = {first.domain.key: {}, second.domain.key: {}}
+    paired = set()
+    for row in expected["pairs"]:
+        for ops, name in ((first, row["t"]), (second, row["s"])):
+            paired.add((ops.domain.key, name))
+            host, facts = facts_of(ops, name)
+            if facts is None:
                 continue
-            differences.extend(host_drift(host, facts, excused))
+            files = facts.get("pair") or {}
+            installed = _sum_lines(files.get("pair_normalized"))
+            if installed is None:
+                differences.append(f"{name}: no {NORMALIZED_RECORD}")
+                continue
+            scripts = {k[len(LOADGEN_PREFIX):]: v for k, v in installed.items() if k.startswith(LOADGEN_PREFIX)}
+            rendered = {k: v for k, v in installed.items() if not k.startswith(LOADGEN_PREFIX) and k not in row["skip"]}
+            wrong = sorted(d for d in set(rendered) | set(row["files"]) if rendered.get(d) != row["files"].get(d))
+            if wrong:
+                differences.append(f"{name}: normalized checksums differ from the expected ones for "
+                                   f"{', '.join(wrong[:5])}{' and more' if len(wrong) > 5 else ''}")
+            if host.role == "loadgen" and scripts != expected["loadgen_files"]:
+                differences.append(f"{name}: load scripts differ from the expected ones "
+                                   f"({', '.join(sorted(set(scripts) | set(expected['loadgen_files'])))})")
             if host.role == "was":
-                wars[host.name] = ((facts.get("pair") or {}).get("pair_war") or "").strip() or None
-    lines = set(wars.values())
-    if None in lines:
-        differences.append(f"no WAR record on {', '.join(sorted(n for n, v in wars.items() if v is None))}")
-    if len(lines - {None}) > 1:
-        differences.append("WAR record differs: " + "; ".join(f"{n} {(v or '-')[:16]}" for n, v in sorted(wars.items())))
-    if not any(ops.domain.servers for ops in (first, second)) or len(wars) == 0:
-        differences.append("no WAS read in either testbed")
-    for one, two in server_pairs(first.domain, second.domain):
-        if "-" in (one, two):
-            differences.append(f"{one if two == '-' else two} has no twin in the other testbed")
-    return {"pair": not differences, "domains": [first.domain.key, second.domain.key], "servers": servers,
+                wars[ops.domain.key][name] = ((files.get("pair_war") or "").strip() or None)
+    for ops in (first, second):
+        for host in ops.hosts:
+            if host.role in PAIR_ROLES and (ops.domain.key, host.name) not in paired:
+                differences.append(f"{host.name}: no pair in the expected values")
+    t_wars, s_wars = wars[first.domain.key], wars[second.domain.key]
+    missing = sorted(name for side in (t_wars, s_wars) for name, line in side.items() if line is None)
+    if missing:
+        differences.append(f"no WAR record on {', '.join(missing)}")
+    t_lines = {line for line in t_wars.values() if line}
+    if len(t_lines) != 1:
+        differences.append(f"{first.domain.key} WAS carry {len(t_lines)} WAR record lines, expected one")
+    elif any(line and line not in t_lines for line in s_wars.values()):
+        differences.append(f"{second.domain.key} WAR record is not {first.domain.key}'s: "
+                           + "; ".join(f"{n} {(v or '-')[:16]}" for n, v in sorted(s_wars.items())))
+    return {"pair": not differences, "domains": [first.domain.key, second.domain.key], "checked": checked,
             "differences": differences, "checked_at": _format(now)}
 
 

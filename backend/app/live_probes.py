@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import ipaddress
 import json
 import math
 import os
@@ -88,6 +89,8 @@ APPROVED_VM_HOSTS = {host.name: host.address for host in vm_ops.HOSTS}
 # loadgen VM over the management connection. S's entry comes from its inventory (vm_ops.VmDomain.entry_url).
 VM_DOMAIN_ENTRY_URL = vm_ops.ENTRY_URL
 TARGET_HEALTH_URL = "http://192.168.122.77:30080/health"
+# The Kubernetes testbed's network (tb-cp, tb-w1~w3 as tb-ops reaches them): the only place the nkia@ host probe goes.
+KUBERNETES_WORKER_NET = ipaddress.ip_network("192.168.122.0/24")
 
 
 def _vm_domain(domain: str) -> "vm_ops.VmDomain":
@@ -2398,6 +2401,12 @@ class LiveProbeSet:
             raise LiveProbeError("host probe scenario is not allowlisted")
         host, mode, target = HOST_PROBE_CONTRACTS[str(scenario_id)]
         vm_host = _approved_vm_host(host)
+        if vm_host is None and ipaddress.ip_address(host) not in KUBERNETES_WORKER_NET:
+            # Review rv-st4r L1: the nkia@ login is for the Kubernetes workers only. A VM testbed address (S with its
+            # operations off, or any address not in a table) is refused, never logged into directly (§7-2).
+            raise LiveProbeError(
+                f"{host} is not a Kubernetes worker nor a VM of a testbed whose operations are on; not probing it"
+            )
         if vm_host is not None and vm_ops.master_is_up(vm_host, self.process_runner) is not True:
             raise LiveProbeError(f"control connection to {host} is down; not probing {vm_host.name} without it")
         result = self.process_runner(

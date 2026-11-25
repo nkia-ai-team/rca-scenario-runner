@@ -1402,3 +1402,27 @@ def test_a_policy_with_both_vm_testbeds_is_accepted_and_keeps_their_shared_names
     document["domain_namespaces"]["civil-petition-xyz"] = "x"
     with pytest.raises(ValueError, match="have no domain words"):
         DecoyPolicy.model_validate(document)
+
+
+def test_an_s_scenario_draws_only_s_vms_and_never_one_its_answer_key_names() -> None:
+    """Review rv-st4r L4: with both VM testbeds in the policy, an S scenario's VM decoys are S's own VMs, never T's,
+    and an S VM the answer key names (wassvr01) is never a decoy."""
+    document = _vm_policy().model_dump(by_alias=True, exclude_none=True)
+    document["domain_namespaces"]["civil-petition-sms"] = "civil-petition-sms-vm"
+    for node, kinds, alias in (("websvr01", ("config_reapply",), "웹 서버"), ("wassvr01", ("war_redeploy",), "WAS"),
+                               ("wassvr02", ("war_redeploy",), "WAS")):
+        target = _vm_target(node, kinds=kinds, service=node)
+        target.update(namespace="civil-petition-sms-vm", aliases=[alias])
+        document["targets"].append(target)
+    policy = DecoyPolicy.model_validate(document)
+    scenario = {"domain": "civil-petition-sms", "root_cause": {"target_id": "uuid-dbsvr01"},
+                "scoring": {"accept": ["uuid-dbsvr01"], "partial": []},
+                "description": "dbsvr01 데이터 디스크가 가득 찬다. wassvr01 은 피해자다."}
+    nodes = Counter()
+    for seed in range(400):
+        for record in build_schedule(policy, seed=seed, scenario_id="F98-X", scenario=scenario,
+                                     cycle_start=CYCLE_START, buffer_start=BUFFER_START):
+            if record.node:
+                nodes[record.node] += 1
+                assert record.namespace == "civil-petition-sms-vm"
+    assert set(nodes) == {"websvr01", "wassvr02"}, nodes

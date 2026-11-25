@@ -2524,6 +2524,38 @@ async def test_cycle_buffer_gate_does_not_inject_when_the_archive_state_blocks(t
 
 
 @pytest.mark.asyncio
+async def test_cycle_buffer_gate_names_the_archive_check_that_failed_with_its_own_words(tmp_path: Path) -> None:
+    """Review rv-st4r M1 (its probe): when only S's dbsvr01 archive falls behind, the buffer gate stops the cycle
+    with S's check name and S's detail, not T's name with an empty detail; with both failing, both are named."""
+    from app.live_queue import ARCHIVE_STATE_SMS_CHECK_NAME
+
+    queue, runner, _, _, clock = make_cycle_queue(tmp_path)
+    (tmp_path / "t").mkdir()
+    (tmp_path / "s").mkdir()
+    queue.archive_state_dir = _archive_facts(tmp_path / "t", clock.value)
+    queue.sms_archive_state_dir = _archive_facts(tmp_path / "s", clock.value)
+    await queue.start()
+    state = await queue.tick()  # cycle_reset -> cycle_normal
+    clock.value = state_expected(state)
+    state = await queue.tick()  # -> cycle_buffer
+    clock.value = state_expected(state)
+    _archive_facts(tmp_path / "t", clock.value)
+    _archive_facts(tmp_path / "s", clock.value, rows=2_304_561)
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == []
+    reason = state.reason or ""
+    assert reason.startswith(f"operational readiness failed: {ARCHIVE_STATE_SMS_CHECK_NAME} (")
+    assert f"{ARCHIVE_STATE_SMS_CHECK_NAME}: petition rows 2304561 > 2304560" in reason
+    assert f"{ARCHIVE_STATE_CHECK_NAME}:" not in reason and f"{ARCHIVE_STATE_CHECK_NAME} " not in reason
+    # Both behind: both named, each with its own words.
+    _archive_facts(tmp_path / "t", clock.value, rows=2_400_000)
+    _archive_facts(tmp_path / "s", clock.value, rows=2_304_561)
+    paused = queue._cycle_buffer_gate(queue.snapshot(), "F01-R")[0]
+    assert f"{ARCHIVE_STATE_CHECK_NAME}, {ARCHIVE_STATE_SMS_CHECK_NAME} (" in (paused.reason or "")
+    assert "petition rows 2400000 > 2304560" in paused.reason and "petition rows 2304561 > 2304560" in paused.reason
+
+
+@pytest.mark.asyncio
 async def test_cycle_buffer_gate_does_not_inject_while_a_domain_pod_is_not_ready(tmp_path: Path) -> None:
     """v4 ORAFIX (Q25 answer 2, review H1): judged at the buffer gate right before the injection (the
     normal lead-in may roll decoys; the injection itself takes pods down on purpose). The buffer is

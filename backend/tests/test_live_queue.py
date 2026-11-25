@@ -2018,3 +2018,35 @@ def test_the_pair_record_excuses_what_held_decoys_left(tmp_path: Path) -> None:
                                                "ids": ["d1"]}}}]
     queue._write_vm_pair_state("run-n", "F01-R", [])
     assert asked[-1] == {}
+
+
+def test_the_queue_wires_s_s_gates_from_the_environment_and_compose_leaves_s_off(tmp_path: Path, monkeypatch) -> None:
+    """Review rv-st4r L3: with S on, the queue gets S's own drift gate under S's key, S's archive folder and the pair
+    record; with everything off none of them; compose carries both S settings empty (off)."""
+    from app import live_queue, vm_ops
+    from tests.test_vm_ops import sms_inventory_document
+
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps(sms_inventory_document()))
+    monkeypatch.setattr(vm_ops, "SMS_INVENTORY", path)
+    monkeypatch.setattr(vm_ops, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(vm_ops, "_ops", None)
+    monkeypatch.setattr(vm_ops, "_sms_ops", None)
+    for name in ("CIVIL_PETITION_OPS", "CIVIL_PETITION_SMS_OPS", "PETITION_SMS_ARCHIVE_STATE_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    off = live_queue.vm_testbed_queue_settings()
+    assert off == {"vm_domain_state": None, "vm_domain_states": {}, "sms_archive_state_dir": None, "vm_pair_state": None}
+    monkeypatch.setenv("CIVIL_PETITION_SMS_OPS", "1")
+    monkeypatch.setenv("PETITION_SMS_ARCHIVE_STATE_DIR", str(tmp_path / "s-archive"))
+    on = live_queue.vm_testbed_queue_settings()
+    sms = vm_ops.get_sms_ops()
+    assert on["vm_domain_state"] is None
+    assert on["vm_domain_states"] == {"civil-petition-sms": sms.drift_detail}
+    assert on["sms_archive_state_dir"] == tmp_path / "s-archive"
+    assert on["vm_pair_state"] is vm_ops.current_pair_verdict
+    monkeypatch.setenv("CIVIL_PETITION_OPS", "1")
+    both = live_queue.vm_testbed_queue_settings()
+    assert both["vm_domain_state"] == vm_ops.get_vm_ops().drift_detail and set(both["vm_domain_states"]) == {"civil-petition-sms"}
+    compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "- CIVIL_PETITION_SMS_OPS=${CIVIL_PETITION_SMS_OPS:-}" in compose
+    assert "- PETITION_SMS_ARCHIVE_STATE_DIR=${PETITION_SMS_ARCHIVE_STATE_DIR:-}" in compose

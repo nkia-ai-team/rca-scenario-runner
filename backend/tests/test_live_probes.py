@@ -2486,7 +2486,12 @@ def test_s_baseline_entry_and_host_probes_go_to_s_s_own_vms(tmp_path, monkeypatc
     assert "opsjob@10.33.0.31" in argv and not any(item.startswith("opsjob@192.168.127.") for item in argv)
 
 
-def test_s_probes_refuse_while_s_s_operations_are_off(tmp_path) -> None:
+def test_s_probes_refuse_while_s_s_operations_are_off(tmp_path, monkeypatch) -> None:
+    """With S's operations off nothing reaches an S VM: the loadgen and entry reads refuse, and a host probe on an
+    S management address is refused instead of falling to the nkia@ login (review rv-st4r L1)."""
+    from app import live_probes
+
+    monkeypatch.setitem(live_probes.HOST_PROBE_CONTRACTS, "F99-X", ("192.168.133.31", "fio", "/pgdata"))
     fakes = _SmsFakes()
     probes = _probes(tmp_path, fakes)
     registry = ApprovedQueryRegistry.from_path()
@@ -2495,4 +2500,11 @@ def test_s_probes_refuse_while_s_s_operations_are_off(tmp_path) -> None:
     )
     assert observation["quality"] != "good"
     assert probes.inspect(_eligibility(checks=["vm-sms-entry-health"])).check_results["vm-sms-entry-health"] is False
-    assert [argv for argv, _ in fakes.process_calls if any(str(a).startswith("opsjob@") for a in argv)] == []
+    probes = _probes(tmp_path, fakes, scenario_id="F99-X")
+    host = probes.observe(registry.bind({"query_id": "host.scenario_active", "parameters": {"scenario_id": "F99-X"}}))
+    assert host["quality"] != "good"
+    assert [argv for argv, _ in fakes.process_calls if any(str(a).startswith(("opsjob@", "nkia@")) for a in argv)] == []
+    # A Kubernetes worker keeps its nkia@ probe.
+    monkeypatch.setitem(live_probes.HOST_PROBE_CONTRACTS, "F99-X", ("192.168.122.14", "fio", "/pgdata"))
+    probes.observe(registry.bind({"query_id": "host.scenario_active", "parameters": {"scenario_id": "F99-X"}}))
+    assert any("nkia@192.168.122.14" in argv for argv, _ in fakes.process_calls)

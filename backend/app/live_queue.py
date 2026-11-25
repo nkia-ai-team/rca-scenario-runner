@@ -1878,12 +1878,16 @@ class LiveScenarioQueue:
         # The cycle queue does not re-run readiness between scenarios; the archive state is
         # checked here so no injection starts on a drifting baseline (needs a person: pause).
         archive_checks, archive_details = self._archive_state_readiness()
-        if archive_checks and not all(archive_checks.values()):
+        failed_archive = [name for name, passes in archive_checks.items() if not passes]
+        if failed_archive:
+            # Each failed check by its own name and its own words (review rv-st4r M1: an S-only failure used to be
+            # reported as T's check with an empty detail).
             return (
                 self._pause(
                     state,
-                    f"operational readiness failed: {ARCHIVE_STATE_CHECK_NAME} "
-                    f"({ARCHIVE_STATE_CHECK_NAME}: {archive_details.get(ARCHIVE_STATE_CHECK_NAME, '')})",
+                    f"operational readiness failed: {', '.join(failed_archive)} ("
+                    + "; ".join(f"{name}: {archive_details.get(name, '')}" for name in failed_archive)
+                    + ")",
                 ),
                 None,
             )
@@ -3646,6 +3650,20 @@ class LiveScenarioQueue:
 _queue: LiveScenarioQueue | None = None
 
 
+def vm_testbed_queue_settings() -> dict[str, Any]:
+    """The queue's VM testbed gates from the environment (review rv-st4r L3: one place, under test). T's drift gate
+    unless CIVIL_PETITION_OPS is off; S's drift gate under its own key unless CIVIL_PETITION_SMS_OPS is off; S's
+    archive folder from PETITION_SMS_ARCHIVE_STATE_DIR; the pair record whenever either testbed is on."""
+    t_ops, sms = get_vm_ops(), get_sms_ops()
+    archive = os.environ.get("PETITION_SMS_ARCHIVE_STATE_DIR", "").strip()
+    return {
+        "vm_domain_state": t_ops.drift_detail if t_ops is not None else None,
+        "vm_domain_states": {sms.domain.key: sms.drift_detail} if sms is not None else {},
+        "sms_archive_state_dir": Path(archive) if archive else None,
+        "vm_pair_state": current_pair_verdict if (t_ops is not None or sms is not None) else None,
+    }
+
+
 def get_live_queue() -> LiveScenarioQueue:
     global _queue
     if _queue is None:
@@ -3755,16 +3773,6 @@ def get_live_queue() -> LiveScenarioQueue:
             # VM testbed (civil-petition): its own preflight signals and the drift gate, both off unless
             # CIVIL_PETITION_OPS is on (app.vm_ops runs the management connections and the periodic read).
             domain_preflight_probes=vm_domain_probes() if preflight_probe is not None else {},
-            vm_domain_state=(vm_ops.drift_detail if (vm_ops := get_vm_ops()) is not None else None),
-            # S testbed (civil-petition-sms): the same gate on its own VMs, off unless CIVIL_PETITION_SMS_OPS is on.
-            vm_domain_states=(
-                {sms.domain.key: sms.drift_detail} if (sms := get_sms_ops()) is not None else {}
-            ),
-            sms_archive_state_dir=(
-                Path(os.environ["PETITION_SMS_ARCHIVE_STATE_DIR"])
-                if os.environ.get("PETITION_SMS_ARCHIVE_STATE_DIR", "").strip()
-                else None
-            ),
-            vm_pair_state=current_pair_verdict if (vm_ops is not None or sms is not None) else None,
+            **vm_testbed_queue_settings(),
         )
     return _queue

@@ -424,8 +424,10 @@ _DOMAIN_WORDS: dict[str, tuple[str, ...]] = {
     "core-banking": ("banking", "은행"),
     "food-delivery": ("food", "배달", "음식"),
     "civil-petition": ("민원", "petition"),
-    # The S testbed runs the same portal (S design decision 5): the same words. Its short names (websvr01, was) are
-    # the ones T's are, so both domains' names stay in the policy and the shared-name rule sees them (§7-6).
+    # The S testbed runs the same portal (S design decision 5): the same words. Its VM names and policy short names
+    # (websvr01, petition-websvr01) differ from T's (web01, petition-web01); what the two share is the containers
+    # (petition, apache2) and the aliases (WAS, 웹 서버), which name a target only inside its own domain's
+    # namespace (review rv-st4r L4).
     "civil-petition-sms": ("민원", "petition"),
 }
 # Short names that also mean something else: everyday words an answer key uses

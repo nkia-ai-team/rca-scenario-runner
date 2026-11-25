@@ -1060,7 +1060,7 @@ def test_the_s_testbed_is_read_from_its_inventory(tmp_path: Path) -> None:
     assert web.known_hosts == vm_ops.KEY_DIR / "known_hosts_civil-petition-sms"
     assert web.units == vm_ops.ROLE_UNITS["web"] and web.files == vm_ops.PAIR_FILES
     assert dict(domain.host("dbsvr01").files)["archive_state"] == vm_ops.ARCHIVE_FACTS_PATH
-    assert domain.host("loadgen").files == (("loadgen_live", "/tmp/k6-civil-petition-sms-live.json"),)
+    assert domain.host("loadgen").files == (("loadgen_live", "/tmp/k6-civil-petition-sms-live.json"), *vm_ops.PAIR_FILES)
     argv = vm_ops.executor_argv(web)
     assert "UserKnownHostsFile=" + str(vm_ops.KEY_DIR / "known_hosts_civil-petition-sms") in argv
     assert str(vm_ops.KEY_DIR / "s5-executor") in argv and argv[-5] == "opsjob@10.33.0.11"
@@ -1108,17 +1108,66 @@ def test_the_real_inventories_give_s_and_t_as_the_runner_reads_them() -> None:
                                              ("web01", "websvr01")]
 
 
-def _pair_ops(tmp_path: Path, t_out: dict, s_out: dict, *, s_age_min: int = 0):
-    """T and S VmOps after one periodic read each; t_out/s_out give _read_output overrides per VM name."""
+WAR_LINE = "4f3c" * 16 + "  petition.war\n"
+PAIR_NAMES = [("web01", "websvr01"), ("was01", "wassvr01"), ("was02", "wassvr02"), ("db01", "dbsvr01"),
+              ("loadgen", "loadgen")]
+PAIR_FILES_BY_T = {
+    "web01": {"/etc/apache2/sites-available/petition.conf": "a1" * 32},
+    "was01": {"/etc/tomcat10/server.xml": "b2" * 32, "/etc/default/tomcat10": "b3" * 32},
+    # The batch node: its own files (testbed-services M2 contract fact ①, pairs differ inside one testbed).
+    "was02": {"/etc/tomcat10/server.xml": "b9" * 32, "/etc/default/tomcat10": "b3" * 32,
+              "/etc/systemd/system/petition-batch.timer": "ba" * 32},
+    "db01": {"/etc/postgresql/16/main/postgresql.conf": "c3" * 32},
+    "loadgen": {"/etc/systemd/system/loadgen.service": "d4" * 32},
+}
+T_ONLY = ["/etc/default/lldpd", "/etc/rsyslog.d/remote/10-forward.conf"]
+LOADGEN_FILES = {"script.js": "e1" * 32, "entrypoint.sh": "e2" * 32}
+
+
+def _expected_document() -> dict:
+    return {"schema": "petition-pair-expected/1", "loadgen_files": LOADGEN_FILES, "pairs": [
+        {"t": t, "s": s, "files": PAIR_FILES_BY_T[t], "t_only": T_ONLY,
+         "differs": ["/etc/netplan/01-host.yaml"] if t == "loadgen" else []} for t, s in PAIR_NAMES]}
+
+
+def _normalized(files: dict) -> str:
+    return "".join(f"{value}  {dest}\n" for dest, value in sorted(files.items()))
+
+
+def _installed(t_name: str, *, testbed: str) -> dict:
+    """What the record step leaves on a VM: the pair's files, T's T-only files, a netplan that differs on purpose,
+    and the load scripts on the loadgen."""
+    files = dict(PAIR_FILES_BY_T[t_name])
+    if testbed == "t":
+        files.update({dest: "70" * 32 for dest in T_ONLY})
+    if t_name == "loadgen":
+        files["/etc/netplan/01-host.yaml"] = ("71" if testbed == "t" else "72") * 32
+        files.update({f"loadgen/{name}": value for name, value in LOADGEN_FILES.items()})
+    return files
+
+
+def _pair_ops(tmp_path: Path, t_out: dict, s_out: dict, *, s_age_min: int = 0, expected: dict | None = None):
+    """T and S VmOps after one periodic read each, and the expected file; t_out/s_out give _read_output overrides
+    per VM name (their «files» replace the right records)."""
     remote_t, remote_s = FakeRemote(), FakeRemote()
     clock = Clock()
     tmp_path.mkdir(parents=True, exist_ok=True)
     domain = sms_domain(tmp_path)
-    war = {"pair_war": "4f3c  petition.war\n"}
-    for host in HOSTS:
-        remote_t.outputs[host.address] = _read_output(host, **{"files": war, **t_out.get(host.name, {})})
-    for host in domain.hosts:
-        remote_s.outputs[host.address] = _read_output(host, **{"files": war, **s_out.get(host.name, {})})
+    expected_path = tmp_path / "pair-expected.json"
+    expected_path.write_text(json.dumps(expected if expected is not None else _expected_document()))
+    twin = {s: t for t, s in PAIR_NAMES}
+
+    for remote, hosts, out, testbed in ((remote_t, HOSTS, t_out, "t"), (remote_s, domain.hosts, s_out, "s")):
+        for host in hosts:
+            t_name = host.name if testbed == "t" else twin.get(host.name)
+            files = {}
+            if t_name in PAIR_FILES_BY_T:
+                files["pair_normalized"] = _normalized(_installed(t_name, testbed=testbed))
+            if host.role == "was":
+                files["pair_war"] = WAR_LINE
+            override = dict(out.get(host.name, {}))
+            override["files"] = {**files, **override.get("files", {})}
+            remote.outputs[host.address] = _read_output(host, **override)
     t_ops = _ops(tmp_path / "t", remote_t, clock)
     s_ops = VmOps(domain=domain, process_runner=remote_s, clock=clock, state_dir=tmp_path / "s",
                   supervisor=MasterSupervisor(domain.hosts, process_runner=remote_s, clock=clock,
@@ -1128,38 +1177,68 @@ def _pair_ops(tmp_path: Path, t_out: dict, s_out: dict, *, s_age_min: int = 0):
     clock.value -= timedelta(minutes=s_age_min)
     s_ops.read_all()
     clock.value += timedelta(minutes=s_age_min)
-    return t_ops, s_ops
+    return t_ops, s_ops, expected_path
 
 
-def test_the_pair_holds_only_when_both_testbeds_run_what_one_build_installed(tmp_path: Path) -> None:
-    """ST4 contract 3 (S design §2-4 condition 1, §7-4): on fresh reads of both testbeds every server passes its
-    install records with nothing changed, and the four WAS carry one WAR record line. Anything else is «no pair»
-    with why; a held decoy's file is excused as in the drift gate."""
-    t_ops, s_ops = _pair_ops(tmp_path / "a", {}, {})
-    verdict = vm_ops.pair_verdict(t_ops, s_ops)
+def test_the_pair_holds_only_when_both_testbeds_installed_the_one_expected_value(tmp_path: Path) -> None:
+    """Review rv-st4r M2 and ST4 contract M2 (S design §2-4 condition 1, §7-4 «the expected value is one, T's»):
+    pair by pair, each VM's normalized checksums without the pair's t_only and differs files are exactly the
+    pair's files, the loadgens carry the expected load scripts, S's WAS carry T's one WAR record line, and nothing
+    changed since install. Anything else is «no pair» with why; a held decoy's file is excused as in the drift
+    gate."""
+    t_ops, s_ops, expected = _pair_ops(tmp_path / "a", {}, {})
+    verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
     assert verdict["pair"] is True and verdict["differences"] == [], verdict
-    assert len(verdict["servers"]) == 8
+    assert len(verdict["checked"]) == 10 and "civil-petition-sms/loadgen" in verdict["checked"]
 
     site = "/etc/apache2/sites-available/petition.conf"
-    drifted = {"websvr01": {"sums": {"/var/lib/petition-deploy/expected.sha256": "rc=1"}, "drift": (site,)}}
+    other_was = {**_installed("was01", testbed="s"), "/etc/tomcat10/server.xml": "ee" * 32}
     cases = {
-        "websvr01 changed since install: " + site: ({}, drifted),
-        "WAR record differs": ({}, {"wassvr02": {"files": {"pair_war": "9a9a  petition.war\n"}}}),
-        "no WAR record on was01": ({"was01": {"files": {}}}, {}),
-        "db01 /var/lib/petition-deploy/expected.sha256 rc=1": (
-            {"db01": {"sums": {"/var/lib/petition-deploy/expected.sha256": "rc=1"}}}, {}),
+        # S installed from another commit: its own records pass, its normalized checksums are not the pair's.
+        "wassvr01: normalized checksums differ from the expected ones for /etc/tomcat10/server.xml": (
+            {}, {"wassvr01": {"files": {"pair_normalized": _normalized(other_was)}}}),
+        # T changed too: T is held to the same one value.
+        "db01: normalized checksums differ from the expected ones for /etc/postgresql/16/main/extra.conf": (
+            {"db01": {"files": {"pair_normalized": _normalized({**_installed("db01", testbed="t"),
+                                                                 "/etc/postgresql/16/main/extra.conf": "0" * 64})}}}, {}),
+        "loadgen: load scripts differ from the expected ones (entrypoint.sh, script.js)": (
+            {}, {"loadgen": {"files": {"pair_normalized": _normalized({**_installed("loadgen", testbed="s"),
+                                                                        "loadgen/script.js": "ff" * 32})}}}),
+        "web01: no /var/lib/petition-deploy/normalized.sha256": ({"web01": {"files": {"pair_normalized": None}}}, {}),
+        "civil-petition-sms WAR record is not civil-petition's": (
+            {}, {"wassvr02": {"files": {"pair_war": "9a" * 32 + "  petition.war\n"}}}),
+        "civil-petition WAS carry 2 WAR record lines, expected one": (
+            {"was02": {"files": {"pair_war": "9b" * 32 + "  petition.war\n"}}}, {}),
+        "no WAR record on was01": ({"was01": {"files": {"pair_war": None}}}, {}),
+        "websvr01 changed since install: " + site: (
+            {}, {"websvr01": {"sums": {"/var/lib/petition-deploy/expected.sha256": "rc=1"}, "drift": (site,)}}),
         "wassvr01 tomcat10.service failed": ({}, {"wassvr01": {"units": {"tomcat10.service": "failed"}}}),
     }
     for index, (words, (t_out, s_out)) in enumerate(cases.items()):
-        t_ops, s_ops = _pair_ops(tmp_path / f"c{index}", t_out, s_out)
-        verdict = vm_ops.pair_verdict(t_ops, s_ops)
-        assert verdict["pair"] is False and any(words in item for item in verdict["differences"]), (words, verdict)
-    t_ops, s_ops = _pair_ops(tmp_path / "held", {}, drifted)
+        t_ops, s_ops, expected = _pair_ops(tmp_path / f"c{index}", t_out, s_out)
+        verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
+        assert verdict["pair"] is False and any(item.startswith(words) for item in verdict["differences"]), (
+            words, verdict["differences"])
+    held_out = {"websvr01": {"sums": {"/var/lib/petition-deploy/expected.sha256": "rc=1"}, "drift": (site,)}}
+    t_ops, s_ops, expected = _pair_ops(tmp_path / "held", {}, held_out)
     held = {"websvr01": {"paths": {site}, "guards": 1}}
-    assert vm_ops.pair_verdict(t_ops, s_ops, excused=held)["pair"] is True
-    t_ops, s_ops = _pair_ops(tmp_path / "stale", {}, {}, s_age_min=30)
-    verdict = vm_ops.pair_verdict(t_ops, s_ops)
+    assert vm_ops.pair_verdict(t_ops, s_ops, excused=held, expected_path=expected)["pair"] is True
+    t_ops, s_ops, expected = _pair_ops(tmp_path / "stale", {}, {}, s_age_min=30)
+    verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
     assert verdict["pair"] is False and "websvr01: no fresh periodic read" in verdict["differences"]
+    # A VM the expected values do not pair, no expected value, or a broken one: no pair, with why.
+    document = _expected_document()
+    document["pairs"] = [row for row in document["pairs"] if row["s"] != "dbsvr01"]
+    t_ops, s_ops, expected = _pair_ops(tmp_path / "unpaired", {}, {}, expected=document)
+    verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
+    assert verdict["pair"] is False and "dbsvr01: no pair in the expected values" in verdict["differences"]
+    t_ops, s_ops, expected = _pair_ops(tmp_path / "noexp", {}, {})
+    expected.unlink()
+    verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
+    assert verdict["pair"] is False and "pair expected values unreadable" in verdict["differences"][0]
+    t_ops, s_ops, expected = _pair_ops(tmp_path / "bad", {}, {}, expected={"pairs": [], "loadgen_files": {}})
+    verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
+    assert verdict["pair"] is False and "have no pairs" in verdict["differences"][0]
 
 
 def test_the_pair_is_no_pair_with_why_while_either_testbed_is_off(monkeypatch) -> None:
