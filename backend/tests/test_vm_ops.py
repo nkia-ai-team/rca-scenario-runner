@@ -1121,12 +1121,13 @@ PAIR_FILES_BY_T = {
     "loadgen": {"/etc/systemd/system/loadgen.service": "d4" * 32},
 }
 T_ONLY = ["/etc/default/lldpd", "/etc/rsyslog.d/remote/10-forward.conf"]
-LOADGEN_FILES = {"script.js": "e1" * 32, "entrypoint.sh": "e2" * 32}
+LOADGEN_FILES = {"loadgen/script.js": "e1" * 32, "loadgen/entrypoint.sh": "e2" * 32}
 
 
 def _expected_document() -> dict:
     return {"schema": "petition-pair-expected/1", "loadgen_files": LOADGEN_FILES, "pairs": [
-        {"t": t, "s": s, "files": PAIR_FILES_BY_T[t], "t_only": T_ONLY,
+        {"t": t, "s": s, "role": "loadgen" if t == "loadgen" else t.rstrip("0123456789"), "files": PAIR_FILES_BY_T[t],
+         "t_only": [] if t == "loadgen" else T_ONLY,
          "differs": ["/etc/netplan/01-host.yaml"] if t == "loadgen" else []} for t, s in PAIR_NAMES]}
 
 
@@ -1138,11 +1139,11 @@ def _installed(t_name: str, *, testbed: str) -> dict:
     """What the record step leaves on a VM: the pair's files, T's T-only files, a netplan that differs on purpose,
     and the load scripts on the loadgen."""
     files = dict(PAIR_FILES_BY_T[t_name])
-    if testbed == "t":
+    if testbed == "t" and t_name != "loadgen":
         files.update({dest: "70" * 32 for dest in T_ONLY})
     if t_name == "loadgen":
         files["/etc/netplan/01-host.yaml"] = ("71" if testbed == "t" else "72") * 32
-        files.update({f"loadgen/{name}": value for name, value in LOADGEN_FILES.items()})
+        files.update(LOADGEN_FILES)
     return files
 
 
@@ -1201,7 +1202,7 @@ def test_the_pair_holds_only_when_both_testbeds_installed_the_one_expected_value
         "db01: normalized checksums differ from the expected ones for /etc/postgresql/16/main/extra.conf": (
             {"db01": {"files": {"pair_normalized": _normalized({**_installed("db01", testbed="t"),
                                                                  "/etc/postgresql/16/main/extra.conf": "0" * 64})}}}, {}),
-        "loadgen: load scripts differ from the expected ones (entrypoint.sh, script.js)": (
+        "loadgen: load scripts differ from the expected ones (loadgen/entrypoint.sh, loadgen/script.js)": (
             {}, {"loadgen": {"files": {"pair_normalized": _normalized({**_installed("loadgen", testbed="s"),
                                                                         "loadgen/script.js": "ff" * 32})}}}),
         "web01: no /var/lib/petition-deploy/normalized.sha256": ({"web01": {"files": {"pair_normalized": None}}}, {}),
@@ -1275,3 +1276,17 @@ def test_s_reads_its_own_vms_with_its_own_cli_domain_and_state(tmp_path: Path, m
     routine._call(["--node", "websvr01", "--check"])
     assert calls[1][2:] == ["--node", "websvr01", "--check"]
     assert ops.routine.cli_args == ("--domain", "civil-petition-sms")
+
+
+def test_the_real_expected_values_pair_the_real_inventories() -> None:
+    """The real pair-expected.json (testbed-services, next to the inventories) reads as five pairs in the runner's
+    twin order with the load scripts, so the runner's reading and the render's file agree."""
+    path = INVENTORY_DIR / "pair-expected.json"
+    if not path.is_file():
+        pytest.skip("testbed-services pair-expected.json is not checked out next to the runner")
+    expected = vm_ops.load_pair_expected(path)
+    s = vm_ops.load_inventory_domain(INVENTORY_DIR / "s.json", key=vm_ops.SMS_DOMAIN)
+    pairs = [(row["t"], row["s"]) for row in expected["pairs"]]
+    assert sorted(pairs[:4]) == sorted(vm_ops.server_pairs(vm_ops.T_DOMAIN, s)) and pairs[4] == ("loadgen", "loadgen")
+    assert sorted(expected["loadgen_files"]) == ["loadgen/entrypoint.sh", "loadgen/script.js"]
+    assert vm_ops.PAIR_EXPECTED.name == path.name and vm_ops.PAIR_EXPECTED.parent.name == "inventory"

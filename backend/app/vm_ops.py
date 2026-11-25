@@ -131,10 +131,10 @@ PAIR_FILES: tuple[tuple[str, str], ...] = (
     ("pair_war", "/var/lib/petition-deploy/war.sha256"),
     ("pair_normalized", NORMALIZED_RECORD),
 )
-# The one expected value both testbeds are held to, pair by pair (testbed-services civil-petition/deploy/
-# pair-expected.json, made by render.py from the repository's templates and both inventories; read from the mounted
-# deploy folder; ST4 contract M2).
-PAIR_EXPECTED = DEPLOY_DIR / "pair-expected.json"
+# The one expected value both testbeds are held to, pair by pair (testbed-services civil-petition/deploy/inventory/
+# pair-expected.json, made by render.py from the repository's templates and both inventories, next to the other
+# site-valued files; read from the mounted deploy folder; ST4 contract M2).
+PAIR_EXPECTED = DEPLOY_DIR / "inventory" / "pair-expected.json"
 PAIR_ROLES = ("web", "was", "db", "loadgen")
 # The units the install starts per role, the same on every VM testbed (one install code, S design decision 5).
 ROLE_UNITS: dict[str, tuple[str, ...]] = {
@@ -1111,8 +1111,8 @@ def server_pairs(first: VmDomain, second: VmDomain) -> list[tuple[str, str]]:
 
 def load_pair_expected(path: Path | None = None) -> dict[str, Any]:
     """The one expected value of pair condition 1 (PAIR_EXPECTED, made by testbed-services render.py; ST4 contract
-    M2): ``pairs`` [{t, s, files {dest: normalized sha256}, t_only [dest], differs [dest]}] in the role order of
-    pair_packages.py, and ``loadgen_files`` {name: sha256} for the load scripts. Raises with why when it cannot be
+    M2): ``pairs`` [{t, s, role, files {dest: normalized sha256}, t_only [dest], differs [dest]}] in the role order
+    of pair_packages.py, and ``loadgen_files`` {"loadgen/<name>": sha256} for the load scripts. Raises with why when it cannot be
     read or has the wrong shape."""
     path = path or PAIR_EXPECTED
     try:
@@ -1193,7 +1193,7 @@ def pair_verdict(
             if installed is None:
                 differences.append(f"{name}: no {NORMALIZED_RECORD}")
                 continue
-            scripts = {k[len(LOADGEN_PREFIX):]: v for k, v in installed.items() if k.startswith(LOADGEN_PREFIX)}
+            scripts = {k: v for k, v in installed.items() if k.startswith(LOADGEN_PREFIX)}
             rendered = {k: v for k, v in installed.items() if not k.startswith(LOADGEN_PREFIX) and k not in row["skip"]}
             wrong = sorted(d for d in set(rendered) | set(row["files"]) if rendered.get(d) != row["files"].get(d))
             if wrong:
