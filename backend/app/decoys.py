@@ -424,6 +424,9 @@ _DOMAIN_WORDS: dict[str, tuple[str, ...]] = {
     "core-banking": ("banking", "은행"),
     "food-delivery": ("food", "배달", "음식"),
     "civil-petition": ("민원", "petition"),
+    # The S testbed runs the same portal (S design decision 5): the same words. Its short names (websvr01, was) are
+    # the ones T's are, so both domains' names stay in the policy and the shared-name rule sees them (§7-6).
+    "civil-petition-sms": ("민원", "petition"),
 }
 # Short names that also mean something else: everyday words an answer key uses
 # for data, not apps ("in order", "application account", "ledger window").
@@ -950,6 +953,8 @@ class VmDecoyExecutor:
                  cli: Path | None = None, clock: Callable[[], datetime] | None = None) -> None:
         from app import vm_ops
 
+        # Every VM testbed goes through the same calls: node names are unique across T and S, and the CLI finds the
+        # domain by the node (ST4 contract 2).
         self.process_runner = process_runner or vm_ops.run_in_group
         self.cli = cli or vm_ops.OPERATOR_SESSION_CLI
         self.clock = clock or (lambda: datetime.now(timezone.utc))

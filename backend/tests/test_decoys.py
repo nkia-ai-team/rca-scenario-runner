@@ -1358,3 +1358,47 @@ def test_a_hold_longer_than_the_near_fault_window_allows_is_refused() -> None:
     document["vm_hold_sec"] = {"min": 96, "max": near - 599}
     with pytest.raises(ValueError, match="must not exceed the near_fault window start"):
         DecoyPolicy.model_validate(document)
+
+
+# --- S testbed (civil-petition-sms, ST4) --------------------------------------------------------------------------
+
+def test_an_s_vm_decoy_goes_through_the_same_cli_calls_by_its_node() -> None:
+    """ST4 contract 2: node names are unique across T and S, so an S decoy is the same `--node <name>` call (the
+    CLI finds the domain by the node); no other argument tells the testbeds apart."""
+    from app.decoys import VmDecoyExecutor
+
+    calls = []
+    vm = VmDecoyExecutor(process_runner=lambda argv, **k: calls.append(argv[2:]) or subprocess.CompletedProcess(argv, 0, "", ""))
+    record = DecoyRecord(id="d1", window="normal", planned_at="2026-11-10T01:30:00Z", kind="war_redeploy",
+                         namespace="civil-petition-sms-vm", deployment="petition-wassvr01", node="wassvr01",
+                         service_name="wassvr01", target_id="uuid-wassvr01", relation="same_domain", value="x",
+                         revert="after_recording", guard_sec=9000)
+    vm.apply(record)
+    vm.undo(record)
+    assert calls == [["--node", "wassvr01", "--decoy-change", "war_redeploy", "--guard-sec", "9000"],
+                     ["--node", "wassvr01", "--decoy-revert", "war_redeploy"]]
+
+
+def test_a_policy_with_both_vm_testbeds_is_accepted_and_keeps_their_shared_names() -> None:
+    """§7-6 decoys row: the S domain key has its words, so a policy naming it validates (else the queue would stop at
+    the plan); T and S targets live side by side under their own namespaces, and a T scenario draws only T's VMs."""
+    from app.decoys import _DOMAIN_WORDS
+
+    assert _DOMAIN_WORDS["civil-petition-sms"] == _DOMAIN_WORDS["civil-petition"]
+    document = _vm_policy().model_dump(by_alias=True, exclude_none=True)
+    document["domain_namespaces"]["civil-petition-sms"] = "civil-petition-sms-vm"
+    for node in ("wassvr01", "wassvr02"):
+        target = _vm_target(node, kinds=("war_redeploy",))
+        target["namespace"] = "civil-petition-sms-vm"
+        document["targets"].append(target)
+    policy = DecoyPolicy.model_validate(document)
+    nodes = set()
+    for seed in range(300):
+        for record in build_schedule(policy, seed=seed, scenario_id="F99-X", scenario=VM_SCENARIO,
+                                     cycle_start=CYCLE_START, buffer_start=BUFFER_START):
+            if record.node:
+                nodes.add(record.node)
+    assert nodes and not nodes & {"wassvr01", "wassvr02"}
+    document["domain_namespaces"]["civil-petition-xyz"] = "x"
+    with pytest.raises(ValueError, match="have no domain words"):
+        DecoyPolicy.model_validate(document)

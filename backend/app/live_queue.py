@@ -58,6 +58,7 @@ from app.pass_mode import (
 )
 from app.preflight import (
     DOMAIN_REQUIRED_SIGNALS,
+    VM_DOMAIN,
     AiJudge,
     PreflightVerdict,
     build_preflight_checks,
@@ -65,7 +66,7 @@ from app.preflight import (
 )
 from app.runner import ScenarioRunner, get_runner
 from app.preflight_probe import vm_domain_probes
-from app.vm_ops import get_vm_ops
+from app.vm_ops import current_pair_verdict, get_sms_ops, get_vm_ops
 from app import seasonal_window
 from app.controller import duration_seconds
 
@@ -232,6 +233,8 @@ ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 # 75 minutes blocks only once a second run is also missing (and stays under the 90 of a third).
 # Default 75 minutes, PETITION_ARCHIVE_STATE_MAX_AGE_SEC overrides. Off unless the directory is configured.
 ARCHIVE_STATE_CHECK_NAME = "petition_archive_state"
+# The same check on the S testbed's dbsvr01 (S design §7-4 보관 배치 상태: same timer, same file, same verdict).
+ARCHIVE_STATE_SMS_CHECK_NAME = "petition_sms_archive_state"
 ARCHIVE_STATE_MISSED_WINDOWS_LIMIT = 2
 ARCHIVE_STATE_DEFAULT_MAX_FACTS_AGE = timedelta(minutes=75)
 
@@ -645,6 +648,9 @@ class LiveScenarioQueue:
         domain_pods_probe: "Callable[[], str | None] | None" = None,
         domain_preflight_probes: "Mapping[str, PreflightProbe] | None" = None,
         vm_domain_state: "Callable[[], str | None] | None" = None,
+        vm_domain_states: "Mapping[str, Callable[..., str | None]] | None" = None,
+        sms_archive_state_dir: Path | None = None,
+        vm_pair_state: "Callable[[], dict[str, Any]] | None" = None,
     ) -> None:
         self.runner = runner
         # Per-domain preflight probes (spec-testbed-vm-3tier §6-4): a scenario of a domain listed here is judged on
@@ -654,6 +660,12 @@ class LiveScenarioQueue:
         # VM testbed drift and service state right before one of its injections (VM_DOMAIN_STATE_CHECK_NAME):
         # None while the VMs run what the install left, else what differs. None (no callable) leaves it out.
         self.vm_domain_state = vm_domain_state
+        # The same gate for every other VM testbed, by domain (S: its own VMs and records, ST4).
+        self.vm_domain_states = dict(vm_domain_states or {})
+        # S design §2-4 condition 1 (T and S run the same software): read with each VM-testbed run and kept in its
+        # run folder as pair.json (pair true or false and why; a held decoy's file excused as in the drift gate).
+        # Never a gate. None leaves it out.
+        self.vm_pair_state = vm_pair_state
         # None while every testbed app pod is Ready, else what is not. None (no probe) leaves the
         # check out (unit tests, older deployments). Called only right before an injection starts.
         self.domain_pods_probe = domain_pods_probe
@@ -667,6 +679,8 @@ class LiveScenarioQueue:
         self.oracle_check_max_age = oracle_check_max_age
         # Where the civil-petition db01 facts (last.json) land. None leaves the check out.
         self.archive_state_dir = archive_state_dir
+        # The S testbed's dbsvr01 facts (same file, same verdict, its own check name). None leaves it out.
+        self.sms_archive_state_dir = sms_archive_state_dir
         self.archive_state_max_facts_age = archive_state_max_facts_age
         # v3 continuous-cycle mode (off by default; v2 behaviour preserved).
         self.cycle_mode = cycle_mode
@@ -850,11 +864,19 @@ class LiveScenarioQueue:
         except Exception as error:
             return {name: False}, {name: f"unreadable check result: {type(error).__name__}: {error}"}
 
-    def _archive_state_facts(self) -> tuple[dict[str, Any] | None, bool, str]:
-        """(facts, passes, detail) from <archive_state_dir>/last.json; facts None when unreadable."""
-        last = self.archive_state_dir / "last.json"  # type: ignore[operator]
+    def _archive_state_dirs(self) -> dict[str, Path]:
+        """Check name -> facts folder for each VM testbed whose archive state is on (T, then S). The check covers
+        the whole queue, not only that testbed's scenarios (S design §7-4: like the Oracle check, a recording
+        holds 119 data of every domain)."""
+        dirs = {ARCHIVE_STATE_CHECK_NAME: self.archive_state_dir, ARCHIVE_STATE_SMS_CHECK_NAME: self.sms_archive_state_dir}
+        return {name: path for name, path in dirs.items() if path is not None}
+
+    def _archive_state_facts(self, folder: Path | None = None) -> tuple[dict[str, Any] | None, bool, str]:
+        """(facts, passes, detail) from <folder>/last.json (T's archive_state_dir by default); facts None when
+        unreadable."""
+        last = (folder or self.archive_state_dir) / "last.json"  # type: ignore[operator]
         if not last.is_file():
-            return None, False, f"no db facts at {last} (periodic db01 read not installed or never ran)"
+            return None, False, f"no db facts at {last} (periodic db read not installed or never ran)"
         try:
             facts = json.loads(last.read_text(encoding="utf-8"))
             passes, detail = archive_state_verdict(
@@ -869,18 +891,48 @@ class LiveScenarioQueue:
     def _archive_state_readiness(self) -> tuple[dict[str, bool], dict[str, str]]:
         """Civil-petition archive state (ARCHIVE_STATE_* above). Never transient: a stalled
         archive needs a person. Checked with readiness and again right before each injection."""
-        if self.archive_state_dir is None:
-            return {}, {}
-        _, passes, detail = self._archive_state_facts()
-        name = ARCHIVE_STATE_CHECK_NAME
-        return ({name: True}, {}) if passes else ({name: False}, {name: detail[:600]})
+        checks: dict[str, bool] = {}
+        details: dict[str, str] = {}
+        for name, folder in self._archive_state_dirs().items():
+            _, passes, detail = self._archive_state_facts(folder)
+            checks[name] = passes
+            if not passes:
+                details[name] = detail[:600]
+        return checks, details
 
     def _write_archive_state(self, run_id: str) -> None:
         """Leave the facts and the verdict this injection started on in the run folder
-        (runner execution record, not the recording) so the verify skill can judge them again."""
-        if self.archive_state_dir is None:
+        (runner execution record, not the recording) so the verify skill can judge them again. T's in
+        archive_state.json as before, S's in archive_state_sms.json."""
+        for name, folder in self._archive_state_dirs().items():
+            filename = "archive_state.json" if name == ARCHIVE_STATE_CHECK_NAME else "archive_state_sms.json"
+            self._write_archive_state_file(run_id, folder, filename)
+
+    def _write_vm_pair_state(
+        self, run_id: str, scenario_id: str | None, decoys: "list[DecoyRecord] | None" = None
+    ) -> None:
+        """pair.json for a run of a VM testbed (S design §7-4 "버전 표류와 쌍 조건"): whether T and S run the same
+        software right now. A recording either way; pair false says it is not one of a pair, and why."""
+        if self.vm_pair_state is None:
             return
-        facts, passes, detail = self._archive_state_facts()
+        try:
+            domain = self._scenario_domain(scenario_id)
+        except ScenarioMetadataError:
+            return
+        if domain not in DOMAIN_REQUIRED_SIGNALS:
+            return
+        held = held_excuses(decoys or [])
+        try:
+            document = dict(self.vm_pair_state(excused=held) if held else self.vm_pair_state())
+        except Exception as error:
+            document = {"pair": False, "differences": [f"pair state unreadable: {type(error).__name__}: {error}"]}
+        document["domain"] = domain
+        path = self.runner.artifact_store.root / run_id / "pair.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _write_archive_state_file(self, run_id: str, folder: Path, filename: str) -> None:
+        facts, passes, detail = self._archive_state_facts(folder)
         document = {
             "checked_at": self._format(self.clock.now()),
             "facts": facts,
@@ -891,7 +943,7 @@ class LiveScenarioQueue:
             "missed_windows_limit": ARCHIVE_STATE_MISSED_WINDOWS_LIMIT,
             "archive_schedule": (facts or {}).get("archive_schedule"),
         }
-        path = self.runner.artifact_store.root / run_id / "archive_state.json"
+        path = self.runner.artifact_store.root / run_id / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -1350,6 +1402,7 @@ class LiveScenarioQueue:
         if verdict is not None:
             self._write_preflight(run.run_id, verdict)
         self._write_archive_state(run.run_id)
+        self._write_vm_pair_state(run.run_id, scenario_id)
         self._write_normal_segment_marker(run.run_id)
         self._write_batch_marker(run.run_id, state)
         state = state.model_copy(
@@ -1770,13 +1823,15 @@ class LiveScenarioQueue:
         metadata = self._scenario_metadata_blocker(scenario_id) if scenario_id else None
         if metadata is not None:
             return metadata
-        if self._scenario_domain(scenario_id) not in DOMAIN_REQUIRED_SIGNALS:
+        domain = self._scenario_domain(scenario_id)
+        if domain not in DOMAIN_REQUIRED_SIGNALS:
             return None
-        if self.vm_domain_state is None:
+        gate = self.vm_domain_states.get(domain) or (self.vm_domain_state if domain == VM_DOMAIN else None)
+        if gate is None:
             return None
         held = held_excuses(decoys or [])
         try:
-            detail = self.vm_domain_state(excused=held) if held else self.vm_domain_state()
+            detail = gate(excused=held) if held else gate()
         except Exception as error:
             detail = f"state unreadable: {type(error).__name__}: {error}"
         if detail is None:
@@ -1887,6 +1942,9 @@ class LiveScenarioQueue:
         if verdict is not None:
             self._write_preflight(run.run_id, verdict)
         self._write_archive_state(run.run_id)
+        self._write_vm_pair_state(
+            run.run_id, state.current_scenario_id or state.scenario_ids[state.next_index], state.cycle_decoys
+        )
         # Decoys are final once the buffer opened; bind them to the run so the
         # capture forwards --decoys-json into meta.json.
         self._write_cycle_decoys(run.run_id, state)
@@ -3698,5 +3756,15 @@ def get_live_queue() -> LiveScenarioQueue:
             # CIVIL_PETITION_OPS is on (app.vm_ops runs the management connections and the periodic read).
             domain_preflight_probes=vm_domain_probes() if preflight_probe is not None else {},
             vm_domain_state=(vm_ops.drift_detail if (vm_ops := get_vm_ops()) is not None else None),
+            # S testbed (civil-petition-sms): the same gate on its own VMs, off unless CIVIL_PETITION_SMS_OPS is on.
+            vm_domain_states=(
+                {sms.domain.key: sms.drift_detail} if (sms := get_sms_ops()) is not None else {}
+            ),
+            sms_archive_state_dir=(
+                Path(os.environ["PETITION_SMS_ARCHIVE_STATE_DIR"])
+                if os.environ.get("PETITION_SMS_ARCHIVE_STATE_DIR", "").strip()
+                else None
+            ),
+            vm_pair_state=current_pair_verdict if (vm_ops is not None or sms is not None) else None,
         )
     return _queue

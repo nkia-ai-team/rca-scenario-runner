@@ -1910,3 +1910,111 @@ def test_compose_carries_the_vm_testbed_settings_and_leaves_them_off() -> None:
         ":/opt/lucida/civil-petition-deploy:ro"
     ) in compose
     assert "- CIVIL_PETITION_TARGETS_PATH=/opt/lucida/civil-petition-deploy/inventory/t.targets.json" in compose
+
+
+# --- S testbed (civil-petition-sms, ST4) --------------------------------------------------------------------------
+from tests.test_preflight import SMS_CLEAN  # noqa: E402
+
+
+def _make_domain(runner, domain: str, *scenario_ids: str) -> None:
+    document = json.loads(runner.scenario_metadata_path.read_text())
+    for scenario_id in scenario_ids:
+        document["scenarios"][scenario_id]["domain"] = domain
+    runner.scenario_metadata_path.write_text(json.dumps(document), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_an_s_scenario_uses_s_s_signals_s_drift_gate_and_records_the_pair(tmp_path: Path) -> None:
+    """S design §7-4, §7-6 live_queue row: an S scenario is judged on S's own signal set and drift gate (never T's),
+    and its run keeps pair.json (whether T and S run the same software; never a gate)."""
+    from app.live_queue import VM_DOMAIN_STATE_CHECK_NAME
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    _make_domain(runner, "civil-petition-sms", "F01-R")
+    s_probe, t_probe = FakePreflightProbe(SMS_CLEAN), FakePreflightProbe(VM_CLEAN)
+    queue.domain_preflight_probes = {"civil-petition": t_probe, "civil-petition-sms": s_probe}
+    t_drift, s_drift = [], []
+    queue.vm_domain_state = lambda: t_drift.append(1) or "web01 changed since install: /etc/x"
+    answers = ["dbsvr01 postgresql@16-main.service inactive"]
+    queue.vm_domain_states = {"civil-petition-sms": lambda: s_drift.append(1) or answers[0]}
+    pair = {"pair": False, "differences": ["websvr01/web01: normalized configuration checksums differ"]}
+    queue.vm_pair_state = lambda: dict(pair)
+    await queue.start()
+    state = await queue.tick()
+    assert state.phase == "paused" and runner.started == [] and t_drift == [] and s_drift == [1]
+    assert f"{VM_DOMAIN_STATE_CHECK_NAME}: dbsvr01 postgresql@16-main.service inactive" in (state.reason or "")
+    answers[0] = None
+    await queue.resume()
+    state = await queue.tick()
+    assert runner.started == [("F01-R", "run")], state.reason
+    assert s_probe.calls == 1 and t_probe.calls == 0 and t_drift == []
+    recorded = json.loads((runner.artifact_store.root / "run-F01-R" / "pair.json").read_text())
+    assert recorded == {**pair, "domain": "civil-petition-sms"}
+    verdict = json.loads((runner.artifact_store.root / "run-F01-R" / "preflight.json").read_text())
+    assert not [c for c in verdict["checks"] if c["name"].startswith("router_")]
+
+
+@pytest.mark.asyncio
+async def test_the_pair_record_is_kept_for_vm_testbed_runs_only_and_says_why_when_unreadable(tmp_path: Path) -> None:
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    queue.vm_pair_state = lambda: {"pair": True}
+    await queue.start()
+    state = await queue.tick()
+    assert runner.started == [("F01-R", "run")]
+    assert not (runner.artifact_store.root / "run-F01-R" / "pair.json").exists()  # a Kubernetes domain: no pair
+    queue._write_vm_pair_state("run-x", None)
+    assert not (runner.artifact_store.root / "run-x" / "pair.json").exists()
+    _make_domain(runner, "civil-petition", "F01-R")
+
+    def broken():
+        raise RuntimeError("no fresh read")
+
+    queue.vm_pair_state = broken
+    queue._write_vm_pair_state("run-y", "F01-R")
+    recorded = json.loads((runner.artifact_store.root / "run-y" / "pair.json").read_text())
+    assert recorded["pair"] is False and "no fresh read" in recorded["differences"][0]
+    assert recorded["domain"] == "civil-petition"
+
+
+def test_the_s_archive_state_is_its_own_check_over_the_whole_queue(tmp_path: Path) -> None:
+    """S design §7-4 보관 배치 상태: the same verdict on S's dbsvr01 facts, its own check name, and like T's it holds
+    the whole queue (a recording holds 119 data of every domain)."""
+    from app.live_queue import ARCHIVE_STATE_SMS_CHECK_NAME
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    assert ARCHIVE_STATE_SMS_CHECK_NAME not in queue.readiness().checks
+    (tmp_path / "t").mkdir()
+    (tmp_path / "s").mkdir()
+    t_dir = _archive_facts(tmp_path / "t", clock.value)
+    s_dir = _archive_facts(tmp_path / "s", clock.value, rows=2_400_000)
+    queue.archive_state_dir, queue.sms_archive_state_dir = t_dir, s_dir
+    readiness = queue.readiness()
+    assert readiness.checks[ARCHIVE_STATE_CHECK_NAME] is True
+    assert readiness.missing == [ARCHIVE_STATE_SMS_CHECK_NAME]
+    assert "rows" in readiness.details[ARCHIVE_STATE_SMS_CHECK_NAME]
+    _archive_facts(tmp_path / "s", clock.value)
+    assert queue.readiness().ready
+    queue._write_archive_state("run-z")
+    folder = runner.artifact_store.root / "run-z"
+    assert json.loads((folder / "archive_state.json").read_text())["passes"] is True
+    assert json.loads((folder / "archive_state_sms.json").read_text())["facts"]["host"] == "db01"
+
+
+def test_the_pair_record_excuses_what_held_decoys_left(tmp_path: Path) -> None:
+    """A WAR decoy held through the recording changed the WAR on its node; the pair record judges the testbeds with
+    that file excused on that node, as the drift gate does (ST4 contract 3)."""
+    from app.decoys import DecoyRecord
+
+    queue, runner, _, _, clock = make_queue(tmp_path)
+    _make_domain(runner, "civil-petition-sms", "F01-R")
+    asked = []
+    queue.vm_pair_state = lambda **kwargs: asked.append(kwargs) or {"pair": True}
+    held = DecoyRecord(id="d1", window="normal", planned_at="2026-11-10T01:30:00Z", kind="war_redeploy",
+                       namespace="civil-petition-sms-vm", deployment="petition-wassvr01", node="wassvr01",
+                       service_name="wassvr01", target_id="t", relation="same_domain", value="x", status="held",
+                       changed_paths=["/var/lib/tomcat10/webapps/petition.war"])
+    queue._write_vm_pair_state("run-h", "F01-R", [held])
+    assert asked == [{"excused": {"wassvr01": {"paths": {"/var/lib/tomcat10/webapps/petition.war"}, "guards": 1,
+                                               "ids": ["d1"]}}}]
+    queue._write_vm_pair_state("run-n", "F01-R", [])
+    assert asked[-1] == {}

@@ -3162,3 +3162,4 @@ def test_the_held_guard_reads_the_approved_manifests_where_the_controller_does(t
         assert queue._scenario_max_injection_sec(document["id"]) == expected, document["id"]
         seen.add(expected)
     assert len(seen) > 1, seen
+

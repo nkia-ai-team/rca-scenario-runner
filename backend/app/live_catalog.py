@@ -29,6 +29,8 @@ _DOMAIN_LABELS = {
     "commerce": "Commerce",
     "core-banking": "Core Banking",
     "food-delivery": "Food Delivery",
+    "civil-petition": "Civil Petition",
+    "civil-petition-sms": "Civil Petition (SMS)",
 }
 _UNASSIGNED_DOMAIN = "unassigned"
 # Registry difficulty is a word; the card renders 1~5 stars.

@@ -107,6 +107,12 @@ services:
       - CIVIL_PETITION_SSH_CONTROL_DIR=/app/state/ssh-control
       - CIVIL_PETITION_DEPLOY_DIR=/opt/lucida/civil-petition-deploy
       - CIVIL_PETITION_TARGETS_PATH=/opt/lucida/civil-petition-deploy/inventory/t.targets.json
+      # S 테스트베드(civil-petition-sms, SMS 만) 관리망 운영. VM 5대와 주소는 위 배포 폴더의 inventory/s.json 에서
+      # 읽고(러너에 복제하지 않음, ST4 계약 2), 키와 known_hosts 는 위 키 폴더의 s5-executor, known_hosts_civil-petition-sms.
+      # 터널 값은 T 의 66 읽기를 같이 쓰므로 CIVIL_PETITION_OPS 도 켜야 S preflight 가 판정한다. 비우면 꺼짐.
+      - CIVIL_PETITION_SMS_OPS=${CIVIL_PETITION_SMS_OPS:-}
+      # S 의 보관 배치 상태(같은 판정, 검사 이름 petition_sms_archive_state). 켤 때는 /app/state/vm-ops/civil-petition-sms/petition-archive.
+      - PETITION_SMS_ARCHIVE_STATE_DIR=${PETITION_SMS_ARCHIVE_STATE_DIR:-}
       # 주입 시작 직전 테스트베드 앱 파드(rca-testbed-*, 컨트롤러 소유) 전부 Ready 검사(v4 ORAFIX). 0 이면 꺼짐.
       - DOMAIN_PODS_CHECK=${DOMAIN_PODS_CHECK:-1}
       # 모델 스냅샷 평면. 비우면 auto(워크로드 실재 여부로 판별).

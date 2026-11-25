@@ -1013,3 +1013,186 @@ def test_a_records_rc1_is_excused_only_when_its_own_lines_are_all_the_held_decoy
     document["hosts"]["was01"]["facts"].pop("drift_records")
     ops.load = lambda: document
     assert "was01 /var/lib/petition-deploy/war.sha256 rc=1" in ops.drift_detail(excused=war)
+
+
+# --- S testbed (civil-petition-sms, testbed-services docs/spec-testbed-sms-only.md, ST4) -------------------------
+
+def sms_inventory_document() -> dict:
+    """A test inventory in the shape of testbed-services civil-petition/deploy/inventory/s.json (made-up values
+    where the real file is not needed; the real file is read by the test below when it is next to the runner)."""
+    def host(name, role, addr, mgmt, net="biz"):
+        return {"name": name, "role": role, "nics": [{"net": net, "addr": addr, "ifname": "ens18", "gateway": True},
+                                                      {"net": "mgmt", "addr": mgmt, "ifname": "ens19"}]}
+    return {
+        "schema": "petition-portal-inventory/1", "testbed": "s", "domain": "civil-petition-sms",
+        "accounts": {"executor": {"name": "opsjob", "uid": 1450, "pubkey_file": "~/.config/testbed/s5-executor.pub"}},
+        "app": {"web_port": 80, "context": "petition"},
+        "networks": {"biz": {"cidr": "10.31.0.0/24"}, "user": {"cidr": "10.32.0.0/24"},
+                     "mgmt": {"cidr": "10.33.0.0/24", "management": True}},
+        "router": None,
+        "hosts": [host("websvr01", "web", "10.31.0.11", "10.33.0.11"), host("wassvr01", "was", "10.31.0.21", "10.33.0.21"),
+                  host("wassvr02", "was", "10.31.0.22", "10.33.0.22"), host("dbsvr01", "db", "10.31.0.31", "10.33.0.31"),
+                  host("loadgen", "loadgen", "10.32.0.10", "10.33.0.10", net="user")],
+    }
+
+
+def sms_domain(tmp_path: Path) -> vm_ops.VmDomain:
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps(sms_inventory_document()))
+    return vm_ops.load_inventory_domain(path, key=vm_ops.SMS_DOMAIN)
+
+
+def test_the_s_testbed_is_read_from_its_inventory(tmp_path: Path) -> None:
+    """ST4 contract 2: S's VMs, management addresses, agent names, loadgen, entry, key and known_hosts come from its
+    inventory, nothing copied into the runner. No router, no 66 target, and the CLI is told the domain."""
+    domain = sms_domain(tmp_path)
+    assert domain.key == "civil-petition-sms" and not domain.router and domain.hypervisor_target == ""
+    assert [(h.name, h.address, h.role) for h in domain.hosts] == [
+        ("websvr01", "10.33.0.11", "web"), ("wassvr01", "10.33.0.21", "was"), ("wassvr02", "10.33.0.22", "was"),
+        ("dbsvr01", "10.33.0.31", "db"), ("loadgen", "10.33.0.10", "loadgen")]
+    assert dict(domain.agent_hosts) == {"websvr01": "10.31.0.11", "wassvr01": "10.31.0.21", "wassvr02": "10.31.0.22",
+                                        "dbsvr01": "10.31.0.31"}
+    assert domain.entry_url == "http://10.31.0.11:80/petition"
+    assert domain.loadgen_live_path == "/tmp/k6-civil-petition-sms-live.json"
+    assert domain.cli_args == ("--domain", "civil-petition-sms") and domain.state_subdir == "civil-petition-sms"
+    web = domain.host("websvr01")
+    assert web.key == vm_ops.KEY_DIR / "s5-executor" and web.user == "opsjob"
+    assert web.known_hosts == vm_ops.KEY_DIR / "known_hosts_civil-petition-sms"
+    assert web.units == vm_ops.ROLE_UNITS["web"] and web.files == vm_ops.PAIR_FILES
+    assert dict(domain.host("dbsvr01").files)["archive_state"] == vm_ops.ARCHIVE_FACTS_PATH
+    assert domain.host("loadgen").files == (("loadgen_live", "/tmp/k6-civil-petition-sms-live.json"),)
+    argv = vm_ops.executor_argv(web)
+    assert "UserKnownHostsFile=" + str(vm_ops.KEY_DIR / "known_hosts_civil-petition-sms") in argv
+    assert str(vm_ops.KEY_DIR / "s5-executor") in argv and argv[-5] == "opsjob@10.33.0.11"
+
+
+def test_an_inventory_that_does_not_fit_is_refused(tmp_path: Path) -> None:
+    document = sms_inventory_document()
+    path = tmp_path / "s.json"
+    for change, words in (
+        (lambda d: d.update(domain="civil-petition"), "not 'civil-petition-sms'"),
+        (lambda d: d["hosts"][0]["nics"].append({"net": "mgmt", "addr": "x"}), "2 management NICs"),
+        (lambda d: d["networks"]["mgmt"].pop("management"), "0 management NICs"),
+        (lambda d: d["hosts"][1]["nics"][0].pop("gateway"), "wassvr01 has no gateway NIC"),
+        (lambda d: d["hosts"][0].update(role="cache"), "unknown role"),
+        (lambda d: d["accounts"]["executor"].update(pubkey_file="k"), "does not end in .pub"),
+        (lambda d: d["hosts"].pop(), "one web VM and a loadgen VM"),
+        (lambda d: d.pop("app"), "unreadable"),
+    ):
+        changed = json.loads(json.dumps(document))
+        change(changed)
+        path.write_text(json.dumps(changed))
+        with pytest.raises(VmOpsError, match=words):
+            vm_ops.load_inventory_domain(path, key=vm_ops.SMS_DOMAIN)
+
+
+INVENTORY_DIR = Path(__file__).resolve().parents[2].parent / "testbed-services/civil-petition/deploy/inventory"
+
+
+def test_the_real_inventories_give_s_and_t_as_the_runner_reads_them() -> None:
+    """The real s.json reads as five S VMs on the S management network; the real t.json, read the same way, gives
+    exactly T's fixed table (so the loader's rules are T's rules, and T's table has not drifted from its inventory)."""
+    if not (INVENTORY_DIR / "s.json").is_file():
+        pytest.skip("testbed-services inventories are not checked out next to the runner")
+    s = vm_ops.load_inventory_domain(INVENTORY_DIR / "s.json", key=vm_ops.SMS_DOMAIN)
+    assert [h.name for h in s.hosts] == ["websvr01", "wassvr01", "wassvr02", "dbsvr01", "loadgen"]
+    assert all(h.address.startswith("192.168.133.") for h in s.hosts)
+    assert sorted(s.agent_hosts.values()) == ["192.168.131.11", "192.168.131.21", "192.168.131.22", "192.168.131.31"]
+    assert s.entry_url == "http://192.168.131.11:80/petition" and not s.router
+    t = vm_ops.load_inventory_domain(INVENTORY_DIR / "t.json", key=vm_ops.DOMAIN)
+    fixed = vm_ops.T_DOMAIN
+    assert [(h.name, h.address, h.role, h.units, h.files, h.user, h.key, h.known_hosts) for h in t.hosts] == [
+        (h.name, h.address, h.role, h.units, h.files, h.user, h.key, h.known_hosts) for h in fixed.hosts]
+    assert dict(t.agent_hosts) == dict(fixed.agent_hosts) and t.entry_url == fixed.entry_url and t.router
+    assert vm_ops.server_pairs(fixed, s) == [("db01", "dbsvr01"), ("was01", "wassvr01"), ("was02", "wassvr02"),
+                                             ("web01", "websvr01")]
+
+
+def _pair_ops(tmp_path: Path, t_out: dict, s_out: dict, *, s_age_min: int = 0):
+    """T and S VmOps after one periodic read each; t_out/s_out give _read_output overrides per VM name."""
+    remote_t, remote_s = FakeRemote(), FakeRemote()
+    clock = Clock()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    domain = sms_domain(tmp_path)
+    war = {"pair_war": "4f3c  petition.war\n"}
+    for host in HOSTS:
+        remote_t.outputs[host.address] = _read_output(host, **{"files": war, **t_out.get(host.name, {})})
+    for host in domain.hosts:
+        remote_s.outputs[host.address] = _read_output(host, **{"files": war, **s_out.get(host.name, {})})
+    t_ops = _ops(tmp_path / "t", remote_t, clock)
+    s_ops = VmOps(domain=domain, process_runner=remote_s, clock=clock, state_dir=tmp_path / "s",
+                  supervisor=MasterSupervisor(domain.hosts, process_runner=remote_s, clock=clock,
+                                              state_dir=tmp_path / "s", control_dir=tmp_path / "cms",
+                                              popen=lambda *a, **k: None))
+    t_ops.read_all()
+    clock.value -= timedelta(minutes=s_age_min)
+    s_ops.read_all()
+    clock.value += timedelta(minutes=s_age_min)
+    return t_ops, s_ops
+
+
+def test_the_pair_holds_only_when_both_testbeds_run_what_one_build_installed(tmp_path: Path) -> None:
+    """ST4 contract 3 (S design §2-4 condition 1, §7-4): on fresh reads of both testbeds every server passes its
+    install records with nothing changed, and the four WAS carry one WAR record line. Anything else is «no pair»
+    with why; a held decoy's file is excused as in the drift gate."""
+    t_ops, s_ops = _pair_ops(tmp_path / "a", {}, {})
+    verdict = vm_ops.pair_verdict(t_ops, s_ops)
+    assert verdict["pair"] is True and verdict["differences"] == [], verdict
+    assert len(verdict["servers"]) == 8
+
+    site = "/etc/apache2/sites-available/petition.conf"
+    drifted = {"websvr01": {"sums": {"/var/lib/petition-deploy/expected.sha256": "rc=1"}, "drift": (site,)}}
+    cases = {
+        "websvr01 changed since install: " + site: ({}, drifted),
+        "WAR record differs": ({}, {"wassvr02": {"files": {"pair_war": "9a9a  petition.war\n"}}}),
+        "no WAR record on was01": ({"was01": {"files": {}}}, {}),
+        "db01 /var/lib/petition-deploy/expected.sha256 rc=1": (
+            {"db01": {"sums": {"/var/lib/petition-deploy/expected.sha256": "rc=1"}}}, {}),
+        "wassvr01 tomcat10.service failed": ({}, {"wassvr01": {"units": {"tomcat10.service": "failed"}}}),
+    }
+    for index, (words, (t_out, s_out)) in enumerate(cases.items()):
+        t_ops, s_ops = _pair_ops(tmp_path / f"c{index}", t_out, s_out)
+        verdict = vm_ops.pair_verdict(t_ops, s_ops)
+        assert verdict["pair"] is False and any(words in item for item in verdict["differences"]), (words, verdict)
+    t_ops, s_ops = _pair_ops(tmp_path / "held", {}, drifted)
+    held = {"websvr01": {"paths": {site}, "guards": 1}}
+    assert vm_ops.pair_verdict(t_ops, s_ops, excused=held)["pair"] is True
+    t_ops, s_ops = _pair_ops(tmp_path / "stale", {}, {}, s_age_min=30)
+    verdict = vm_ops.pair_verdict(t_ops, s_ops)
+    assert verdict["pair"] is False and "websvr01: no fresh periodic read" in verdict["differences"]
+
+
+def test_the_pair_is_no_pair_with_why_while_either_testbed_is_off(monkeypatch) -> None:
+    monkeypatch.setattr(vm_ops, "get_vm_ops", lambda: None)
+    monkeypatch.setattr(vm_ops, "get_sms_ops", lambda: None)
+    verdict = vm_ops.current_pair_verdict()
+    assert verdict["pair"] is False and "civil-petition, civil-petition-sms" in verdict["differences"][0]
+
+
+def test_s_reads_its_own_vms_with_its_own_cli_domain_and_state(tmp_path: Path, monkeypatch) -> None:
+    """The S VmOps reads only S's five VMs (no 66: S has no executors there), keeps its facts and routine in its own
+    folder, gives the S db VM's archive line to its own archive folder, and tells the operator CLI the domain."""
+    monkeypatch.setattr(vm_ops, "STATE_DIR", tmp_path / "state")
+    domain = sms_domain(tmp_path)
+    remote = FakeRemote()
+    for host in domain.hosts:
+        remote.outputs[host.address] = _read_output(host, files={"archive_state": '{"ok": 1}'})
+    ops = VmOps(domain=domain, process_runner=remote, clock=Clock(), archive_state_dir=tmp_path / "archive",
+                supervisor=MasterSupervisor(domain.hosts, process_runner=remote, clock=Clock(),
+                                            state_dir=tmp_path / "x", control_dir=tmp_path / "cm",
+                                            popen=lambda *a, **k: None))
+    assert ops.state_dir == tmp_path / "state" / "civil-petition-sms" and ops.hypervisor_target == ""
+    ops.read_all()
+    targets = {argv[-5] for argv, _ in remote.calls if "-O" not in argv}
+    assert targets == {f"opsjob@{h.address}" for h in domain.hosts}
+    assert not any(argv[-1].startswith("hvjob@") for argv, _ in remote.calls)
+    assert json.loads((tmp_path / "archive" / "last.json").read_text()) == {"ok": 1}
+    calls = []
+    routine = vm_ops.OperatorRoutine(process_runner=lambda argv, **k: calls.append(argv) or subprocess.CompletedProcess(
+        argv, 0, '["websvr01"]', ""), state_dir=tmp_path, cli_args=domain.cli_args, clock=Clock())
+    assert routine.nodes() == ("websvr01",)
+    assert calls[0][2:] == ["--domain", "civil-petition-sms", "--list-nodes"]
+    # Only the node list names the domain; a session names its node (unique across the testbeds, ST4 contract 2).
+    routine._call(["--node", "websvr01", "--check"])
+    assert calls[1][2:] == ["--node", "websvr01", "--check"]
+    assert ops.routine.cli_args == ("--domain", "civil-petition-sms")

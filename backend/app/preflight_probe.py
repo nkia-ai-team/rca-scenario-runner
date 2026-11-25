@@ -220,9 +220,11 @@ def router_target_id(path: Path = VM_DOMAIN_TARGETS_PATH) -> str:
 
 
 class VmDomainPreflightProbe:
-    """§6-4 signals for the VM testbed. Same interface as ProductionPreflightProbe."""
+    """§6-4 signals for a VM testbed (T, and S with S design §7-4). Same interface as ProductionPreflightProbe.
 
-    domain = "civil-petition"
+    The domain comes from its VmOps. A testbed without a router (S) has no router rows. A testbed without 66
+    executors (S) reads the tunnel through ``tunnel_ops`` (T's VmOps: the same 66 end, the same helper) and counts
+    only its own VMs' guards."""
 
     def __init__(
         self,
@@ -233,8 +235,11 @@ class VmDomainPreflightProbe:
         urlopen=None,
         incident_count=None,
         targets_path: Path | None = None,
+        tunnel_ops: "_vm_ops.VmOps | None" = None,
     ) -> None:
         self.ops = ops
+        self.domain = ops.domain.key
+        self.tunnel_ops = tunnel_ops if tunnel_ops is not None else ops
         self.base = base or ProductionPreflightProbe(vm_url=vm_url, urlopen=urlopen)
         self.vm_url = (vm_url or self.base.vm_url).rstrip("/")
         self.urlopen = urlopen or self.base.urlopen
@@ -266,7 +271,9 @@ class VmDomainPreflightProbe:
                 f"loadgen live summary has no requests in its window (http_count={document.get('http_count')})"
             )
         facts = self._fresh_facts(now)
-        hypervisor = self.ops.hypervisor_facts()
+        if not self.tunnel_ops.hypervisor_target:
+            raise _vm_ops.VmOpsError(f"{self.domain}: no 66 read for the tunnel (the T testbed's operations are off)")
+        hypervisor = self.tunnel_ops.hypervisor_facts()
         handshake = hypervisor.get("handshake_age_sec")
         ping = hypervisor.get("ping") or {}
         sent, received = int(ping.get("sent", 0)), int(ping.get("received", 0))
@@ -290,8 +297,12 @@ class VmDomainPreflightProbe:
             max(0, max(int(f["guards_armed"]), int(f["guard_timers"])) - int((self.held.get(host) or {}).get("guards", 0)))
             for host, f in facts.items()
         )
-        guards += int(hypervisor.get("guards_active", 0))
+        if self.tunnel_ops is self.ops:
+            # 66's guards belong to this domain's 66 executors (T); S has none there.
+            guards += int(hypervisor.get("guards_active", 0))
         freshness = self._freshness()
+        tunnel_load = self._tunnel_load_mbps()
+        router = {"router_cpu_pct": self._router_cpu_pct()} if self.ops.domain.router else {}
         return {
             "baseline_loadgen_alive": 1.0 if alive else 0.0,
             "achieved_rps": float(document.get("achieved_rps", 0.0)),
@@ -309,9 +320,9 @@ class VmDomainPreflightProbe:
             ),
             "tunnel_ping_lost": float(sent - received),
             "tunnel_ping_max_ms": float(max_ms) if max_ms is not None else TUNNEL_NEVER_SEC,
-            "tunnel_load_mbps": self._tunnel_load_mbps(),
+            "tunnel_load_mbps": tunnel_load,
             **freshness,
-            "router_cpu_pct": self._router_cpu_pct(),
+            **router,
             "mgmt_ssh_down": float(down),
             "mgmt_ssh_settle_sec": settle,
             "clock_offset_ms": max(_vm_ops.chrony_offset_ms(f["chrony"]) for f in facts.values()),
@@ -343,7 +354,7 @@ class VmDomainPreflightProbe:
         return facts
 
     def _tunnel_load_mbps(self) -> float:
-        history = self.ops.load()["hypervisor"].get("history") or []
+        history = self.tunnel_ops.load()["hypervisor"].get("history") or []
         if not history:
             raise _vm_ops.VmOpsError("no tunnel counter samples")
         latest = history[-1]
@@ -388,7 +399,7 @@ class VmDomainPreflightProbe:
         return {row["metric"].get("host_name", ""): float(row["value"][1]) for row in self._vm_vector(promql)}
 
     def _freshness(self) -> dict[str, float]:
-        hosts = sorted(_vm_ops.SERVER_AGENT_HOSTS.values())
+        hosts = sorted(self.ops.domain.agent_hosts.values())
         selector = "|".join(re.escape(host) for host in hosts)
         lookback = f"[{FRESHNESS_LOOKBACK_SEC}s]"
         missing_age = float(FRESHNESS_LOOKBACK_SEC + 1)
@@ -403,6 +414,13 @@ class VmDomainPreflightProbe:
         icmp_last = self._by_host(
             f'max by (host_name) (last_over_time({{__name__="sms.server.icmp_status",host_name=~"{selector}"}}{lookback}))'
         )
+        servers = {
+            "sms_cpu_sample_age_sec": max(cpu_ages.get(host, missing_age) for host in hosts),
+            "sms_icmp_down": float(sum(1 for host in hosts if icmp_last.get(host) != 1.0)),
+            "sms_icmp_sample_age_sec": max(icmp_ages.get(host, missing_age) for host in hosts),
+        }
+        if not self.ops.domain.router:
+            return servers
         router = router_target_id(self.targets_path)
         router_age = self._vm_vector(
             f'time() - max(tlast_over_time({{__name__="nms.network.snmp_status",target_id="{router}"}}{lookback}))'
@@ -411,17 +429,31 @@ class VmDomainPreflightProbe:
             f'max(last_over_time({{__name__="nms.network.snmp_status",target_id="{router}"}}{lookback}))'
         )
         return {
-            "sms_cpu_sample_age_sec": max(cpu_ages.get(host, missing_age) for host in hosts),
-            "sms_icmp_down": float(sum(1 for host in hosts if icmp_last.get(host) != 1.0)),
-            "sms_icmp_sample_age_sec": max(icmp_ages.get(host, missing_age) for host in hosts),
+            **servers,
             "router_snmp_down": 0.0 if router_last and float(router_last[0]["value"][1]) == 1.0 else 1.0,
             "router_snmp_sample_age_sec": float(router_age[0]["value"][1]) if router_age else missing_age,
         }
 
 
 def vm_domain_probes() -> dict[str, VmDomainPreflightProbe]:
-    """Domain -> preflight probe for the VM testbed when its operations are on (CIVIL_PETITION_OPS)."""
+    """Domain -> preflight probe for each VM testbed whose operations are on (CIVIL_PETITION_OPS for T,
+    CIVIL_PETITION_SMS_OPS for S). S reads the tunnel through T's 66 read; with T off its probe raises with why."""
+    probes: dict[str, VmDomainPreflightProbe] = {}
     ops = _vm_ops.get_vm_ops()
-    if ops is None:
-        return {}
-    return {VmDomainPreflightProbe.domain: VmDomainPreflightProbe(ops=ops)}
+    if ops is not None:
+        probes[ops.domain.key] = VmDomainPreflightProbe(ops=ops)
+    sms = _vm_ops.get_sms_ops()
+    if sms is not None:
+        probes[sms.domain.key] = VmDomainPreflightProbe(
+            ops=sms, tunnel_ops=ops if ops is not None else _NoTunnel(sms)
+        )
+    return probes
+
+
+class _NoTunnel:
+    """Stands in for T's VmOps when only S is on: no 66 read, so the S preflight stops with why."""
+
+    hypervisor_target = ""
+
+    def __init__(self, ops: "_vm_ops.VmOps") -> None:
+        self.domain = ops.domain

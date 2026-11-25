@@ -279,7 +279,16 @@ VM_DOMAIN_REQUIRED_SIGNALS: frozenset[str] = frozenset(
         "operator_routine_age_sec",
     }
 )
-DOMAIN_REQUIRED_SIGNALS: dict[str, frozenset[str]] = {VM_DOMAIN: VM_DOMAIN_REQUIRED_SIGNALS}
+# The S testbed (testbed-services docs/spec-testbed-sms-only.md §7-4): the T set without the router rows (S has no
+# router, decision 3). The tunnel is T's (the same 66 end), the guards are the five S VMs', the management connections
+# are the five S VMs'; every other row is the same check on S's own VMs.
+SMS_VM_DOMAIN = "civil-petition-sms"
+ROUTER_SIGNALS: frozenset[str] = frozenset({"router_snmp_down", "router_snmp_sample_age_sec", "router_cpu_pct"})
+SMS_VM_DOMAIN_REQUIRED_SIGNALS: frozenset[str] = VM_DOMAIN_REQUIRED_SIGNALS - ROUTER_SIGNALS
+DOMAIN_REQUIRED_SIGNALS: dict[str, frozenset[str]] = {
+    VM_DOMAIN: VM_DOMAIN_REQUIRED_SIGNALS,
+    SMS_VM_DOMAIN: SMS_VM_DOMAIN_REQUIRED_SIGNALS,
+}
 
 
 def required_signals(domain: str | None = None) -> frozenset[str]:
@@ -303,7 +312,7 @@ def build_preflight_checks(
     if missing:
         raise ValueError(f"preflight is missing required signals: {sorted(missing)}")
     if domain in DOMAIN_REQUIRED_SIGNALS:
-        return _vm_domain_checks(observations)
+        return [check for check in _vm_domain_checks(observations, required) if check is not None]
     return [
         # baseline loadgen must be alive (1 = present).
         PreflightCheckInput(
@@ -360,8 +369,15 @@ def build_preflight_checks(
     ]
 
 
-def _vm_domain_checks(observations: Mapping[str, float]) -> list[PreflightCheckInput]:
-    def check(name: str, threshold: float, op: Op, *, key: str | None = None, tolerance: float = 0.0) -> PreflightCheckInput:
+def _vm_domain_checks(
+    observations: Mapping[str, float], required: frozenset[str] = VM_DOMAIN_REQUIRED_SIGNALS
+) -> list[PreflightCheckInput | None]:
+    """Every VM-testbed check; a row whose signal the domain does not require (S: the router rows) is None."""
+    def check(
+        name: str, threshold: float, op: Op, *, key: str | None = None, tolerance: float = 0.0
+    ) -> PreflightCheckInput | None:
+        if (key or name) not in required:
+            return None
         return PreflightCheckInput(
             name=name, value=float(observations[key or name]), threshold=threshold, op=op, tolerance=tolerance
         )

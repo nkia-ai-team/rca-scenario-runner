@@ -2428,3 +2428,71 @@ def test_vm_reads_refuse_without_a_master_instead_of_logging_in(tmp_path, monkey
     entry = probes.inspect(_eligibility(checks=["vm-entry-health"])).check_results["vm-entry-health"]
     assert baseline["quality"] != "good" and host["quality"] != "good" and entry is False
     assert [argv for argv, _ in fakes.process_calls if "-O" not in argv and any(a.startswith("opsjob@") for a in argv)] == []
+
+
+# --- S testbed (civil-petition-sms, ST4: S design §7-6 live_probes row) ---------------------------------------------
+
+class _SmsFakes(_VmFakes):
+    def __init__(self) -> None:
+        super().__init__()
+        self.vm_live = {**self.vm_live, "domain": "civil-petition-sms", "achieved_rps": 16.0}
+
+    def process(self, argv, **kwargs):
+        if any(str(item).startswith("opsjob@") for item in argv) and "-O" not in argv:
+            body = kwargs["input"].decode()
+            if body.startswith("cat -- /tmp/k6-civil-petition-sms-live.json"):
+                self.process_calls.append((list(argv), kwargs))
+                return subprocess.CompletedProcess(list(argv), 0, json.dumps(self.vm_live).encode(), b"")
+        return super().process(argv, **kwargs)
+
+
+@pytest.fixture
+def sms_on(tmp_path, monkeypatch):
+    from app import vm_ops
+    from tests.test_vm_ops import sms_domain
+
+    ops = vm_ops.VmOps(domain=sms_domain(tmp_path), state_dir=tmp_path / "s-ops")
+    monkeypatch.setattr(vm_ops, "sms_enabled", lambda: True)
+    monkeypatch.setattr(vm_ops, "_sms_ops", ops)
+    return ops
+
+
+def test_s_baseline_entry_and_host_probes_go_to_s_s_own_vms(tmp_path, monkeypatch, sms_on) -> None:
+    """S's loadgen summary, entry health and host probes run on S's VMs from its inventory, as the executor account
+    over S's always-open connections with S's known_hosts; never on T's VMs."""
+    from app import live_probes
+
+    assert "civil-petition-sms" in live_probes.APPROVED_LOADGEN_DOMAINS
+    assert "civil-petition-sms" in live_probes.VM_LOADGEN_DOMAINS
+    fakes = _SmsFakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    observation = probes.observe(
+        registry.bind({"query_id": "loadgen.achieved_rps", "parameters": {"domain": "civil-petition-sms"}})
+    )
+    assert observation["quality"] == "good" and observation["value"] == 16.0, observation
+    argv, kwargs = [c for c in fakes.process_calls if "-O" not in c[0]][-1]
+    assert "opsjob@10.33.0.10" in argv and kwargs["input"] == b"cat -- /tmp/k6-civil-petition-sms-live.json\n"
+    assert any("known_hosts_civil-petition-sms" in item for item in argv)
+    assert probes.inspect(_eligibility(checks=["vm-sms-entry-health"])).check_results["vm-sms-entry-health"] is True
+    argv, kwargs = fakes.process_calls[-1]
+    assert "opsjob@10.33.0.10" in argv
+    assert kwargs["input"] == b"curl -sS -m 5 -o /dev/null -w '%{http_code}' http://10.31.0.11:80/petition/api/health\n"
+    monkeypatch.setitem(live_probes.HOST_PROBE_CONTRACTS, "F99-X", ("10.33.0.31", "fio", "/pgdata"))
+    probes = _probes(tmp_path, fakes, scenario_id="F99-X")
+    host = probes.observe(registry.bind({"query_id": "host.scenario_active", "parameters": {"scenario_id": "F99-X"}}))
+    assert host["quality"] == "good"
+    argv, _ = fakes.process_calls[-1]
+    assert "opsjob@10.33.0.31" in argv and not any(item.startswith("opsjob@192.168.127.") for item in argv)
+
+
+def test_s_probes_refuse_while_s_s_operations_are_off(tmp_path) -> None:
+    fakes = _SmsFakes()
+    probes = _probes(tmp_path, fakes)
+    registry = ApprovedQueryRegistry.from_path()
+    observation = probes.observe(
+        registry.bind({"query_id": "loadgen.achieved_rps", "parameters": {"domain": "civil-petition-sms"}})
+    )
+    assert observation["quality"] != "good"
+    assert probes.inspect(_eligibility(checks=["vm-sms-entry-health"])).check_results["vm-sms-entry-health"] is False
+    assert [argv for argv, _ in fakes.process_calls if any(str(a).startswith("opsjob@") for a in argv)] == []

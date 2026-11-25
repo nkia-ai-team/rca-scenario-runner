@@ -20,7 +20,7 @@ from app.watchdog import WatchdogDecision, WatchdogRequest, decide_watchdog
 from app.live_queue import LiveQueueState, OperationalReadiness, get_live_queue
 from app.pass_mode import isolation_checks_enabled
 from app.restart_recovery import recover_after_restart
-from app.vm_ops import get_vm_ops_service
+from app.vm_ops import get_sms_ops_service, get_vm_ops_service
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +50,10 @@ async def lifespan(_: FastAPI):
     runner.cleanup_retry_hold = lambda: get_live_queue().injection_reserved
     runner.ensure_capture_worker()
     runner.ensure_watchdog_worker()
-    # VM testbed management connections and periodic read (off unless CIVIL_PETITION_OPS is on).
-    vm_ops_service = get_vm_ops_service()
-    if vm_ops_service is not None:
+    # VM testbed management connections and periodic read: T unless CIVIL_PETITION_OPS is off, S unless
+    # CIVIL_PETITION_SMS_OPS is off (both off by default).
+    vm_ops_services = [service for service in (get_vm_ops_service(), get_sms_ops_service()) if service is not None]
+    for vm_ops_service in vm_ops_services:
         vm_ops_service.ensure_started()
     get_live_queue().ensure_worker()
     try:
@@ -60,7 +61,7 @@ async def lifespan(_: FastAPI):
     finally:
         # First: the masters end with -O exit before docker's stop grace runs out (a SIGKILLed master leaves its
         # socket file on the state volume).
-        if vm_ops_service is not None:
+        for vm_ops_service in vm_ops_services:
             await vm_ops_service.stop()
         await get_live_queue().stop_worker()
         await runner.stop_capture_worker()

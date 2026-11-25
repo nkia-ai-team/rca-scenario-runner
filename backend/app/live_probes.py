@@ -72,19 +72,42 @@ LOADGEN_FIELDS = {
 # blocked F15-G/T3/T4 and forced surge scripts to double as observation vehicles.
 # Deliberately not a new id space: 10 fields x 3 domains would fork LOADGEN_FIELDS,
 # and a forked allowlist is exactly what killed F06-P.
-APPROVED_LOADGEN_DOMAINS = frozenset({"commerce", "core-banking", "food-delivery", "civil-petition"})
+APPROVED_LOADGEN_DOMAINS = frozenset(
+    {"commerce", "core-banking", "food-delivery", "civil-petition", "civil-petition-sms"}
+)
 # Traditional VM testbed (testbed-services docs/spec-testbed-vm-3tier.md §6-6 live_probes row). Its loadgen is a VM on
 # that testbed's management network: the runner reaches it, and every other VM of the domain, only as the executor
 # account over the always-open connection (app.vm_ops), never as nkia@ with tb_key. Kubernetes checks (kube-*,
 # worker placement, the domain pods gate) stay with the Kubernetes domains.
-VM_LOADGEN_DOMAINS = frozenset({vm_ops.DOMAIN})
-# Management address per VM: the only hosts a VM-domain host probe may reach.
+VM_LOADGEN_DOMAINS = frozenset({vm_ops.DOMAIN, vm_ops.SMS_DOMAIN})
+# Management address per VM: the only hosts a VM-domain host probe may reach (T fixed here; the S testbed's come from
+# its inventory while its operations are on, _approved_vm_host).
 APPROVED_VM_HOSTS = {host.name: host.address for host in vm_ops.HOSTS}
 # The portal's entry as the loadgen calls it (inventory: web01 business address, web_port 80, context petition).
 # The runner cannot reach the business networks (66 drops 192.168.122.0/24 <-> 123~126), so the check runs on the
-# loadgen VM over the management connection.
-VM_DOMAIN_ENTRY_URL = "http://192.168.124.11:80/petition"
+# loadgen VM over the management connection. S's entry comes from its inventory (vm_ops.VmDomain.entry_url).
+VM_DOMAIN_ENTRY_URL = vm_ops.ENTRY_URL
 TARGET_HEALTH_URL = "http://192.168.122.77:30080/health"
+
+
+def _vm_domain(domain: str) -> "vm_ops.VmDomain":
+    """The VM testbed a domain names: T fixed, S from its inventory while CIVIL_PETITION_SMS_OPS is on."""
+    found = vm_ops.vm_domain_of(domain)
+    if found is None:
+        raise LiveProbeError(f"{domain} is not a VM testbed whose operations are on")
+    return found
+
+
+def _approved_vm_host(address: str) -> "vm_ops.VmHost | None":
+    """The VM a host probe contract names by management address: T's fixed table, then S's inventory when on."""
+    for name, approved in APPROVED_VM_HOSTS.items():
+        if approved == address:
+            return vm_ops.HOSTS_BY_NAME[name]
+    sms = vm_ops.vm_domain_of(vm_ops.SMS_DOMAIN) if vm_ops.sms_enabled() else None
+    for host in sms.hosts if sms is not None else ():
+        if host.address == address:
+            return host
+    return None
 PROMETHEUS_URL = os.environ.get(
     "PROMETHEUS_URL", "http://192.168.230.119:18428/api/v1/query"
 )
@@ -165,6 +188,8 @@ APPROVED_CHECK_IDS = frozenset(
         "target-health",
         # The VM testbed's entry answers its health path (curl from the loadgen VM, VM_DOMAIN_ENTRY_URL).
         "vm-entry-health",
+        # The same for the S testbed (its loadgen VM, its entry from its inventory).
+        "vm-sms-entry-health",
         # F05-P starves a worker node's memory and then measures the impact on
         # the services that node hosts. If they are not on it, the scenario is
         # a no-op that cannot fail loudly. The manifest has asked for this check
@@ -1113,6 +1138,7 @@ class LiveProbeSet:
             "baseline-business-success": self._baseline_business_succeeds,
             "target-health": self._target_healthy,
             "vm-entry-health": self._vm_entry_healthy,
+            "vm-sms-entry-health": lambda: self._vm_entry_healthy(vm_ops.SMS_DOMAIN),
             "worker-cohort-placement": self._worker_cohort_is_placed,
             "db-memory-headroom": self._db_memory_has_headroom,
         }
@@ -1446,14 +1472,14 @@ class LiveProbeSet:
         response = self.http_client("GET", TARGET_HEALTH_URL, timeout=5.0)
         return 200 <= int(response["status"]) < 300
 
-    def _vm_read(self, host_name: str, body: bytes) -> bytes:
-        """One read on a VM of the VM testbed, as the executor account over the shared socket, only while its
+    def _vm_read(self, host_name: str, body: bytes, domain: str = vm_ops.DOMAIN) -> bytes:
+        """One read on a VM of a VM testbed, as the executor account over the shared socket, only while its
         master is up (review rv-t4r3 R-M1: never a direct login in its place)."""
-        host = vm_ops.HOSTS_BY_NAME[host_name]
+        host = _vm_domain(domain).host(host_name)
         if vm_ops.master_is_up(host, self.process_runner) is not True:
             raise LiveProbeError(f"control connection to {host.address} is down; not reading {host_name} without it")
         completed = self.process_runner(
-            vm_ops.executor_argv(vm_ops.HOSTS_BY_NAME[host_name]),
+            vm_ops.executor_argv(host),
             input=body,
             check=True,
             capture_output=True,
@@ -1463,13 +1489,15 @@ class LiveProbeSet:
         )
         return completed.stdout
 
-    def _vm_entry_healthy(self) -> bool:
+    def _vm_entry_healthy(self, domain: str = vm_ops.DOMAIN) -> bool:
+        entry = VM_DOMAIN_ENTRY_URL if domain == vm_ops.DOMAIN else _vm_domain(domain).entry_url
         body = (
             "curl -sS -m 5 -o /dev/null -w '%{http_code}' "
-            + shlex.quote(f"{VM_DOMAIN_ENTRY_URL}/api/health")
+            + shlex.quote(f"{entry}/api/health")
             + "\n"
         ).encode()
-        status = self._vm_read("loadgen", body).decode("utf-8", "replace").strip()
+        loadgen = _vm_domain(domain).role_host("loadgen").name
+        status = self._vm_read(loadgen, body, domain).decode("utf-8", "replace").strip()
         if not status.isdigit():
             raise LiveProbeError(f"entry health returned no status: {status[:80]!r}")
         return 200 <= int(status) < 300
@@ -2369,11 +2397,11 @@ class LiveProbeSet:
         if scenario_id not in HOST_PROBE_CONTRACTS:
             raise LiveProbeError("host probe scenario is not allowlisted")
         host, mode, target = HOST_PROBE_CONTRACTS[str(scenario_id)]
-        vm_host = next((name for name, address in APPROVED_VM_HOSTS.items() if address == host), None)
-        if vm_host is not None and vm_ops.master_is_up(vm_ops.HOSTS_BY_NAME[vm_host], self.process_runner) is not True:
-            raise LiveProbeError(f"control connection to {host} is down; not probing {vm_host} without it")
+        vm_host = _approved_vm_host(host)
+        if vm_host is not None and vm_ops.master_is_up(vm_host, self.process_runner) is not True:
+            raise LiveProbeError(f"control connection to {host} is down; not probing {vm_host.name} without it")
         result = self.process_runner(
-            vm_ops.executor_argv(vm_ops.HOSTS_BY_NAME[vm_host])
+            vm_ops.executor_argv(vm_host)
             if vm_host is not None
             else [
                 "ssh", "-i", LOADGEN_KEY, "-o", "BatchMode=yes",
@@ -2521,7 +2549,10 @@ class LiveProbeSet:
             document = _read_json(local)
         elif domain in VM_LOADGEN_DOMAINS:
             # The domain's loadgen VM writes the same summary (testbed-services loadgen_monitor) under the same name.
-            raw = self._vm_read("loadgen", f"cat -- /tmp/k6-{domain}-live.json\n".encode())
+            vm_domain = _vm_domain(domain)
+            raw = self._vm_read(
+                vm_domain.role_host("loadgen").name, f"cat -- {vm_domain.loadgen_live_path}\n".encode(), domain
+            )
             document = json.loads(raw.decode("utf-8"))
         else:
             completed = self.process_runner(

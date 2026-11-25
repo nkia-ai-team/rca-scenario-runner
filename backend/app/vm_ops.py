@@ -95,9 +95,8 @@ HYPERVISOR_TARGET = "hvjob@192.168.122.1"
 # The helper is rendered from the inventory at apply time (no file with addresses lives in the repository), so the
 # repository keeps its expected checksums in one file (T4S): {"files": {"t4-hv-exec": "<sha256>", ...}}, the same
 # shape the helper's `version` verb prints. Read from the testbed-services deploy directory mounted into the runner.
-HELPER_CHECKSUMS = Path(
-    os.environ.get("CIVIL_PETITION_DEPLOY_DIR", "/opt/lucida/civil-petition-deploy")
-) / "hypervisor" / "t4-hv-exec.sha256.json"
+DEPLOY_DIR = Path(os.environ.get("CIVIL_PETITION_DEPLOY_DIR", "/opt/lucida/civil-petition-deploy"))
+HELPER_CHECKSUMS = DEPLOY_DIR / "hypervisor" / "t4-hv-exec.sha256.json"
 HELPER_FILES = ("t4-hv-exec", "t4-hv-exec-root")
 
 
@@ -113,22 +112,34 @@ class VmHost:
     files: tuple[tuple[str, str], ...] = ()
     user: str = EXECUTOR_USER
     key: Path = EXECUTOR_KEY
+    # The domain's known_hosts file (each VM testbed has its own; ssh_options).
+    known_hosts: Path = KNOWN_HOSTS
 
 
 # Inventory civil-petition/deploy/inventory/t.json (hosts, management NIC addresses) and the role units the T2
 # install starts. Fixed here like every other runner allowlist: a scenario cannot name another host.
 LOADGEN_LIVE_PATH = f"/tmp/k6-{DOMAIN}-live.json"
 ARCHIVE_FACTS_PATH = "/var/lib/pg-table-stats/last.json"
+# The pair condition 1 record the runner compares across T and S (ST4 contract 3): the WAR record line, read whole
+# from every server (only the WAS pair has one; the others read as «-»). The configuration files' normalized
+# checksums are held equal by the testbed-services repository test, not read here.
+PAIR_FILES: tuple[tuple[str, str], ...] = (("pair_war", "/var/lib/petition-deploy/war.sha256"),)
+# The units the install starts per role, the same on every VM testbed (one install code, S design decision 5).
+ROLE_UNITS: dict[str, tuple[str, ...]] = {
+    "router": ("snmpd.service", "nftables.service"),
+    "web": ("apache2.service", "lucida-agent.service"),
+    "was": ("tomcat10.service", "lucida-agent.service"),
+    "db": ("postgresql@16-main.service", "lucida-agent.service"),
+    "loadgen": ("loadgen.service",),
+}
+SERVER_ROLES = ("web", "was", "db")
 HOSTS: tuple[VmHost, ...] = (
-    VmHost("rt-core01", "192.168.127.2", "router", ("snmpd.service", "nftables.service")),
-    VmHost("web01", "192.168.127.21", "web", ("apache2.service", "lucida-agent.service")),
-    VmHost("was01", "192.168.127.31", "was", ("tomcat10.service", "lucida-agent.service")),
-    VmHost("was02", "192.168.127.32", "was", ("tomcat10.service", "lucida-agent.service")),
-    VmHost(
-        "db01", "192.168.127.41", "db", ("postgresql@16-main.service", "lucida-agent.service"),
-        (("archive_state", ARCHIVE_FACTS_PATH),),
-    ),
-    VmHost("loadgen", "192.168.127.10", "loadgen", ("loadgen.service",), (("loadgen_live", LOADGEN_LIVE_PATH),)),
+    VmHost("rt-core01", "192.168.127.2", "router", ROLE_UNITS["router"]),
+    VmHost("web01", "192.168.127.21", "web", ROLE_UNITS["web"], PAIR_FILES),
+    VmHost("was01", "192.168.127.31", "was", ROLE_UNITS["was"], PAIR_FILES),
+    VmHost("was02", "192.168.127.32", "was", ROLE_UNITS["was"], PAIR_FILES),
+    VmHost("db01", "192.168.127.41", "db", ROLE_UNITS["db"], (("archive_state", ARCHIVE_FACTS_PATH), *PAIR_FILES)),
+    VmHost("loadgen", "192.168.127.10", "loadgen", ROLE_UNITS["loadgen"], (("loadgen_live", LOADGEN_LIVE_PATH),)),
 )
 HOSTS_BY_NAME = {host.name: host for host in HOSTS}
 
@@ -146,6 +157,115 @@ def hypervisor_host(target: str = HYPERVISOR_TARGET) -> VmHost | None:
 SERVER_AGENT_HOSTS = {"web01": "192.168.124.11", "was01": "192.168.125.11", "was02": "192.168.125.12", "db01": "192.168.126.11"}
 ROUTER_NAME = "rt-core01"
 ROUTER_POLL_ADDRESS = "192.168.123.254"
+# The portal's entry as the loadgen calls it (inventory: web01 business address, web_port 80, context petition).
+ENTRY_URL = "http://192.168.124.11:80/petition"
+
+
+@dataclass(frozen=True)
+class VmDomain:
+    """One VM testbed as the runner reaches it: its VMs, the names its SMS agents report as, its loadgen and entry,
+    its own known_hosts and state, and whether it has 66 executors and a router (S design §7-6, ST4 contract 2)."""
+
+    key: str
+    hosts: tuple[VmHost, ...]
+    agent_hosts: Mapping[str, str]
+    entry_url: str
+    loadgen_live_path: str
+    hypervisor_target: str
+    router: bool
+    # Under STATE_DIR: "" keeps T where it always was; another domain gets its own folder.
+    state_subdir: str
+    # What the operator CLI's node list takes to name this domain (none for T, its default).
+    cli_args: tuple[str, ...]
+
+    def host(self, name: str) -> VmHost:
+        for host in self.hosts:
+            if host.name == name:
+                return host
+        raise VmOpsError(f"{name!r} is not a VM of {self.key}")
+
+    def role_host(self, role: str) -> VmHost:
+        for host in self.hosts:
+            if host.role == role:
+                return host
+        raise VmOpsError(f"{self.key} has no {role} VM")
+
+    @property
+    def servers(self) -> tuple[VmHost, ...]:
+        return tuple(host for host in self.hosts if host.role in SERVER_ROLES)
+
+
+# The S testbed (testbed-services docs/spec-testbed-sms-only.md): the same app on five more VMs, SMS only, no router,
+# no 66 executors. Its key is fixed here like the other domain keys (decoy domain words, preflight signal sets); the
+# inventory must carry the same value or it is refused.
+SMS_DOMAIN = "civil-petition-sms"
+SMS_INVENTORY = DEPLOY_DIR / "inventory" / "s.json"
+
+
+def load_inventory_domain(path: Path, *, key: str | None = None) -> VmDomain:
+    """A VM testbed read from its inventory (testbed-services civil-petition/deploy/inventory/<t|s>.json), the one
+    place its names and addresses live (ST4 contract 2: no copy here). The NIC on the network marked ``management``
+    = the always-open connection; a server's ``gateway`` NIC = the address its SMS agent reports as (LUCIDA_HOST);
+    the executor key is the inventory's executor public key file without ``.pub`` under KEY_DIR; known_hosts is
+    ``known_hosts_<domain>``."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        domain = str(document["domain"])
+        executor = document["accounts"]["executor"]
+        user = str(executor["name"])
+        key_name = Path(str(executor["pubkey_file"])).name
+        app = document["app"]
+        raw_hosts = list(document["hosts"])
+        management = {name for name, net in (document.get("networks") or {}).items() if net.get("management") is True}
+    except Exception as error:
+        raise VmOpsError(f"inventory {path} unreadable: {type(error).__name__}: {error}") from None
+    if key is not None and domain != key:
+        raise VmOpsError(f"inventory {path} is for {domain!r}, not {key!r}")
+    if not key_name.endswith(".pub"):
+        raise VmOpsError(f"inventory {path}: executor pubkey_file {key_name!r} does not end in .pub")
+    private_key = KEY_DIR / key_name[: -len(".pub")]
+    known_hosts = KEY_DIR / f"known_hosts_{domain}"
+    loadgen_live = f"/tmp/k6-{domain}-live.json"
+    hosts: list[VmHost] = []
+    agents: dict[str, str] = {}
+    for raw in raw_hosts:
+        name, role = str(raw["name"]), str(raw["role"])
+        if role not in ROLE_UNITS:
+            raise VmOpsError(f"inventory {path}: {name} has unknown role {role!r}")
+        nics = list(raw.get("nics") or [])
+        mgmt = [str(nic["addr"]) for nic in nics if nic.get("net") in management]
+        other = [str(nic["addr"]) for nic in nics if nic.get("gateway") is True and nic.get("net") not in management]
+        if len(mgmt) != 1:
+            raise VmOpsError(f"inventory {path}: {name} has {len(mgmt)} management NICs, expected 1")
+        files: tuple[tuple[str, str], ...] = ()
+        if role in SERVER_ROLES:
+            if not other:
+                raise VmOpsError(f"inventory {path}: server {name} has no gateway NIC")
+            agents[name] = other[0]
+            files = PAIR_FILES
+        if role == "db":
+            files = (("archive_state", ARCHIVE_FACTS_PATH), *files)
+        if role == "loadgen":
+            files = (("loadgen_live", loadgen_live),)
+        hosts.append(VmHost(name, mgmt[0], role, ROLE_UNITS[role], files, user, private_key, known_hosts))
+    names = [host.name for host in hosts]
+    if len(names) != len(set(names)):
+        raise VmOpsError(f"inventory {path}: host names repeat")
+    webs = [host for host in hosts if host.role == "web"]
+    if len(webs) != 1 or not [host for host in hosts if host.role == "loadgen"]:
+        raise VmOpsError(f"inventory {path}: needs one web VM and a loadgen VM")
+    entry = f"http://{agents[webs[0].name]}:{int(app['web_port'])}/{str(app['context']).strip('/')}"
+    return VmDomain(
+        key=domain, hosts=tuple(hosts), agent_hosts=agents, entry_url=entry, loadgen_live_path=loadgen_live,
+        hypervisor_target="", router=any(host.role == "router" for host in hosts),
+        state_subdir=domain, cli_args=("--domain", domain),
+    )
+
+
+T_DOMAIN = VmDomain(
+    key=DOMAIN, hosts=HOSTS, agent_hosts=SERVER_AGENT_HOSTS, entry_url=ENTRY_URL, loadgen_live_path=LOADGEN_LIVE_PATH,
+    hypervisor_target=HYPERVISOR_TARGET, router=True, state_subdir="", cli_args=(),
+)
 # Checksum records a role must have and pass (the WAR on the WAS pair; the install's file list on every VM).
 REQUIRED_RECORDS_BY_ROLE: dict[str, tuple[str, ...]] = {
     "was": ("/var/lib/petition-deploy/war.sha256",),
@@ -234,7 +354,7 @@ def _environment() -> dict[str, str]:
     return {"PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"), "HOME": "/root", "LC_ALL": "C"}
 
 
-def ssh_options(*, key: Path = EXECUTOR_KEY) -> list[str]:
+def ssh_options(*, key: Path = EXECUTOR_KEY, known_hosts: Path = KNOWN_HOSTS) -> list[str]:
     """The common options both sides use (T4S contract 3)."""
     return [
         "-F", "none",
@@ -242,7 +362,7 @@ def ssh_options(*, key: Path = EXECUTOR_KEY) -> list[str]:
         "-o", "IdentitiesOnly=yes",
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=yes",
-        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+        "-o", f"UserKnownHostsFile={known_hosts}",
         "-o", f"ConnectTimeout={CONNECT_TIMEOUT_SEC}",
         "-o", f"ControlPath={CONTROL_PATH}",
     ]
@@ -251,7 +371,7 @@ def ssh_options(*, key: Path = EXECUTOR_KEY) -> list[str]:
 def executor_argv(host: VmHost) -> list[str]:
     """The executor-call form over the shared socket (the same argv the testbed-services executors build)."""
     return [
-        "/usr/bin/ssh", *ssh_options(key=host.key),
+        "/usr/bin/ssh", *ssh_options(key=host.key, known_hosts=host.known_hosts),
         "-o", "ControlMaster=no",
         f"{host.user}@{host.address}",
         "sudo", "-n", "bash", "-s",
@@ -260,7 +380,7 @@ def executor_argv(host: VmHost) -> list[str]:
 
 def master_argv(host: VmHost) -> list[str]:
     return [
-        "/usr/bin/ssh", *ssh_options(key=host.key),
+        "/usr/bin/ssh", *ssh_options(key=host.key, known_hosts=host.known_hosts),
         "-o", "ControlMaster=yes",
         "-o", "ControlPersist=yes",
         "-o", f"ServerAliveInterval={SERVER_ALIVE_INTERVAL_SEC}",
@@ -271,7 +391,7 @@ def master_argv(host: VmHost) -> list[str]:
 
 
 def master_check_argv(host: VmHost) -> list[str]:
-    return ["/usr/bin/ssh", *ssh_options(key=host.key), "-O", "check", f"{host.user}@{host.address}"]
+    return ["/usr/bin/ssh", *ssh_options(key=host.key, known_hosts=host.known_hosts), "-O", "check", f"{host.user}@{host.address}"]
 
 
 def master_is_up(host: VmHost, process_runner: ProcessRunner = subprocess.run) -> bool | None:
@@ -296,7 +416,7 @@ def require_master(host: VmHost, process_runner: ProcessRunner = subprocess.run)
 
 
 def master_exit_argv(host: VmHost) -> list[str]:
-    return ["/usr/bin/ssh", *ssh_options(key=host.key), "-O", "exit", f"{host.user}@{host.address}"]
+    return ["/usr/bin/ssh", *ssh_options(key=host.key, known_hosts=host.known_hosts), "-O", "exit", f"{host.user}@{host.address}"]
 
 
 def read_stdin(host: VmHost) -> bytes:
@@ -655,18 +775,24 @@ class VmOps:
 
     def __init__(
         self,
-        hosts: Sequence[VmHost] = HOSTS,
+        hosts: Sequence[VmHost] | None = None,
         *,
+        domain: VmDomain = T_DOMAIN,
         process_runner: ProcessRunner = subprocess.run,
         clock: Clock = _utc_now,
-        state_dir: Path = STATE_DIR,
+        state_dir: Path | None = None,
         archive_state_dir: Path | None = None,
-        hypervisor_target: str = HYPERVISOR_TARGET,
+        hypervisor_target: str | None = None,
         supervisor: MasterSupervisor | None = None,
         routine: OperatorRoutine | None = None,
     ) -> None:
+        self.domain = domain
+        hosts = domain.hosts if hosts is None else hosts
+        hypervisor_target = domain.hypervisor_target if hypervisor_target is None else hypervisor_target
+        if state_dir is None:
+            state_dir = STATE_DIR / domain.state_subdir if domain.state_subdir else STATE_DIR
         self.hosts = tuple(hosts)
-        self.routine = routine or OperatorRoutine(clock=clock, state_dir=state_dir)
+        self.routine = routine or OperatorRoutine(clock=clock, state_dir=state_dir, cli_args=domain.cli_args)
         self.process_runner = process_runner
         self.clock = clock
         self.state_dir = state_dir
@@ -704,12 +830,15 @@ class VmOps:
 
         The loadgen sends nothing to 119 and is not an SMS target (§2-4), so a fresh read per preflight leaves no
         trace in a recording; it still goes over the same socket and the same form."""
-        host = HOSTS_BY_NAME["loadgen"]
+        host = next((item for item in self.hosts if item.role == "loadgen"), None)
+        if host is None:
+            raise VmOpsError(f"{self.domain.key} has no loadgen VM")
+        live_path = dict(host.files).get("loadgen_live", self.domain.loadgen_live_path)
         body = (
             "echo \"@@ host $(hostname)\"\n"
             "echo \"@@ unit loadgen.service $(systemctl is-active loadgen.service 2>/dev/null || true)\"\n"
             "echo \"@@ env $(systemctl show -p Environment --value loadgen.service 2>/dev/null)\"\n"
-            f"if [[ -r {LOADGEN_LIVE_PATH} ]]; then echo \"@@ file loadgen_live $(base64 -w0 <{LOADGEN_LIVE_PATH})\"; "
+            f"if [[ -r {live_path} ]]; then echo \"@@ file loadgen_live $(base64 -w0 <{live_path})\"; "
             "else echo '@@ file loadgen_live -'; fi\n"
             "echo '@@ end'\n"
         ).encode()
@@ -725,7 +854,7 @@ class VmOps:
             elif line.startswith("@@ file loadgen_live "):
                 payload = line[len("@@ file loadgen_live "):].strip()
         if payload in ("", "-"):
-            raise VmOpsError(f"loadgen: no live summary at {LOADGEN_LIVE_PATH} (unit {state or 'unknown'})")
+            raise VmOpsError(f"loadgen: no live summary at {live_path} (unit {state or 'unknown'})")
         document = json.loads(base64.b64decode(payload).decode("utf-8"))
         if not isinstance(document, dict):
             raise VmOpsError("loadgen: live summary is not an object")
@@ -854,6 +983,8 @@ class VmOps:
                                 "guards_armed": result.guards_armed,
                                 "guard_timers": result.guard_timers,
                                 "chrony": result.chrony,
+                                # Pair condition 1 records as read (None = the file is not there).
+                                "pair": {label: result.files.get(label) for label, _ in PAIR_FILES},
                             },
                             "cpu_history": cpu[-ROUTER_CPU_HISTORY:],
                             "last_error": None,
@@ -891,24 +1022,7 @@ class VmOps:
             facts = (document["hosts"].get(host.name) or {}).get("facts")
             if facts is None or (now - _parse(facts["read_at"])).total_seconds() > FACTS_MAX_AGE_SEC:
                 continue
-            for unit, state in sorted(facts["units"].items()):
-                if state != "active":
-                    problems.append(f"{host.name} {unit} {state}")
-            held = set((excused or {}).get(host.name, {}).get("paths") or ())
-            # war.sha256 names the WAR relative to the webapps directory; the CLI names files absolute.
-            unexcused = [path for path in facts["drift"] if _drift_absolute(path) not in held]
-            by_record = facts.get("drift_records") or {}  # facts read before L-D have none: nothing is excused
-            for record in (*REQUIRED_RECORDS_BY_ROLE.get(host.role, ()), *REQUIRED_RECORDS_ALL):
-                verdict = facts["sums"].get(record, "not read")
-                # sha256sum -c ends 1 on any differing line; only a record whose every line is a held decoy's file
-                # had its rc=1 from the decoy (review rv-t4u4 L-D: an rc=1 with no line of its own is not).
-                lines = by_record.get(record) or []
-                if verdict == "rc=1" and held and lines and all(_drift_absolute(path) in held for path in lines):
-                    continue
-                if verdict != "rc=0":
-                    problems.append(f"{host.name} {record} {verdict}")
-            for path in unexcused:
-                problems.append(f"{host.name} changed since install: {path}")
+            problems.extend(host_drift(host, facts, excused))
         history = document["hypervisor"].get("history") or []
         if self.hypervisor_target and history:
             latest = history[-1]
@@ -923,8 +1037,8 @@ class VmOps:
         return "; ".join(problems) if problems else None
 
     def _deliver_files(self, name: str, facts: HostFacts) -> None:
-        """db01's archive facts line goes where the archive-state readiness reads it, unchanged."""
-        if name != "db01" or self.archive_state_dir is None:
+        """The db VM's archive facts line goes where the archive-state readiness reads it, unchanged."""
+        if self.archive_state_dir is None or not any(host.name == name and host.role == "db" for host in self.hosts):
             return
         text = facts.files.get("archive_state")
         if text is None:
@@ -932,9 +1046,92 @@ class VmOps:
         try:
             json.loads(text)
         except ValueError:
-            logger.warning("db01 archive facts line is not JSON; last.json left as it was")
+            logger.warning("%s archive facts line is not JSON; last.json left as it was", name)
             return
         _atomic_write(self.archive_state_dir / "last.json", text if text.endswith("\n") else text + "\n")
+
+
+def host_drift(host: VmHost, facts: Mapping[str, Any], excused: Mapping[str, Mapping[str, Any]] | None = None) -> list[str]:
+    """What differs from the install on one VM by its periodic read: a role unit not active, a checksum record that
+    does not pass, a file changed since install. ``excused`` is decoys.held_excuses: a file a VM decoy held through
+    the recording changed (D1 (b)) is no drift, on that node only."""
+    problems: list[str] = []
+    for unit, state in sorted(facts["units"].items()):
+        if state != "active":
+            problems.append(f"{host.name} {unit} {state}")
+    held = set((excused or {}).get(host.name, {}).get("paths") or ())
+    # war.sha256 names the WAR relative to the webapps directory; the CLI names files absolute.
+    unexcused = [path for path in facts["drift"] if _drift_absolute(path) not in held]
+    by_record = facts.get("drift_records") or {}  # facts read before L-D have none: nothing is excused
+    for record in (*REQUIRED_RECORDS_BY_ROLE.get(host.role, ()), *REQUIRED_RECORDS_ALL):
+        verdict = facts["sums"].get(record, "not read")
+        # sha256sum -c ends 1 on any differing line; only a record whose every line is a held decoy's file
+        # had its rc=1 from the decoy (review rv-t4u4 L-D: an rc=1 with no line of its own is not).
+        lines = by_record.get(record) or []
+        if verdict == "rc=1" and held and lines and all(_drift_absolute(path) in held for path in lines):
+            continue
+        if verdict != "rc=0":
+            problems.append(f"{host.name} {record} {verdict}")
+    for path in unexcused:
+        problems.append(f"{host.name} changed since install: {path}")
+    return problems
+
+
+def server_pairs(first: VmDomain, second: VmDomain) -> list[tuple[str, str]]:
+    """Twin servers of two VM testbeds: the n-th server of a role in one inventory with the n-th of that role in the
+    other (the rule of testbed-services civil-petition/deploy/tools/pair_packages.py)."""
+    def by_role(domain: VmDomain) -> dict[str, str]:
+        counter: dict[str, int] = {}
+        out: dict[str, str] = {}
+        for host in domain.servers:
+            index = counter.get(host.role, 0)
+            counter[host.role] = index + 1
+            out[f"{host.role}{index}"] = host.name
+        return out
+
+    one, two = by_role(first), by_role(second)
+    return [(one[key], two[key]) for key in sorted(set(one) | set(two)) if key in one and key in two] + [
+        (one.get(key, "-"), two.get(key, "-")) for key in sorted(set(one) ^ set(two))
+    ]
+
+
+def pair_verdict(
+    first: "VmOps", second: "VmOps", *, now: datetime | None = None,
+    excused: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """S design §2-4 condition 1 and §7-4 as the runner can see it before a recording (ST4 contract 3): on fresh
+    periodic reads of both testbeds, every server runs what its install left (host_drift empty: role units active,
+    war.sha256 and expected.sha256 pass, no file changed; a held decoy's file excused as in the drift gate) and every
+    WAS of both carries the same WAR record line (one build). The normalized configuration checksums are held equal
+    by the testbed-services repository test (SharedCodeTests), not here. Not a gate: a run of either domain is
+    recorded with ``pair`` true or false and why."""
+    now = now or first.clock()
+    differences: list[str] = []
+    wars: dict[str, str | None] = {}
+    servers: list[str] = []
+    for ops in (first, second):
+        document = ops.load()
+        for host in ops.domain.servers:
+            servers.append(f"{ops.domain.key}/{host.name}")
+            facts = (document["hosts"].get(host.name) or {}).get("facts")
+            if facts is None or (now - _parse(facts["read_at"])).total_seconds() > FACTS_MAX_AGE_SEC:
+                differences.append(f"{host.name}: no fresh periodic read")
+                continue
+            differences.extend(host_drift(host, facts, excused))
+            if host.role == "was":
+                wars[host.name] = ((facts.get("pair") or {}).get("pair_war") or "").strip() or None
+    lines = set(wars.values())
+    if None in lines:
+        differences.append(f"no WAR record on {', '.join(sorted(n for n, v in wars.items() if v is None))}")
+    if len(lines - {None}) > 1:
+        differences.append("WAR record differs: " + "; ".join(f"{n} {(v or '-')[:16]}" for n, v in sorted(wars.items())))
+    if not any(ops.domain.servers for ops in (first, second)) or len(wars) == 0:
+        differences.append("no WAS read in either testbed")
+    for one, two in server_pairs(first.domain, second.domain):
+        if "-" in (one, two):
+            differences.append(f"{one if two == '-' else two} has no twin in the other testbed")
+    return {"pair": not differences, "domains": [first.domain.key, second.domain.key], "servers": servers,
+            "differences": differences, "checked_at": _format(now)}
 
 
 # Routine operator sessions (testbed-services docs/spec-testbed-vm-3tier.md operator path, Q35 answer condition ②).
@@ -987,8 +1184,12 @@ class OperatorRoutine:
         state_dir: Path = STATE_DIR,
         rng: Any = None,
         cli: Path = OPERATOR_SESSION_CLI,
+        cli_args: Sequence[str] = (),
     ) -> None:
         self.process_runner = process_runner
+        # The domain's own node-list arguments (`--domain <key>` for a testbed other than T, ST4 contract 2: only
+        # `--list-nodes` takes it; `--node` names are unique across the testbeds).
+        self.cli_args = tuple(cli_args)
         self._nodes: tuple[str, ...] | None = None
         self.clock = clock
         self.state_dir = state_dir
@@ -1010,7 +1211,8 @@ class OperatorRoutine:
 
     def _call(self, args: Sequence[str]) -> subprocess.CompletedProcess:
         return self.process_runner(
-            ["python3", str(self.cli), *args], timeout=OPERATOR_ROUTINE_TIMEOUT_SEC, env=self._environment(),
+            ["python3", str(self.cli), *(self.cli_args if args[:1] == ["--list-nodes"] else ()), *args],
+            timeout=OPERATOR_ROUTINE_TIMEOUT_SEC, env=self._environment(),
         )
 
     def nodes(self) -> tuple[str, ...]:
@@ -1201,3 +1403,66 @@ def get_vm_ops_service() -> VmOpsService | None:
     if _service is None:
         _service = VmOpsService(ops)
     return _service
+
+
+_sms_ops: VmOps | None = None
+_sms_service: VmOpsService | None = None
+
+
+def sms_enabled() -> bool:
+    return os.environ.get("CIVIL_PETITION_SMS_OPS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_sms_ops() -> VmOps | None:
+    """The S testbed's VmOps when CIVIL_PETITION_SMS_OPS is on (off by default), its VMs read from SMS_INVENTORY.
+    An unreadable inventory raises: the switch is on, so a silent «no S» would hide the domain's gate."""
+    global _sms_ops
+    if not sms_enabled():
+        return None
+    if _sms_ops is None:
+        archive = os.environ.get("PETITION_SMS_ARCHIVE_STATE_DIR", "").strip()
+        _sms_ops = VmOps(
+            domain=load_inventory_domain(SMS_INVENTORY, key=SMS_DOMAIN),
+            archive_state_dir=Path(archive) if archive else None,
+        )
+    return _sms_ops
+
+
+def get_sms_ops_service() -> VmOpsService | None:
+    global _sms_service
+    ops = get_sms_ops()
+    if ops is None:
+        return None
+    if _sms_service is None:
+        _sms_service = VmOpsService(ops)
+    return _sms_service
+
+
+def ops_for(domain: str | None) -> VmOps | None:
+    """The VmOps of a VM testbed domain, None when it is off or not a VM testbed."""
+    if domain == DOMAIN:
+        return get_vm_ops()
+    if domain == SMS_DOMAIN:
+        return get_sms_ops()
+    return None
+
+
+def current_pair_verdict(excused: Mapping[str, Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """pair_verdict of T and S as the queue records it with a run of either; «no pair» with why when one is off."""
+    t_ops, s_ops = get_vm_ops(), get_sms_ops()
+    if t_ops is None or s_ops is None:
+        off = [key for key, ops in ((DOMAIN, t_ops), (SMS_DOMAIN, s_ops)) if ops is None]
+        return {"pair": False, "domains": [DOMAIN, SMS_DOMAIN], "servers": [],
+                "differences": [f"operations off for {', '.join(off)}: the twin cannot be read"],
+                "checked_at": _format(_utc_now())}
+    return pair_verdict(t_ops, s_ops, excused=excused)
+
+
+def vm_domain_of(host_or_domain: str | None) -> VmDomain | None:
+    """The VM testbed a domain key names (T fixed here, S from its inventory when its operations are on)."""
+    if host_or_domain == DOMAIN:
+        return T_DOMAIN
+    if host_or_domain == SMS_DOMAIN:
+        ops = get_sms_ops()
+        return ops.domain if ops is not None else None
+    return None

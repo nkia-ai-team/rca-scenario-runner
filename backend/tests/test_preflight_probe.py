@@ -505,3 +505,156 @@ def test_vm_domain_guard_residue_excuses_one_guard_per_held_decoy_on_its_own_nod
     assert probe.collect(now=clock.value)["residual_guards"] == 1
     probe.set_held_decoys({})
     assert probe.collect(now=clock.value)["residual_guards"] == 2
+
+
+# --- S testbed (civil-petition-sms, S design §7-4) ---------------------------------------------------------------
+from tests.test_vm_ops import sms_domain as _sms_domain  # noqa: E402
+
+_SMS_LOADGEN_ENV = "PEAK_RPS=30 TROUGH_RPS=5 LOADGEN_SEED=42 ENTRY_URL=http://10.31.0.11:80/petition"
+
+
+class _SmsRemote(_VmDomainRemote):
+    def live_document(self, **overrides) -> dict:
+        return super().live_document(domain="civil-petition-sms", **overrides)
+
+
+def _sms_probe(tmp_path: _Path, *, answers=None, reads: int = 3, settle_min: int = 60):
+    """An S probe on real S VmOps state next to the T probe whose 66 read carries the shared tunnel."""
+    t_probe, t_ops, t_remote, clock = _vm_probe(tmp_path / "t", reads=reads)
+    domain = _sms_domain(tmp_path)
+    remote = _SmsRemote(clock)
+    remote.outputs = {host.address: _read_output(host, at=clock.value) for host in domain.hosts}
+    ops = _vm_ops.VmOps(
+        domain=domain, process_runner=remote, clock=clock, state_dir=tmp_path / "s-ops",
+        supervisor=_vm_ops.MasterSupervisor(domain.hosts, process_runner=remote, clock=clock,
+                                            state_dir=tmp_path / "s-ops", control_dir=tmp_path / "cms",
+                                            popen=lambda *a, **k: None),
+    )
+    ops.read_all()
+    (tmp_path / "s-ops" / "operator-routine.json").write_text(json.dumps({"last_ok": {
+        "at": (clock.value - _timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ"), "host": "wassvr01"}}))
+    opened = (clock.value - _timedelta(minutes=settle_min)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ops.supervisor.status = {host.name: {"alive": True, "opened_at": opened, "detail": ""} for host in ops.supervisor.hosts}
+    agents = sorted(domain.agent_hosts.values())
+    default = {
+        "sms.cpu.utilization": _rows({host: 15 for host in agents}),
+        'time() - max by (host_name) (tlast_over_time({__name__="sms.server.icmp_status"': _rows({h: 20 for h in agents}),
+        'max by (host_name) (last_over_time({__name__="sms.server.icmp_status"': _rows({h: 1 for h in agents}),
+        "pending_requests": _rows({"": 0}),
+        "/api/v1/alerts": {"data": {"alerts": []}},
+    }
+    probe = VmDomainPreflightProbe(
+        ops=ops, tunnel_ops=t_ops, vm_url="http://vm", urlopen=_vm_urlopen(answers or default),
+        incident_count=lambda: 0,
+    )
+    return probe, ops, remote, t_remote, clock
+
+
+def _sms_gate(observations, now):
+    return evaluate_preflight(
+        window=("2026-11-20T05:50:00Z", "2026-11-20T06:00:00Z"),
+        checks=build_preflight_checks(observations, domain="civil-petition-sms"),
+        now=now,
+    )
+
+
+def test_the_s_probe_reads_every_s_signal_on_s_vms_and_t_s_tunnel(tmp_path) -> None:
+    """S design §7-4: its loadgen, its five VMs' reads and masters, its four SMS agents' freshness at 119, and the
+    tunnel through T's 66 read. No router row; 66's guards are T's executors', not counted for S."""
+    probe, ops, remote, t_remote, clock = _sms_probe(tmp_path)
+    t_remote.hypervisor = {**t_remote.hypervisor, "guards_active": 2}
+    observations = probe.collect(now=clock.value)
+    from app.preflight import SMS_VM_DOMAIN_REQUIRED_SIGNALS
+
+    assert set(observations) == SMS_VM_DOMAIN_REQUIRED_SIGNALS
+    assert observations["residual_guards"] == 0 and observations["mgmt_ssh_down"] == 0
+    assert observations["tunnel_handshake_age_sec"] == 12
+    assert _sms_gate(observations, clock.value).verdict == "clean"
+    # Every S read and the loadgen read went to S's management addresses with S's known_hosts, never to T or 66.
+    targets = {argv[-5] for argv, _ in remote.calls if "-O" not in argv}
+    assert targets == {f"opsjob@{host.address}" for host in ops.hosts}
+    assert all(f"UserKnownHostsFile={_vm_ops.KEY_DIR / 'known_hosts_civil-petition-sms'}" in argv
+               for argv, _ in remote.calls)
+    # An S VM's own armed guard is residue.
+    remote.outputs["10.33.0.21"] = _read_output(ops.domain.host("wassvr01"), at=clock.value, guards=(1, 1))
+    ops.read_all()
+    assert probe.collect(now=clock.value)["residual_guards"] == 1
+
+
+def test_a_cut_tunnel_makes_the_s_gate_dirty(tmp_path) -> None:
+    """§11 ST4: the tunnel cut on purpose (no handshake, pings lost) is a dirty S gate."""
+    probe, ops, remote, t_remote, clock = _sms_probe(tmp_path)
+    t_remote.hypervisor = {**t_remote.hypervisor, "handshake_age_sec": None,
+                           "ping": {"sent": 10, "received": 0, "max_ms": None}}
+    verdict = _sms_gate(probe.collect(now=clock.value), clock.value)
+    assert verdict.verdict == "dirty"
+    assert {c.name for c in verdict.checks if c.status == "fail"} == {
+        "tunnel_handshake_age_sec", "tunnel_ping_lost", "tunnel_ping_max_ms"}
+
+
+def test_a_cut_always_open_connection_makes_the_s_gate_dirty(tmp_path) -> None:
+    """§11 ST4: one of S's five always-open connections down is a dirty gate; reopened 10 minutes ago it still is
+    (30-minute settle)."""
+    probe, ops, remote, t_remote, clock = _sms_probe(tmp_path)
+    ops.supervisor.status["dbsvr01"] = {"alive": False, "opened_at": None, "detail": "exit 255"}
+    verdict = _sms_gate(probe.collect(now=clock.value), clock.value)
+    assert verdict.verdict == "dirty"
+    assert {c.name for c in verdict.checks if c.status == "fail"} == {"mgmt_ssh_down", "mgmt_ssh_settle_sec"}
+    assert set(ops.supervisor.status) == {"websvr01", "wassvr01", "wassvr02", "dbsvr01", "loadgen"}
+    ops.supervisor.status["dbsvr01"] = {"alive": True, "detail": "",
+                                        "opened_at": (clock.value - _timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    verdict = _sms_gate(probe.collect(now=clock.value), clock.value)
+    assert {c.name for c in verdict.checks if c.status == "fail"} == {"mgmt_ssh_settle_sec"}
+
+
+def test_the_s_probe_reads_freshness_of_s_s_own_agents(tmp_path) -> None:
+    probe, ops, remote, t_remote, clock = _sms_probe(tmp_path)
+    queries = []
+    inner = probe.urlopen
+
+    def spy(url, timeout=None):
+        queries.append(_urlparse.unquote_plus(url))
+        return inner(url, timeout=timeout)
+
+    probe.urlopen = spy
+    observations = probe.collect(now=clock.value)
+    fresh = [q for q in queries if "sms.cpu.utilization" in q or "sms.server.icmp_status" in q]
+    assert fresh and all("10\\.31\\.0\\.11" in q and "192\\.168\\.124" not in q for q in fresh), fresh
+    assert not [q for q in queries if "nms.network.snmp_status" in q]
+    assert observations["sms_icmp_down"] == 0
+
+
+def test_the_s_probe_stops_with_why_when_t_s_66_read_is_off(tmp_path) -> None:
+    from app.preflight_probe import _NoTunnel
+
+    probe, ops, remote, t_remote, clock = _sms_probe(tmp_path)
+    probe.tunnel_ops = _NoTunnel(ops)
+    with _pytest.raises(_vm_ops.VmOpsError, match="no 66 read for the tunnel"):
+        probe.collect(now=clock.value)
+
+
+def test_both_vm_testbeds_get_their_probe_and_s_reads_the_tunnel_through_t(tmp_path, monkeypatch) -> None:
+    from app import preflight_probe
+    from tests.test_vm_ops import sms_inventory_document
+
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps(sms_inventory_document()))
+    monkeypatch.setattr(_vm_ops, "SMS_INVENTORY", path)
+    monkeypatch.setattr(_vm_ops, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(_vm_ops, "_ops", None)
+    monkeypatch.setattr(_vm_ops, "_sms_ops", None)
+    monkeypatch.setenv("CIVIL_PETITION_SMS_OPS", "1")
+    monkeypatch.setenv("CIVIL_PETITION_OPS", "1")
+    probes = preflight_probe.vm_domain_probes()
+    assert set(probes) == {"civil-petition", "civil-petition-sms"}
+    assert probes["civil-petition-sms"].tunnel_ops is probes["civil-petition"].ops
+    assert probes["civil-petition-sms"].ops.domain.key == "civil-petition-sms"
+    assert probes["civil-petition"].tunnel_ops is probes["civil-petition"].ops
+    monkeypatch.setenv("CIVIL_PETITION_OPS", "")
+    probes = preflight_probe.vm_domain_probes()
+    assert set(probes) == {"civil-petition-sms"} and probes["civil-petition-sms"].tunnel_ops.hypervisor_target == ""
+    # An inventory for another domain behind the S switch is refused, not read as S.
+    path.write_text(json.dumps({**sms_inventory_document(), "domain": "civil-petition"}))
+    monkeypatch.setattr(_vm_ops, "_sms_ops", None)
+    with _pytest.raises(_vm_ops.VmOpsError, match="not 'civil-petition-sms'"):
+        preflight_probe.vm_domain_probes()
