@@ -573,6 +573,10 @@ def test_the_s_probe_reads_every_s_signal_on_s_vms_and_t_s_tunnel(tmp_path) -> N
     # Every S read and the loadgen read went to S's management addresses with S's known_hosts, never to T or 66.
     targets = {argv[-5] for argv, _ in remote.calls if "-O" not in argv}
     assert targets == {f"opsjob@{host.address}" for host in ops.hosts}
+    # The loadgen summary is S's own file (the loadgen unit names it by the domain value).
+    loadgen = [stdin for argv, stdin in remote.calls if isinstance(stdin, bytes) and b"systemctl show -p Environment" in stdin]
+    assert loadgen and all(b"/tmp/k6-civil-petition-sms-live.json" in stdin and b"k6-civil-petition-live" not in stdin
+                           for stdin in loadgen)
     assert all(f"UserKnownHostsFile={_vm_ops.KEY_DIR / 'known_hosts_civil-petition-sms'}" in argv
                for argv, _ in remote.calls)
     # An S VM's own armed guard is residue.
