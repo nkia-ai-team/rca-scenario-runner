@@ -136,6 +136,7 @@ PAIR_FILES: tuple[tuple[str, str], ...] = (
 # site-valued files; read from the mounted deploy folder; ST4 contract M2).
 PAIR_EXPECTED = DEPLOY_DIR / "inventory" / "pair-expected.json"
 PAIR_ROLES = ("web", "was", "db", "loadgen")
+PAIR_EXPECTED_SCHEMA = "petition-pair-expected/1"
 # The units the install starts per role, the same on every VM testbed (one install code, S design decision 5).
 ROLE_UNITS: dict[str, tuple[str, ...]] = {
     "router": ("snmpd.service", "nftables.service"),
@@ -1117,12 +1118,21 @@ def load_pair_expected(path: Path | None = None) -> dict[str, Any]:
     path = path or PAIR_EXPECTED
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
-        pairs = [
-            {"t": str(row["t"]), "s": str(row["s"]),
-             "files": {str(dest): str(value) for dest, value in dict(row["files"]).items()},
-             "skip": {str(dest) for dest in [*row.get("t_only", []), *row.get("differs", []), *row.get("secrets", [])]}}
-            for row in document["pairs"]
-        ]
+        if document.get("schema") != PAIR_EXPECTED_SCHEMA:
+            # Another shape may give the same fields another meaning (review rv-st4r L9): not read as this one.
+            raise ValueError(f"schema {document.get('schema')!r}, expected {PAIR_EXPECTED_SCHEMA!r}")
+        pairs = []
+        for row in document["pairs"]:
+            for field in ("t", "s", "role", "files", "t_only", "differs"):
+                if field not in row:
+                    raise ValueError(f"a pair lacks {field!r}")
+            if not isinstance(row["t_only"], list) or not isinstance(row["differs"], list):
+                raise ValueError("t_only and differs must be lists")
+            pairs.append({
+                "t": str(row["t"]), "s": str(row["s"]), "role": str(row["role"]),
+                "files": {str(dest): str(value) for dest, value in dict(row["files"]).items()},
+                "skip": {str(dest) for dest in [*row["t_only"], *row["differs"], *row.get("secrets", [])]},
+            })
         loadgen = {str(name): str(value) for name, value in dict(document["loadgen_files"]).items()}
     except Exception as error:
         raise VmOpsError(f"pair expected values unreadable at {path}: {type(error).__name__}: {error}") from None
@@ -1167,27 +1177,35 @@ def pair_verdict(
                 "differences": [str(error)], "checked_at": _format(now)}
     documents = {id(first): first.load(), id(second): second.load()}
 
+    # Every line names its testbed: both loadgens are called «loadgen» (review rv-st4r L6).
     def facts_of(ops: "VmOps", name: str) -> tuple[VmHost | None, dict[str, Any] | None]:
         host = next((item for item in ops.hosts if item.name == name), None)
         if host is None:
-            differences.append(f"{name}: not a VM of {ops.domain.key}")
+            differences.append(f"{ops.domain.key}/{name}: not a VM of {ops.domain.key}")
             return None, None
         checked.append(f"{ops.domain.key}/{name}")
         facts = (documents[id(ops)]["hosts"].get(name) or {}).get("facts")
         if facts is None or (now - _parse(facts["read_at"])).total_seconds() > FACTS_MAX_AGE_SEC:
-            differences.append(f"{name}: no fresh periodic read")
+            differences.append(f"{ops.domain.key}/{name}: no fresh periodic read")
             return host, None
-        differences.extend(host_drift(host, facts, excused))
+        differences.extend(f"{ops.domain.key}/{line}" for line in host_drift(host, facts, excused))
         return host, facts
 
     wars: dict[str, dict[str, str | None]] = {first.domain.key: {}, second.domain.key: {}}
     paired = set()
+    wanted = len(server_pairs(first.domain, second.domain)) + 1  # the servers' twins and the two loadgens
+    if len(expected["pairs"]) != wanted:
+        differences.append(f"pair expected values have {len(expected['pairs'])} pairs, the testbeds have {wanted}")
     for row in expected["pairs"]:
         for ops, name in ((first, row["t"]), (second, row["s"])):
             paired.add((ops.domain.key, name))
             host, facts = facts_of(ops, name)
+            if host is not None and host.role != row["role"]:
+                differences.append(f"{ops.domain.key}/{name}: is a {host.role} VM, the expected pair says {row['role']}")
+                continue
             if facts is None:
                 continue
+            name = f"{ops.domain.key}/{name}"
             files = facts.get("pair") or {}
             installed = _sum_lines(files.get("pair_normalized"))
             if installed is None:
@@ -1203,13 +1221,13 @@ def pair_verdict(
                 differences.append(f"{name}: load scripts differ from the expected ones "
                                    f"({', '.join(sorted(set(scripts) | set(expected['loadgen_files'])))})")
             if host.role == "was":
-                wars[ops.domain.key][name] = ((files.get("pair_war") or "").strip() or None)
+                wars[ops.domain.key][host.name] = ((files.get("pair_war") or "").strip() or None)
     for ops in (first, second):
         for host in ops.hosts:
             if host.role in PAIR_ROLES and (ops.domain.key, host.name) not in paired:
-                differences.append(f"{host.name}: no pair in the expected values")
+                differences.append(f"{ops.domain.key}/{host.name}: no pair in the expected values")
     t_wars, s_wars = wars[first.domain.key], wars[second.domain.key]
-    missing = sorted(name for side in (t_wars, s_wars) for name, line in side.items() if line is None)
+    missing = sorted(f"{key}/{name}" for key, side in wars.items() for name, line in side.items() if line is None)
     if missing:
         differences.append(f"no WAR record on {', '.join(missing)}")
     t_lines = {line for line in t_wars.values() if line}
@@ -1540,7 +1558,7 @@ def current_pair_verdict(excused: Mapping[str, Mapping[str, Any]] | None = None)
     t_ops, s_ops = get_vm_ops(), get_sms_ops()
     if t_ops is None or s_ops is None:
         off = [key for key, ops in ((DOMAIN, t_ops), (SMS_DOMAIN, s_ops)) if ops is None]
-        return {"pair": False, "domains": [DOMAIN, SMS_DOMAIN], "servers": [],
+        return {"pair": False, "domains": [DOMAIN, SMS_DOMAIN], "checked": [],
                 "differences": [f"operations off for {', '.join(off)}: the twin cannot be read"],
                 "checked_at": _format(_utc_now())}
     return pair_verdict(t_ops, s_ops, excused=excused)

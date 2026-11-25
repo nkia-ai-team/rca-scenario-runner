@@ -2050,3 +2050,33 @@ def test_the_queue_wires_s_s_gates_from_the_environment_and_compose_leaves_s_off
     compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text(encoding="utf-8")
     assert "- CIVIL_PETITION_SMS_OPS=${CIVIL_PETITION_SMS_OPS:-}" in compose
     assert "- PETITION_SMS_ARCHIVE_STATE_DIR=${PETITION_SMS_ARCHIVE_STATE_DIR:-}" in compose
+
+
+def test_the_live_queue_singleton_takes_s_s_gates(tmp_path: Path, monkeypatch) -> None:
+    """Review rv-st4r L8: get_live_queue spreads the VM testbed settings into the queue it builds, so with S on the
+    queue holds S's drift gate under S's key and S's archive folder (a dropped line would turn S's gate off
+    silently)."""
+    from app import live_queue, runner as runner_module, vm_ops
+    from tests.test_vm_ops import sms_inventory_document
+
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps(sms_inventory_document()))
+    monkeypatch.setattr(vm_ops, "SMS_INVENTORY", path)
+    monkeypatch.setattr(vm_ops, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(vm_ops, "_ops", None)
+    monkeypatch.setattr(vm_ops, "_sms_ops", None)
+    monkeypatch.setattr(live_queue, "_queue", None)
+    monkeypatch.setattr(runner_module, "_singleton", None)
+    for name, value in {
+        "CIVIL_PETITION_SMS_OPS": "1", "PETITION_SMS_ARCHIVE_STATE_DIR": str(tmp_path / "s-archive"),
+        "LIVE_QUEUE_STATE_PATH": str(tmp_path / "live-queue.json"), "PREFLIGHT_PROBE": "off",
+        "SCRIPT_DIR": str(tmp_path / "scripts"), "LOG_DIR": str(tmp_path / "logs"),
+        "SCENARIO_MANIFEST_ROOT": str(tmp_path / "manifests"), "DOMAIN_PODS_CHECK": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("CIVIL_PETITION_OPS", raising=False)
+    queue = live_queue.get_live_queue()
+    assert set(queue.vm_domain_states) == {"civil-petition-sms"}
+    assert queue.vm_domain_states["civil-petition-sms"] == vm_ops.get_sms_ops().drift_detail
+    assert queue.sms_archive_state_dir == tmp_path / "s-archive" and queue.vm_domain_state is None
+    assert queue.vm_pair_state is vm_ops.current_pair_verdict

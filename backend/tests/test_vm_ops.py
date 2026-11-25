@@ -1196,24 +1196,24 @@ def test_the_pair_holds_only_when_both_testbeds_installed_the_one_expected_value
     other_was = {**_installed("was01", testbed="s"), "/etc/tomcat10/server.xml": "ee" * 32}
     cases = {
         # S installed from another commit: its own records pass, its normalized checksums are not the pair's.
-        "wassvr01: normalized checksums differ from the expected ones for /etc/tomcat10/server.xml": (
+        "civil-petition-sms/wassvr01: normalized checksums differ from the expected ones for /etc/tomcat10/server.xml": (
             {}, {"wassvr01": {"files": {"pair_normalized": _normalized(other_was)}}}),
         # T changed too: T is held to the same one value.
-        "db01: normalized checksums differ from the expected ones for /etc/postgresql/16/main/extra.conf": (
+        "civil-petition/db01: normalized checksums differ from the expected ones for /etc/postgresql/16/main/extra.conf": (
             {"db01": {"files": {"pair_normalized": _normalized({**_installed("db01", testbed="t"),
                                                                  "/etc/postgresql/16/main/extra.conf": "0" * 64})}}}, {}),
-        "loadgen: load scripts differ from the expected ones (loadgen/entrypoint.sh, loadgen/script.js)": (
+        "civil-petition-sms/loadgen: load scripts differ from the expected ones (loadgen/entrypoint.sh, loadgen/script.js)": (
             {}, {"loadgen": {"files": {"pair_normalized": _normalized({**_installed("loadgen", testbed="s"),
                                                                         "loadgen/script.js": "ff" * 32})}}}),
-        "web01: no /var/lib/petition-deploy/normalized.sha256": ({"web01": {"files": {"pair_normalized": None}}}, {}),
+        "civil-petition/web01: no /var/lib/petition-deploy/normalized.sha256": ({"web01": {"files": {"pair_normalized": None}}}, {}),
         "civil-petition-sms WAR record is not civil-petition's": (
             {}, {"wassvr02": {"files": {"pair_war": "9a" * 32 + "  petition.war\n"}}}),
         "civil-petition WAS carry 2 WAR record lines, expected one": (
             {"was02": {"files": {"pair_war": "9b" * 32 + "  petition.war\n"}}}, {}),
-        "no WAR record on was01": ({"was01": {"files": {"pair_war": None}}}, {}),
-        "websvr01 changed since install: " + site: (
+        "no WAR record on civil-petition/was01": ({"was01": {"files": {"pair_war": None}}}, {}),
+        "civil-petition-sms/websvr01 changed since install: " + site: (
             {}, {"websvr01": {"sums": {"/var/lib/petition-deploy/expected.sha256": "rc=1"}, "drift": (site,)}}),
-        "wassvr01 tomcat10.service failed": ({}, {"wassvr01": {"units": {"tomcat10.service": "failed"}}}),
+        "civil-petition-sms/wassvr01 tomcat10.service failed": ({}, {"wassvr01": {"units": {"tomcat10.service": "failed"}}}),
     }
     for index, (words, (t_out, s_out)) in enumerate(cases.items()):
         t_ops, s_ops, expected = _pair_ops(tmp_path / f"c{index}", t_out, s_out)
@@ -1226,20 +1226,40 @@ def test_the_pair_holds_only_when_both_testbeds_installed_the_one_expected_value
     assert vm_ops.pair_verdict(t_ops, s_ops, excused=held, expected_path=expected)["pair"] is True
     t_ops, s_ops, expected = _pair_ops(tmp_path / "stale", {}, {}, s_age_min=30)
     verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
-    assert verdict["pair"] is False and "websvr01: no fresh periodic read" in verdict["differences"]
+    assert verdict["pair"] is False and "civil-petition-sms/websvr01: no fresh periodic read" in verdict["differences"]
     # A VM the expected values do not pair, no expected value, or a broken one: no pair, with why.
     document = _expected_document()
     document["pairs"] = [row for row in document["pairs"] if row["s"] != "dbsvr01"]
     t_ops, s_ops, expected = _pair_ops(tmp_path / "unpaired", {}, {}, expected=document)
     verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
-    assert verdict["pair"] is False and "dbsvr01: no pair in the expected values" in verdict["differences"]
+    assert verdict["pair"] is False and "civil-petition-sms/dbsvr01: no pair in the expected values" in verdict["differences"]
+    assert "pair expected values have 4 pairs, the testbeds have 5" in verdict["differences"]
     t_ops, s_ops, expected = _pair_ops(tmp_path / "noexp", {}, {})
     expected.unlink()
     verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
     assert verdict["pair"] is False and "pair expected values unreadable" in verdict["differences"][0]
-    t_ops, s_ops, expected = _pair_ops(tmp_path / "bad", {}, {}, expected={"pairs": [], "loadgen_files": {}})
+    t_ops, s_ops, expected = _pair_ops(tmp_path / "bad", {}, {}, expected={
+        "schema": "petition-pair-expected/1", "pairs": [], "loadgen_files": {}})
     verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
     assert verdict["pair"] is False and "have no pairs" in verdict["differences"][0]
+    # Review rv-st4r L9: another schema, a pair without one of its fields, or a pair whose role is not the VM's.
+    for index, (change, words) in enumerate((
+        (lambda d: d.update(schema="petition-pair-expected/2"), "schema 'petition-pair-expected/2'"),
+        (lambda d: d["pairs"][0].pop("role"), "a pair lacks 'role'"),
+        (lambda d: d["pairs"][1].update(t_only="/etc/default/lldpd"), "t_only and differs must be lists"),
+    )):
+        document = _expected_document()
+        change(document)
+        t_ops, s_ops, expected = _pair_ops(tmp_path / f"shape{index}", {}, {}, expected=document)
+        verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
+        assert verdict["pair"] is False and "pair expected values unreadable" in verdict["differences"][0], verdict
+        assert words in verdict["differences"][0]
+    document = _expected_document()
+    document["pairs"][3]["role"] = "was"
+    t_ops, s_ops, expected = _pair_ops(tmp_path / "role", {}, {}, expected=document)
+    verdict = vm_ops.pair_verdict(t_ops, s_ops, expected_path=expected)
+    assert verdict["pair"] is False
+    assert "civil-petition/db01: is a db VM, the expected pair says was" in verdict["differences"]
 
 
 def test_the_pair_is_no_pair_with_why_while_either_testbed_is_off(monkeypatch) -> None:
@@ -1247,6 +1267,7 @@ def test_the_pair_is_no_pair_with_why_while_either_testbed_is_off(monkeypatch) -
     monkeypatch.setattr(vm_ops, "get_sms_ops", lambda: None)
     verdict = vm_ops.current_pair_verdict()
     assert verdict["pair"] is False and "civil-petition, civil-petition-sms" in verdict["differences"][0]
+    assert verdict["checked"] == [] and "servers" not in verdict  # the same fields as pair_verdict (review L6)
 
 
 def test_s_reads_its_own_vms_with_its_own_cli_domain_and_state(tmp_path: Path, monkeypatch) -> None:

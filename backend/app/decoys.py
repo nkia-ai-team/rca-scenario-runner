@@ -426,8 +426,10 @@ _DOMAIN_WORDS: dict[str, tuple[str, ...]] = {
     "civil-petition": ("민원", "petition"),
     # The S testbed runs the same portal (S design decision 5): the same words. Its VM names and policy short names
     # (websvr01, petition-websvr01) differ from T's (web01, petition-web01); what the two share is the containers
-    # (petition, apache2) and the aliases (WAS, 웹 서버), which name a target only inside its own domain's
-    # namespace (review rv-st4r L4).
+    # (petition, apache2) and the aliases (WAS, 웹 서버). mentioned_targets looks for those in every namespace, so a
+    # shared alias or container named in either domain's answer key excludes the targets of both; the effect stays
+    # inside the scenario's own domain only because VM decoys are drawn for same-domain recordings alone
+    # (decoy_candidates; review rv-st4r L4, L7).
     "civil-petition-sms": ("민원", "petition"),
 }
 # Short names that also mean something else: everyday words an answer key uses
