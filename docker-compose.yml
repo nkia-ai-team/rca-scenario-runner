@@ -113,6 +113,11 @@ services:
       - CIVIL_PETITION_SMS_OPS=${CIVIL_PETITION_SMS_OPS:-}
       # S 의 보관 배치 상태(같은 판정, 검사 이름 petition_sms_archive_state). 켤 때는 /app/state/vm-ops/civil-petition-sms/petition-archive.
       - PETITION_SMS_ARCHIVE_STATE_DIR=${PETITION_SMS_ARCHIVE_STATE_DIR:-}
+      # 주입 시작 직전 119 부하 검사(backend/app/live_queue.py MONITORING_LOAD_*): 직전 10분 CPU(steal 제외)나
+      # 1분 부하 평균 최댓값이 문턱을 넘으면 주입을 보류하고 다시 본다. 0 이면 꺼짐, 문턱은 비우면 코드 기본값.
+      - PREFLIGHT_119_LOAD_GATE=${PREFLIGHT_119_LOAD_GATE:-1}
+      - PREFLIGHT_119_CPU_MAX_PCT=${PREFLIGHT_119_CPU_MAX_PCT:-}
+      - PREFLIGHT_119_LOAD1_MAX=${PREFLIGHT_119_LOAD1_MAX:-}
       # 주입 시작 직전 테스트베드 앱 파드(rca-testbed-*, 컨트롤러 소유) 전부 Ready 검사(v4 ORAFIX). 0 이면 꺼짐.
       - DOMAIN_PODS_CHECK=${DOMAIN_PODS_CHECK:-1}
       # 모델 스냅샷 평면. 비우면 auto(워크로드 실재 여부로 판별).

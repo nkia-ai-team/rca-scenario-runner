@@ -232,6 +232,16 @@ ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 # fetches every 5, so a normal age is up to about 35 minutes and one missed run makes it up to about 65;
 # 75 minutes blocks only once a second run is also missing (and stays under the 90 of a third).
 # Default 75 minutes, PETITION_ARCHIVE_STATE_MAX_AGE_SEC overrides. Off unless the directory is configured.
+# 119 load gate (questions.md Q44 answer, task 1): when other load on 119's host pushes it, its pollers fall behind
+# and write false DOWNs into a recording (11-25 21:57:59 the router read DOWN for 44 s at CPU 84.7 %, load 15.5 ~
+# 23.4 on 8 vCPUs). Right before an injection, the last 10 minutes of 119's CPU busy share (steal excluded) and its
+# highest 1-minute load average must stay under these; else the injection is held (not dirty, not a pause) and the
+# gate looks again. Thresholds from that case and 119's last 7 days (LOADGATE.md): 80 % and 20 (2.5 per vCPU) hold
+# 13.7 % of 10-minute windows and catch the case at every minute from 21:50. A reading that fails holds too.
+MONITORING_LOAD_CHECK_NAME = "monitoring_load"
+MONITORING_CPU_MAX_PCT = 80.0
+MONITORING_LOAD1_MAX = 20.0
+MONITORING_LOAD_RECHECK = timedelta(seconds=30)
 ARCHIVE_STATE_CHECK_NAME = "petition_archive_state"
 # The same check on the S testbed's dbsvr01 (S design §7-4 보관 배치 상태: same timer, same file, same verdict).
 ARCHIVE_STATE_SMS_CHECK_NAME = "petition_sms_archive_state"
@@ -651,6 +661,10 @@ class LiveScenarioQueue:
         vm_domain_states: "Mapping[str, Callable[..., str | None]] | None" = None,
         sms_archive_state_dir: Path | None = None,
         vm_pair_state: "Callable[[], dict[str, Any]] | None" = None,
+        monitoring_load_probe: "Callable[[], dict[str, float]] | None" = None,
+        monitoring_load_peak: "Callable[[datetime, datetime], dict[str, Any]] | None" = None,
+        monitoring_cpu_max_pct: float = MONITORING_CPU_MAX_PCT,
+        monitoring_load1_max: float = MONITORING_LOAD1_MAX,
     ) -> None:
         self.runner = runner
         # Per-domain preflight probes (spec-testbed-vm-3tier §6-4): a scenario of a domain listed here is judged on
@@ -666,6 +680,13 @@ class LiveScenarioQueue:
         # run folder as pair.json (pair true or false and why; a held decoy's file excused as in the drift gate).
         # Never a gate. None leaves it out.
         self.vm_pair_state = vm_pair_state
+        # 119 load right before an injection (MONITORING_LOAD_* above): None leaves it out (unit tests).
+        self.monitoring_load_probe = monitoring_load_probe
+        self.monitoring_load_peak = monitoring_load_peak
+        self.monitoring_cpu_max_pct = monitoring_cpu_max_pct
+        self.monitoring_load1_max = monitoring_load1_max
+        self._monitoring_looked: datetime | None = None
+        self._monitoring_reading: dict[str, Any] | None = None
         # None while every testbed app pod is Ready, else what is not. None (no probe) leaves the
         # check out (unit tests, older deployments). Called only right before an injection starts.
         self.domain_pods_probe = domain_pods_probe
@@ -1379,6 +1400,8 @@ class LiveScenarioQueue:
             return state, None, None
         if verdict_pods == "pause":
             return self._pause(state, detail or DOMAIN_PODS_CHECK_NAME), None, None
+        if self._monitoring_load_gate()[0]:
+            return state, None, None
         vm_state = self._vm_domain_state_blocker(scenario_id)
         if vm_state is not None:
             return self._pause(state, vm_state), None, None
@@ -1744,6 +1767,30 @@ class LiveScenarioQueue:
             self.injection_reserved = False
         return await asyncio.to_thread(self._enter_cycle_running, state, run, verdict)
 
+    def _monitoring_load_gate(self) -> tuple[bool, str | None]:
+        """(hold, detail) for 119's load right before an injection (MONITORING_LOAD_* above). Looks again at most every
+        MONITORING_LOAD_RECHECK; the reading the injection started on is kept for its preflight record."""
+        if self.monitoring_load_probe is None:
+            return False, None
+        now = self.clock.now()
+        if self._monitoring_looked is None or now - self._monitoring_looked >= MONITORING_LOAD_RECHECK:
+            self._monitoring_looked = now
+            try:
+                self._monitoring_reading = dict(self.monitoring_load_probe())
+            except Exception as error:
+                self._monitoring_reading = {"error": f"{type(error).__name__}: {error}"[:300]}
+        reading = self._monitoring_reading or {}
+        if "error" in reading:
+            detail = f"119 load unreadable: {reading['error']}"
+        else:
+            cpu, load = float(reading["cpu_busy_pct"]), float(reading["load1_max"])
+            if cpu < self.monitoring_cpu_max_pct and load < self.monitoring_load1_max:
+                return False, None
+            detail = (f"119 CPU busy {cpu:.1f}% (limit {self.monitoring_cpu_max_pct:g}), load1 max {load:.1f} "
+                      f"(limit {self.monitoring_load1_max:g}) over the last 10 minutes")
+        logger.warning("injection held: %s: %s", MONITORING_LOAD_CHECK_NAME, detail)
+        return True, detail
+
     def _domain_pods_gate(self, scenario_id: str | None = None) -> tuple[str, str | None]:
         """("go", None), ("hold", detail) or ("pause", reason) for the testbed app pods right before an
         injection (DOMAIN_PODS_* above). Hold keeps the queue in its phase; the next tick asks again.
@@ -1904,6 +1951,8 @@ class LiveScenarioQueue:
             return state, None
         if verdict_pods == "pause":
             return self._pause(state, detail or DOMAIN_PODS_CHECK_NAME), None
+        if self._monitoring_load_gate()[0]:
+            return state, None
         # None = decoys off; a list (possibly empty) = decoys on for this cycle.
         decoys = state.cycle_decoys if state.cycle_decoy_seed is not None else None
         vm_state = self._vm_domain_state_blocker(scenario_id, decoys)
@@ -2015,6 +2064,7 @@ class LiveScenarioQueue:
         # exposed on the production run — shortened smoke cooldown 5m<20m hid it.)
         if capture_enabled():
             self._write_cycle_phases(state)
+        self._record_monitoring_window(state, t2)
         state = state.model_copy(
             update={
                 "phase": "cycle_cooldown",
@@ -3348,12 +3398,43 @@ class LiveScenarioQueue:
 
     def _write_preflight(self, run_id: str, verdict: PreflightVerdict) -> None:
         """Drop the verdict where ProductionCaptureInvoker forwards it to capture."""
+        document = verdict.to_meta()
+        if self.monitoring_load_probe is not None and self._monitoring_reading:
+            # The 119 load reading this injection started on (MONITORING_LOAD_*); capture carries preflight.json
+            # into meta.json as it is.
+            document["monitoring_load_gate"] = {
+                **self._monitoring_reading,
+                "cpu_max_pct": self.monitoring_cpu_max_pct, "load1_max_limit": self.monitoring_load1_max,
+            }
+        self._write_preflight_document(run_id, document)
+
+    def _record_monitoring_window(self, state: LiveQueueState, t2: datetime) -> None:
+        """At cooldown entry, before the capture reads preflight.json (t2 + 20 minutes), add 119's highest CPU busy
+        share and load from the cycle start to the injection end (``monitoring_load_window``), so the recording's
+        meta says how loaded 119 was while it recorded (Q44 answer, task 1). A failed read is recorded as such."""
+        if self.monitoring_load_peak is None or state.current_run_id is None or state.cycle_started_at is None:
+            return
+        path = self.runner.artifact_store.root / state.current_run_id / "preflight.json"
+        if not path.is_file():
+            return
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                peak = dict(self.monitoring_load_peak(parse_utc(state.cycle_started_at, field="cycle_started_at"), t2))
+            except Exception as error:
+                peak = {"error": f"{type(error).__name__}: {error}"[:300]}
+            document["monitoring_load_window"] = peak
+            self._write_preflight_document(state.current_run_id, document)
+        except Exception as error:
+            logger.warning("119 load window not recorded for %s: %s", state.current_run_id, error)
+
+    def _write_preflight_document(self, run_id: str, document: Mapping[str, Any]) -> None:
         path = self.runner.artifact_store.root / run_id / "preflight.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(verdict.to_meta(), stream, indent=2, sort_keys=True)
+                json.dump(document, stream, indent=2, sort_keys=True)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -3664,6 +3745,21 @@ def vm_testbed_queue_settings() -> dict[str, Any]:
     }
 
 
+def monitoring_load_settings() -> dict[str, Any]:
+    """The 119 load gate from the environment: on unless PREFLIGHT_119_LOAD_GATE is 0/off; limits
+    PREFLIGHT_119_CPU_MAX_PCT and PREFLIGHT_119_LOAD1_MAX (defaults MONITORING_*)."""
+    if os.environ.get("PREFLIGHT_119_LOAD_GATE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return {"monitoring_load_probe": None, "monitoring_load_peak": None}
+    from app.preflight_probe import monitoring_load, monitoring_load_peak
+
+    return {
+        "monitoring_load_probe": monitoring_load,
+        "monitoring_load_peak": lambda start, end: monitoring_load_peak(start, end),
+        "monitoring_cpu_max_pct": float(os.environ.get("PREFLIGHT_119_CPU_MAX_PCT", "") or MONITORING_CPU_MAX_PCT),
+        "monitoring_load1_max": float(os.environ.get("PREFLIGHT_119_LOAD1_MAX", "") or MONITORING_LOAD1_MAX),
+    }
+
+
 def get_live_queue() -> LiveScenarioQueue:
     global _queue
     if _queue is None:
@@ -3774,5 +3870,6 @@ def get_live_queue() -> LiveScenarioQueue:
             # CIVIL_PETITION_OPS is on (app.vm_ops runs the management connections and the periodic read).
             domain_preflight_probes=vm_domain_probes() if preflight_probe is not None else {},
             **vm_testbed_queue_settings(),
+            **monitoring_load_settings(),
         )
     return _queue

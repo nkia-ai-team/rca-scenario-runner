@@ -662,3 +662,47 @@ def test_both_vm_testbeds_get_their_probe_and_s_reads_the_tunnel_through_t(tmp_p
     monkeypatch.setattr(_vm_ops, "_sms_ops", None)
     with _pytest.raises(_vm_ops.VmOpsError, match="not 'civil-petition-sms'"):
         preflight_probe.vm_domain_probes()
+
+
+def test_119_load_reads_cpu_without_steal_and_the_highest_load_from_119_s_own_host_metrics() -> None:
+    """Q44 answer, task 1: 119's own otelcol hostmetrics (its one target id), CPU busy without idle, iowait and
+    steal over the window, the highest 1-minute load in it; no data is an error (the gate holds)."""
+    from app.preflight_probe import MONITORING_HOST_TARGET, monitoring_load, monitoring_load_peak
+
+    seen = []
+
+    @contextmanager
+    def urlopen(url, timeout=None):
+        query = _urlparse.parse_qs(_urlparse.urlparse(url).query)
+        seen.append(query)
+
+        class Response:
+            def read(self):
+                q = query["query"][0]
+                value = "23.4" if "load_average" in q else "84.1"
+                return json.dumps({"data": {"result": [{"metric": {}, "value": [0, value]}]}}).encode()
+
+        yield Response()
+
+    reading = monitoring_load("http://vm", urlopen=urlopen)
+    assert reading == {"cpu_busy_pct": 84.1, "load1_max": 23.4, "window_sec": 600.0}
+    cpu, load = seen[0]["query"][0], seen[1]["query"][0]
+    assert f'target_id="{MONITORING_HOST_TARGET}"' in cpu and 'state!~"idle|wait|steal"' in cpu and "[600s]" in cpu
+    assert load == f'max_over_time(system.cpu.load_average.1m{{target_id="{MONITORING_HOST_TARGET}"}}[600s])'
+    start, end = datetime(2026, 11, 25, 12, 30, tzinfo=timezone.utc), datetime(2026, 11, 25, 13, 10, tzinfo=timezone.utc)
+    peak = monitoring_load_peak(start, end, "http://vm", urlopen=urlopen)
+    assert peak == {"from": "2026-11-25T12:30:00Z", "to": "2026-11-25T13:10:00Z", "cpu_busy_pct_max": 84.1,
+                    "load1_max": 23.4}
+    assert seen[-2]["query"][0].startswith("max_over_time((100 * sum(rate(") and "[2400s:1m]" in seen[-2]["query"][0]
+    assert seen[-1]["time"] == [str(int(end.timestamp()))]
+
+    @contextmanager
+    def empty(url, timeout=None):
+        class Response:
+            def read(self):
+                return b'{"data": {"result": []}}'
+
+        yield Response()
+
+    with _pytest.raises(RuntimeError, match="119 host metrics returned no data"):
+        monitoring_load("http://vm", urlopen=empty)

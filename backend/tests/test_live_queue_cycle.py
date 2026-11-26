@@ -3194,3 +3194,61 @@ def test_the_held_guard_reads_the_approved_manifests_where_the_controller_does(t
         assert queue._scenario_max_injection_sec(document["id"]) == expected, document["id"]
         seen.add(expected)
     assert len(seen) > 1, seen
+
+
+@pytest.mark.asyncio
+async def test_the_cycle_buffer_gate_holds_on_a_loaded_119_and_the_window_peak_goes_into_preflight(tmp_path: Path) -> None:
+    """Q44 answer, task 1: the buffer gate holds while 119 is over its limits (the buffer stays, no restart, no
+    pause); once it starts, cooldown entry adds 119's highest CPU and load from the cycle start to the injection end
+    to preflight.json before the capture reads it."""
+    queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
+    answers = [{"cpu_busy_pct": 90.0, "load1_max": 5.0, "window_sec": 600.0}]
+    queue.monitoring_load_probe = lambda: answers[0]
+    from tests.test_live_queue import FakePreflightProbe
+
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    peaks = []
+    queue.monitoring_load_peak = lambda start, end: peaks.append((start, end)) or {
+        "from": "x", "to": "y", "cpu_busy_pct_max": 88.8, "load1_max": 23.4}
+    await queue.start()
+    state = await queue.tick()
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "cycle_buffer"
+    clock.value = state_expected(state)
+    state = await queue.tick()
+    assert state.phase == "cycle_buffer" and runner.started == []
+    answers[0] = {"cpu_busy_pct": 50.0, "load1_max": 5.0, "window_sec": 600.0}
+    clock.value += timedelta(seconds=30)
+    state = await queue.tick()
+    assert state.phase == "running" and runner.started == [("F01-R", "run")], state.reason
+    run_id = state.current_run_id
+    _complete_injection(runner, scheduler, clock, run_id, t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    state = await queue.tick()
+    assert state.phase == "cycle_cooldown"
+    recorded = json.loads((runner.artifact_store.root / run_id / "preflight.json").read_text())
+    assert recorded["monitoring_load_window"]["load1_max"] == 23.4
+    assert recorded["monitoring_load_gate"]["cpu_busy_pct"] == 50.0
+    start, end = peaks[0]
+    assert start == datetime.strptime(state.cycle_started_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    assert end == datetime(2026, 7, 16, 10, 15, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_119_peak_read_is_recorded_and_does_not_stop_the_cycle(tmp_path: Path) -> None:
+    queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
+
+    def broken(start, end):
+        raise RuntimeError("119 unreachable")
+
+    queue.monitoring_load_peak = broken
+    from tests.test_live_queue import FakePreflightProbe
+
+    queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
+    state = await _advance_to_injection(queue, runner, clock, scenario_id="F01-R")
+    run_id = state.current_run_id
+    _complete_injection(runner, scheduler, clock, run_id, t1="2026-07-16T10:10:00Z", t2="2026-07-16T10:15:00Z")
+    state = await queue.tick()
+    assert state.phase == "cycle_cooldown"
+    recorded = json.loads((runner.artifact_store.root / run_id / "preflight.json").read_text())
+    assert recorded["monitoring_load_window"] == {"error": "RuntimeError: 119 unreachable"}

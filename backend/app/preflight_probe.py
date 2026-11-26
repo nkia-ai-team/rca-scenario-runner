@@ -28,9 +28,9 @@ import shlex
 import subprocess
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from app import vm_ops as _vm_ops
@@ -56,6 +56,65 @@ _TIMEOUT_SEC = 10
 
 P95_QUERY = 'max(apm.agent.otel.java.percentile95{service_name="commerce-gateway"}) / 1000'
 POOL_PENDING_QUERY = 'max(db.client.connections.pending_requests{service_name=~"commerce-.*"})'
+
+
+# 119 itself (questions.md Q44 answer, task 1): when 119 is pushed by other load on its host, its pollers fall behind
+# and write false DOWNs into a recording (11-25 21:57:59 the router read DOWN for 44 s with 119 at CPU 84.7 %, load
+# 15.5 ~ 23.4 on 8 vCPUs). 119's own host metrics (otelcol hostmetrics, the one target id below) answer it.
+MONITORING_HOST_TARGET = "00000000-0000-0000-0000-00000000aaaa"
+# CPU busy share without steal (a host taking CPU away is not 119 being busy) and without idle and iowait.
+MONITORING_CPU_BUSY = (
+    '100 * sum(rate(system.cpu.time{{target_id="{t}",state!~"idle|wait|steal"}}[{w}]))'
+    ' / sum(rate(system.cpu.time{{target_id="{t}"}}[{w}]))'
+)
+MONITORING_LOAD1 = 'system.cpu.load_average.1m{{target_id="{t}"}}'
+
+
+def monitoring_load(vm_url: str | None = None, *, urlopen=None, now: datetime | None = None,
+                    window_sec: int = 600) -> dict[str, float]:
+    """119's CPU busy percent averaged over the last ``window_sec`` (steal excluded) and the highest 1-minute load
+    average in it, read from 119's VictoriaMetrics. Raises when either is missing (the gate then holds)."""
+    base = (vm_url or os.environ.get("PREFLIGHT_VM_URL") or DEFAULT_VM_URL).rstrip("/")
+    opener = urlopen or urllib.request.urlopen
+    window = f"{int(window_sec)}s"
+
+    def scalar(promql: str) -> float:
+        params = {"query": promql}
+        if now is not None:
+            params["time"] = str(int(now.timestamp()))
+        with opener(f"{base}/api/v1/query?{urllib.parse.urlencode(params)}", timeout=_TIMEOUT_SEC) as response:
+            document = json.loads(response.read())
+        rows = document.get("data", {}).get("result", [])
+        if not rows:
+            raise RuntimeError(f"119 host metrics returned no data: {promql}")
+        return float(rows[0]["value"][1])
+
+    return {
+        "cpu_busy_pct": scalar(MONITORING_CPU_BUSY.format(t=MONITORING_HOST_TARGET, w=window)),
+        "load1_max": scalar(f"max_over_time({MONITORING_LOAD1.format(t=MONITORING_HOST_TARGET)}[{window}])"),
+        "window_sec": float(window_sec),
+    }
+
+
+def monitoring_load_peak(start: datetime, end: datetime, vm_url: str | None = None, *, urlopen=None) -> dict[str, Any]:
+    """The highest 1-minute CPU busy percent (steal excluded) and 1-minute load average of 119 between ``start``
+    and ``end`` (a recording window), for the record of that recording."""
+    base = (vm_url or os.environ.get("PREFLIGHT_VM_URL") or DEFAULT_VM_URL).rstrip("/")
+    opener = urlopen or urllib.request.urlopen
+    span = max(60, int((end - start).total_seconds()))
+    cpu = MONITORING_CPU_BUSY.format(t=MONITORING_HOST_TARGET, w="1m")
+    load = MONITORING_LOAD1.format(t=MONITORING_HOST_TARGET)
+    out: dict[str, Any] = {
+        "from": start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "to": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    for key, promql in (("cpu_busy_pct_max", f"max_over_time(({cpu})[{span}s:1m])"),
+                        ("load1_max", f"max_over_time({load}[{span}s])")):
+        params = {"query": promql, "time": str(int(end.timestamp()))}
+        with opener(f"{base}/api/v1/query?{urllib.parse.urlencode(params)}", timeout=_TIMEOUT_SEC) as response:
+            rows = json.loads(response.read()).get("data", {}).get("result", [])
+        out[key] = float(rows[0]["value"][1]) if rows else None
+    return out
 
 
 class ProductionPreflightProbe:
