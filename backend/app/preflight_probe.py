@@ -26,6 +26,7 @@ import re
 import os
 import shlex
 import subprocess
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -126,6 +127,48 @@ def monitoring_load_peak(start: datetime, end: datetime, vm_url: str | None = No
     return out
 
 
+def promql_regex_literal(values) -> str:
+    r"""An alternation of exact values for a MetricsQL `=~"..."` matcher. The regex escape (``\.``) must itself be
+    escaped inside the double-quoted string literal (``\\.``): VictoriaMetrics rejects ``"192\.168..."`` with 422
+    «cannot parse string literal ... invalid syntax» (PF422, the S and T freshness queries; the same fix as
+    testbed-services 4fccfc6). Quotes are escaped too."""
+    return "|".join(re.escape(str(value)) for value in values).replace("\\", "\\\\").replace('"', '\\"')
+
+
+class PreflightSignalError(RuntimeError):
+    """A preflight signal could not be read; the message names the signal and the request (PF422)."""
+
+
+def describe_error(error: BaseException) -> str:
+    """What failed, for the pause reason and the log: an HTTP error says its status, the path it went to (with the
+    PromQL of a VictoriaMetrics query) and the start of the answer body (VictoriaMetrics puts the reason there)."""
+    if isinstance(error, urllib.error.HTTPError):
+        url = urllib.parse.urlparse(getattr(error, "url", None) or error.filename or "")
+        where = url.path or "?"
+        promql = urllib.parse.parse_qs(url.query).get("query")
+        if promql:
+            where += f" query={promql[0][:160]}"
+        try:
+            body = error.read()[:240].decode("utf-8", "replace").strip()
+        except Exception:
+            body = ""
+        return f"HTTP {error.code} {error.reason} from {url.netloc}{where}" + (f": {body}" if body else "")
+    if isinstance(error, urllib.error.URLError):
+        return f"{type(error).__name__}: {error.reason}"
+    return f"{type(error).__name__}: {error}"
+
+
+def read_signal(name: str, read):
+    """``read()`` with its failure named by the signal and the request (PF422: a bare «HTTP Error 422» in the pause
+    reason did not say which of the preflight's requests had failed)."""
+    try:
+        return read()
+    except PreflightSignalError:
+        raise
+    except Exception as error:
+        raise PreflightSignalError(f"{name}: {describe_error(error)}"[:600]) from error
+
+
 class ProductionPreflightProbe:
     def __init__(self, *, vm_url: str | None = None, process_runner=subprocess.run, urlopen=None):
         self.vm_url = (vm_url or os.environ.get("PREFLIGHT_VM_URL") or DEFAULT_VM_URL).rstrip("/")
@@ -141,16 +184,18 @@ class ProductionPreflightProbe:
 
     def collect(self, *, now: datetime) -> Mapping[str, float]:
         del now
-        alive, iters_per_sec = self._loadgen_state()
+        alive, iters_per_sec = read_signal("baseline_loadgen", self._loadgen_state)
         return {
             "baseline_loadgen_alive": 1.0 if alive else 0.0,
             "achieved_rps": iters_per_sec,
             "diurnal_rps_floor": DIURNAL_RPS_FLOOR,
-            "user_5xx_rate": self._gateway_5xx_fraction(),
-            "entry_p95_sec": self._vm_scalar(P95_QUERY),
-            "active_alarms": float(self._firing_alarm_count()),
-            "open_incidents": float(open_incident_count()),
-            "prev_pool_pending": self._vm_scalar(POOL_PENDING_QUERY, default=0.0),
+            "user_5xx_rate": read_signal("user_5xx_rate", self._gateway_5xx_fraction),
+            "entry_p95_sec": read_signal("entry_p95_sec", lambda: self._vm_scalar(P95_QUERY)),
+            "active_alarms": float(read_signal("active_alarms", self._firing_alarm_count)),
+            "open_incidents": float(read_signal("open_incidents", open_incident_count)),
+            "prev_pool_pending": read_signal(
+                "prev_pool_pending", lambda: self._vm_scalar(POOL_PENDING_QUERY, default=0.0)
+            ),
         }
 
     def _loadgen_state(self) -> tuple[bool, float]:
@@ -328,7 +373,7 @@ class VmDomainPreflightProbe:
         return self.base.last_excused_alarms
 
     def collect(self, *, now: datetime) -> Mapping[str, float]:
-        alive, document, env_line = self.ops.read_loadgen_live()
+        alive, document, env_line = read_signal("baseline_loadgen", self.ops.read_loadgen_live)
         if document.get("domain") != self.domain or "scenario_id" in document:
             raise _vm_ops.VmOpsError("loadgen live summary is not this domain's baseline document")
         age = (now - datetime.fromisoformat(str(document["observed_at"]).replace("Z", "+00:00"))).total_seconds()
@@ -341,7 +386,7 @@ class VmDomainPreflightProbe:
         facts = self._fresh_facts(now)
         if not self.tunnel_ops.hypervisor_target:
             raise _vm_ops.VmOpsError(f"{self.domain}: no 66 read for the tunnel (the T testbed's operations are off)")
-        hypervisor = self.tunnel_ops.hypervisor_facts()
+        hypervisor = read_signal("tunnel", self.tunnel_ops.hypervisor_facts)
         handshake = hypervisor.get("handshake_age_sec")
         ping = hypervisor.get("ping") or {}
         sent, received = int(ping.get("sent", 0)), int(ping.get("received", 0))
@@ -368,7 +413,7 @@ class VmDomainPreflightProbe:
         if self.tunnel_ops is self.ops:
             # 66's guards belong to this domain's 66 executors (T); S has none there.
             guards += int(hypervisor.get("guards_active", 0))
-        freshness = self._freshness()
+        freshness = read_signal("monitoring_freshness", self._freshness)
         tunnel_load = self._tunnel_load_mbps()
         router = {"router_cpu_pct": self._router_cpu_pct()} if self.ops.domain.router else {}
         return {
@@ -377,10 +422,12 @@ class VmDomainPreflightProbe:
             "diurnal_rps_floor": vm_domain_rps_floor(now, env_line),
             "user_5xx_rate": float(document["http_abnormal_rate"]),
             "entry_p95_sec": float(document["http_p95_ms"]) / 1000.0,
-            "active_alarms": float(self.base._firing_alarm_count()),
-            "open_incidents": float(self.incident_count()),
+            "active_alarms": float(read_signal("active_alarms", self.base._firing_alarm_count)),
+            "open_incidents": float(read_signal("open_incidents", self.incident_count)),
             # The same global residue signal the other domains are held on (U7 rule as is, review rv-t4r3 L1).
-            "prev_pool_pending": self.base._vm_scalar(POOL_PENDING_QUERY, default=0.0),
+            "prev_pool_pending": read_signal(
+                "prev_pool_pending", lambda: self.base._vm_scalar(POOL_PENDING_QUERY, default=0.0)
+            ),
             "residual_guards": float(guards),
             # None or negative (the helper's -1) = no handshake at all (review rv-t4r3 M1).
             "tunnel_handshake_age_sec": (
@@ -468,7 +515,7 @@ class VmDomainPreflightProbe:
 
     def _freshness(self) -> dict[str, float]:
         hosts = sorted(self.ops.domain.agent_hosts.values())
-        selector = "|".join(re.escape(host) for host in hosts)
+        selector = promql_regex_literal(hosts)
         lookback = f"[{FRESHNESS_LOOKBACK_SEC}s]"
         missing_age = float(FRESHNESS_LOOKBACK_SEC + 1)
 

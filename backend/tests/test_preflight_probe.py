@@ -623,7 +623,7 @@ def test_the_s_probe_reads_freshness_of_s_s_own_agents(tmp_path) -> None:
     probe.urlopen = spy
     observations = probe.collect(now=clock.value)
     fresh = [q for q in queries if "sms.cpu.utilization" in q or "sms.server.icmp_status" in q]
-    assert fresh and all("10\\.31\\.0\\.11" in q and "192\\.168\\.124" not in q for q in fresh), fresh
+    assert fresh and all("10\\\\.31\\\\.0\\\\.11" in q and "192\\\\.168\\\\.124" not in q for q in fresh), fresh
     assert not [q for q in queries if "nms.network.snmp_status" in q]
     assert observations["sms_icmp_down"] == 0
 
@@ -709,3 +709,101 @@ def test_119_load_reads_cpu_without_steal_and_the_highest_load_from_119_s_own_ho
 
     with _pytest.raises(RuntimeError, match="119 host metrics returned no data"):
         monitoring_load("http://vm", urlopen=empty)
+
+
+# --- PF422: a failed signal says which signal and which request ----------------------------------------------------
+import io as _io  # noqa: E402
+import urllib.error as _urlerror  # noqa: E402
+
+
+def _http_error(url: str, code: int, body: bytes):
+    return _urlerror.HTTPError(url, code, {422: "Unprocessable Entity", 504: "Gateway Timeout"}.get(code, "Error"),
+                               {}, _io.BytesIO(body))
+
+
+def test_a_failed_s_freshness_query_names_its_signal_path_query_status_and_body(tmp_path) -> None:
+    """PF422 (F80-P 11-27 17:43, «HTTP Error 422: Unprocessable Entity» with nothing else): the pause reason now says
+    which signal, which request (path and PromQL), the status and the start of VictoriaMetrics' answer."""
+    from app.preflight_probe import PreflightSignalError
+
+    probe, ops, remote, t_remote, clock = _sms_probe(tmp_path)
+    inner = probe.urlopen
+
+    def urlopen(url, timeout=None):
+        if "sms.server.icmp_status" in _urlparse.unquote_plus(url):
+            raise _http_error(url, 422, b'{"status":"error","errorType":"422","error":"cannot parse query"}')
+        return inner(url, timeout=timeout)
+
+    probe.urlopen = urlopen
+    with _pytest.raises(PreflightSignalError) as caught:
+        probe.collect(now=clock.value)
+    text = str(caught.value)
+    assert text.startswith("monitoring_freshness: HTTP 422 Unprocessable Entity from vm/api/v1/query query=")
+    assert "sms.server.icmp_status" in text and 'cannot parse query' in text
+
+
+def test_failed_alarm_incident_and_pool_reads_are_named(tmp_path) -> None:
+    from app.preflight_probe import PreflightSignalError
+
+    probe, ops, remote, t_remote, clock = _sms_probe(tmp_path)
+    probe.incident_count = lambda: (_ for _ in ()).throw(TimeoutError("timed out"))
+    with _pytest.raises(PreflightSignalError, match=r"^open_incidents: TimeoutError: timed out$"):
+        probe.collect(now=clock.value)
+    probe.incident_count = lambda: 0
+    inner = probe.base.urlopen
+
+    def alerts_422(url, timeout=None):
+        if url.endswith("/api/v1/alerts"):
+            raise _http_error(url, 422, b"missing vmalert")
+        return inner(url, timeout=timeout)
+
+    probe.base.urlopen = alerts_422
+    with _pytest.raises(PreflightSignalError, match=r"^active_alarms: HTTP 422 Unprocessable Entity from vm/api/v1/alerts: missing vmalert$"):
+        probe.collect(now=clock.value)
+
+    def pool_504(url, timeout=None):
+        if "pending_requests" in _urlparse.unquote_plus(url):
+            raise _http_error(url, 504, b"")
+        return inner(url, timeout=timeout)
+
+    probe.base.urlopen = pool_504
+    with _pytest.raises(PreflightSignalError, match=r"^prev_pool_pending: HTTP 504 Gateway Timeout from vm/api/v1/query query=max\(db\.client"):
+        probe.collect(now=clock.value)
+
+
+def test_the_kubernetes_preflight_names_its_failed_signal_too() -> None:
+    """The same for the other domains' probe (PF422 task 3)."""
+    from app.preflight_probe import PreflightSignalError, ProductionPreflightProbe
+
+    def urlopen(url, timeout=None):
+        raise _http_error(url if isinstance(url, str) else url.full_url, 422, b"bad")
+
+    probe = ProductionPreflightProbe(vm_url="http://vm", urlopen=urlopen,
+                                     process_runner=lambda *a, **k: subprocess.CompletedProcess(a, 0, "active\n5 iters/s", ""))
+    with _pytest.raises(PreflightSignalError, match=r"^user_5xx_rate: HTTP 422"):
+        probe.collect(now=_VM_NOW)
+
+
+def test_the_freshness_matcher_is_a_string_literal_victoriametrics_parses(tmp_path) -> None:
+    """PF422 cause (replayed against 119 at 17:5x KST): a regex escape inside a MetricsQL double-quoted literal must be
+    doubled; `host_name=~"192\\.168..."` is rejected with 422 «cannot parse string literal ... invalid syntax», for
+    S and T alike. The literal is read here the way VictoriaMetrics reads it (Go-style unquoting, as JSON), and the
+    regex it gives matches exactly the testbed's agents."""
+    import re
+
+    for domain_probe in (_sms_probe(tmp_path / "s")[0], _vm_probe(tmp_path / "t")[0]):
+        queries = []
+        inner = domain_probe.urlopen
+
+        def spy(url, timeout=None, inner=inner, queries=queries):
+            queries.append(_urlparse.parse_qs(_urlparse.urlparse(url).query).get("query", [""])[0])
+            return inner(url, timeout=timeout)
+
+        domain_probe.urlopen = spy
+        domain_probe._freshness()
+        hosts = sorted(domain_probe.ops.domain.agent_hosts.values())
+        for query in [q for q in queries if "host_name=~" in q]:
+            literal = query.split('host_name=~"', 1)[1].split('"}', 1)[0]
+            pattern = json.loads(f'"{literal}"')  # raises on «\.» like VictoriaMetrics does
+            assert all(re.fullmatch(pattern, host) for host in hosts)
+            assert not re.fullmatch(pattern, hosts[0].replace(".", "x", 1))
