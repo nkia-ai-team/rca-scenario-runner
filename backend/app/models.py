@@ -163,6 +163,14 @@ class Domain(BaseModel):
     scenario_count: int
 
 
+class CleanupProgress(BaseModel):
+    """A cleanup call in flight inside a run (RUNCL): which one, since when, how long so far."""
+    stage: Literal["terminal", "transition"]
+    started_at: datetime
+    elapsed_sec: int
+    recorded_at: datetime
+
+
 class ActiveRun(BaseModel):
     """Returned by /api/active. Tells everyone if the runner is busy and on what."""
     is_active: bool
@@ -171,6 +179,8 @@ class ActiveRun(BaseModel):
     mode: Optional[Literal["run", "cleanup"]] = None
     started_at: Optional[datetime] = None
     fencing_token: Optional[int] = None
+    # Set while the run's cleanup is in flight (the run's ticks stop until it returns), cleared when it returns.
+    cleanup: Optional[CleanupProgress] = None
 
 
 class RunInfo(BaseModel):

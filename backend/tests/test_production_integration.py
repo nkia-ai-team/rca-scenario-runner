@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1967,3 +1967,92 @@ def test_image_carries_the_mysql_client_the_db_executors_and_probes_call() -> No
     install = install[: install.index("\n\n")]
     assert '"PyMySQL==1.1.1"' in install
     assert dockerfile.index("PyMySQL==1.1.1") > dockerfile.index("FROM python:3.12-slim AS backend")
+
+
+async def test_the_runner_records_cleanup_progress_while_a_tick_waits_on_cleanup(tmp_path) -> None:
+    """RUNCL (11-27 21:14:12 ~ 21:34:14: a 1,200 s cleanup left no tick and no sign of life): while the tick awaits
+    a cleanup, every tick interval the runner writes a [CLEANUP] run log line and a cleanup-progress.jsonl line and
+    shows the cleanup on /api/active; ticks.jsonl keeps its shape; the tick's own result comes back unchanged and
+    the progress is cleared after it. A tick with no cleanup in flight records nothing."""
+    import asyncio
+
+    from app.models import RunInfo
+
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir = store.create("run-cl", {"controller": {}})
+
+    class MovingClock:
+        value = NOW
+
+        def now(self):
+            return self.value
+
+    clock = MovingClock()
+    runner = ScenarioRunner(tmp_path, tmp_path / "logs", artifact_store=store, clock=clock)
+    runner._current = RunInfo(run_id="run-cl", scenario_id="F80-P", mode="run", status="running",
+                              started_at=clock.now())
+    gate = asyncio.Event()
+    started = clock.now()
+
+    class Runtime:
+        session = SimpleNamespace(spec=SimpleNamespace(tick_interval_sec=0.05))
+        cleanup_in_progress = None
+
+        async def tick(self):
+            self.cleanup_in_progress = {"stage": "terminal", "started_at": started}
+            await gate.wait()
+            self.cleanup_in_progress = None
+            return "the session"
+
+    lines: list[str] = []
+    runtime = Runtime()
+    task = asyncio.ensure_future(runner._tick_with_cleanup_progress(runtime, run_dir, lines.append))
+    await asyncio.sleep(0.03)
+    clock.value = started + timedelta(seconds=600)
+    await asyncio.sleep(0.06)
+    active = runner.get_active()
+    assert active.cleanup is not None and active.cleanup.stage == "terminal" and active.cleanup.elapsed_sec == 600
+    assert active.cleanup.started_at == started
+    clock.value = started + timedelta(seconds=1200)
+    await asyncio.sleep(0.06)
+    gate.set()
+    assert await task == "the session"
+    progress = [json.loads(line) for line in (run_dir / "cleanup-progress.jsonl").read_text().splitlines()]
+    assert len(progress) >= 2 and {row["stage"] for row in progress} == {"terminal"}
+    assert progress[-1]["elapsed_sec"] == 1200
+    assert [line for line in lines if line.startswith("[CLEANUP] terminal cleanup in progress +")]
+    assert not (run_dir / "ticks.jsonl").exists()
+    assert runner.get_active().cleanup is None
+
+    class Plain:
+        session = SimpleNamespace(spec=SimpleNamespace(tick_interval_sec=0.05))
+        cleanup_in_progress = None
+
+        async def tick(self):
+            await asyncio.sleep(0.12)
+            return "plain"
+
+    before = (run_dir / "cleanup-progress.jsonl").read_text()
+    assert await runner._tick_with_cleanup_progress(Plain(), run_dir, lines.append) == "plain"
+    assert (run_dir / "cleanup-progress.jsonl").read_text() == before
+
+
+async def test_a_tick_that_raises_while_cleanup_is_in_flight_raises_as_before(tmp_path) -> None:
+    """The run's failure path (runner_exception, DIRTY) sees the same exception the tick raised."""
+    import asyncio
+
+    store = RunArtifactStore(tmp_path / "runs")
+    run_dir = store.create("run-x", {"controller": {}})
+    runner = ScenarioRunner(tmp_path, tmp_path / "logs", artifact_store=store, clock=Clock())
+
+    class Runtime:
+        session = SimpleNamespace(spec=SimpleNamespace(tick_interval_sec=0.02))
+        cleanup_in_progress = {"stage": "transition", "started_at": Clock().now()}
+
+        async def tick(self):
+            await asyncio.sleep(0.05)
+            raise RuntimeError("dispatcher vanished")
+
+    with pytest.raises(RuntimeError, match="dispatcher vanished"):
+        await runner._tick_with_cleanup_progress(Runtime(), run_dir, lambda line: None)
+    assert runner._cleanup_progress is None

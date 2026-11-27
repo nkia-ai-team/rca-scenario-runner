@@ -14,7 +14,7 @@ from typing import Awaitable, Callable, Literal, Optional, Protocol
 
 from app.execution import build_invocation, describe_invocation
 from app.controller import normalized_controller_plan
-from app.models import ActiveRun, ExecutionSpec, HistoryEntry, RunInfo, Status
+from app.models import ActiveRun, CleanupProgress, ExecutionSpec, HistoryEntry, RunInfo, Status
 from app.manifests import get_manifest, normalized_manifest_plan
 from app.scenarios import get_scenario
 from app.coordinator import GlobalCoordinator
@@ -59,6 +59,10 @@ RecoveryValidator = Callable[[object], bool | Awaitable[bool]]
 RuntimeFactory = Callable[..., AdaptiveRuntime]
 Sleeper = Callable[[float], Awaitable[None]]
 
+
+
+# Fallback progress interval for a cleanup in flight when a session has no tick interval (RUNCL).
+CLEANUP_PROGRESS_SEC = 15.0
 
 class Clock(Protocol):
     def now(self) -> datetime: ...
@@ -190,6 +194,8 @@ class ScenarioRunner:
 
         self._lock = asyncio.Lock()
         self._current: Optional[RunInfo] = None
+        # The run's cleanup in flight, for /api/active (RUNCL); None between cleanups.
+        self._cleanup_progress: Optional[CleanupProgress] = None
         self._log_buffer: deque[str] = deque(maxlen=_LOG_TAIL_SIZE)
         self._history: deque[HistoryEntry] = deque(maxlen=_HISTORY_SIZE)
         self._task: Optional[asyncio.Task] = None
@@ -265,6 +271,7 @@ class ScenarioRunner:
             mode=self._current.mode,
             started_at=self._current.started_at,
             fencing_token=self._current.fencing_token,
+            cleanup=self._cleanup_progress,
         )
 
     def get_history(self) -> list[HistoryEntry]:
@@ -965,7 +972,7 @@ class ScenarioRunner:
                     now=self.clock.now(),
                     lease_sec=self.lease_sec,
                 )
-                session = await runtime.tick()
+                session = await self._tick_with_cleanup_progress(runtime, run_dir, run_log)
                 self.artifact_store.persist_session(
                     run_dir, session.model_dump(mode="json")
                 )
@@ -1018,6 +1025,54 @@ class ScenarioRunner:
                 )
                 return -1, session
             return -1, None
+
+    async def _tick_with_cleanup_progress(self, runtime, run_dir: Path, run_log):
+        """``runtime.tick()``, recording cleanup progress while it waits on a cleanup (RUNCL: on 11-27 a 1,200 s
+        cleanup left the run with no tick and no sign of life from 21:14:12 to 21:34:14). Every tick interval while
+        the cleanup call is in flight: a ``[CLEANUP]`` run log line, a ``cleanup-progress.jsonl`` line in the run
+        folder and ``cleanup`` on /api/active (stage, start, seconds so far). ticks.jsonl keeps its shape (its last
+        line is what the verify skill reads). The tick itself, the cleanup call, its order and its result (DIRTY on a
+        failed cleanup) are untouched: this only waits on the same awaitable in slices."""
+        task = asyncio.ensure_future(runtime.tick())
+        interval = float(getattr(runtime.session.spec, "tick_interval_sec", 0) or 0)
+        if interval <= 0:
+            interval = CLEANUP_PROGRESS_SEC
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=interval)
+                if done:
+                    return task.result()
+                self._note_cleanup_progress(runtime, run_dir, run_log)
+        finally:
+            if not task.done():
+                task.cancel()
+            self._cleanup_progress = None
+
+    def _note_cleanup_progress(self, runtime, run_dir: Path, run_log) -> None:
+        """One progress record for the cleanup in flight, if any; never fatal."""
+        progress = getattr(runtime, "cleanup_in_progress", None)
+        if not progress:
+            return
+        try:
+            now = self.clock.now()
+            started = progress["started_at"]
+            record = CleanupProgress(
+                stage=progress["stage"],
+                started_at=started,
+                elapsed_sec=max(0, int((now - started).total_seconds())),
+                recorded_at=now,
+            )
+            self._cleanup_progress = record
+            if run_dir.parent != self.artifact_store.root or run_dir.is_symlink():
+                raise RuntimeError("cleanup progress escaped the trusted runs root")
+            with (run_dir / "cleanup-progress.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(record.model_dump_json() + "\n")
+            run_log(
+                f"[CLEANUP] {record.stage} cleanup in progress +{record.elapsed_sec}s "
+                f"(since {record.started_at.isoformat()})"
+            )
+        except Exception as error:  # diagnostics must never fail the run
+            self._append_log(f"[ERROR] Cleanup progress diagnostics failed: {error}")
 
     def _record_tick(self, runtime, session, run_dir: Path, run_log) -> None:
         """Persist the tick diagnostic (ticks.jsonl + run log line); never fatal."""

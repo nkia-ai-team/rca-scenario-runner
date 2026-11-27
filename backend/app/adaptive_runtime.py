@@ -286,6 +286,10 @@ class AdaptiveRuntime:
         # driver persists it (ticks.jsonl); it is not part of the session
         # schema and is intentionally reset on every tick.
         self.last_tick: dict[str, Any] | None = None
+        # The cleanup call in flight, if any: {"stage": "terminal" | "transition", "started_at": datetime}. A cleanup
+        # can take its dispatcher's whole limit (RUNCL: 1,200 s on 11-27) while tick() is awaiting it; the driver
+        # reads this to keep recording progress meanwhile. Not part of the session.
+        self.cleanup_in_progress: dict[str, Any] | None = None
 
     @classmethod
     def create(
@@ -461,7 +465,11 @@ class AdaptiveRuntime:
         )
         try:
             action = getattr(self.applier, "transition_cleanup", self.applier.cleanup)
-            result = await _maybe_await(action(request))
+            self.cleanup_in_progress = {"stage": "transition", "started_at": request.requested_at}
+            try:
+                result = await _maybe_await(action(request))
+            finally:
+                self.cleanup_in_progress = None
             _validate_fenced_result(request, result)
         except Exception as error:
             result = CleanupResult(
@@ -610,7 +618,11 @@ class AdaptiveRuntime:
             requested_at=now,
         )
         try:
-            result = await _maybe_await(self.applier.cleanup(request))
+            self.cleanup_in_progress = {"stage": "terminal", "started_at": now}
+            try:
+                result = await _maybe_await(self.applier.cleanup(request))
+            finally:
+                self.cleanup_in_progress = None
             _validate_fenced_result(request, result)
         except Exception as error:
             result = CleanupResult(

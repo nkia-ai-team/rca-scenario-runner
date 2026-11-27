@@ -687,3 +687,60 @@ async def test_profile_apply_failure_keeps_the_executor_message_whole() -> None:
     assert "267MB free, preflight needs at least 1024MB" in reason
     assert 'failed at line 57: [[ "$free" -ge "$free_mb" ]]' in reason
     assert "\n" not in reason
+
+
+async def test_a_slow_cleanup_is_reported_in_flight_and_cleared_after_success_or_failure() -> None:
+    """RUNCL: while tick() awaits the cleanup, the runtime says a cleanup is in flight (stage, start) so the driver
+    can keep recording progress; when it returns (success, failure or exception) it says so no more. A failed
+    cleanup still makes the run DIRTY with one cleanup call (order and count unchanged)."""
+    import asyncio
+
+    seen: list[dict | None] = []
+    for succeeds in (True, False):
+        clock = FakeClock()
+        values = {"loadgen.achieved_rps": 100, "http.entry_health": 200, "database.tagged_session_count": 0}
+        applier = FakeApplier(clock, cleanup_succeeds=succeeds)
+        runtime, _, _ = _runtime(clock, values, applier=applier)
+        gate = asyncio.Event()
+        plain = applier.cleanup
+
+        async def slow_cleanup(request, plain=plain, gate=gate):
+            await gate.wait()
+            return plain(request)
+
+        applier.cleanup = slow_cleanup
+        await runtime.begin()
+        clock.advance(20)
+        await runtime.tick()
+        clock.advance(30)
+        task = asyncio.ensure_future(runtime.tick())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        seen.append(dict(runtime.cleanup_in_progress or {}))
+        assert runtime.cleanup_in_progress["stage"] == "terminal"
+        assert runtime.cleanup_in_progress["started_at"] == clock.now()
+        gate.set()
+        session = await task
+        assert runtime.cleanup_in_progress is None
+        assert len(applier.cleanups) == 1
+        if succeeds:
+            assert session.status in {SessionStatus.RECOVERING, SessionStatus.CLEAN}, session.status
+        else:
+            assert session.status == SessionStatus.DIRTY
+
+    clock = FakeClock()
+    values = {"loadgen.achieved_rps": 100, "http.entry_health": 200, "database.tagged_session_count": 0}
+    applier = FakeApplier(clock)
+
+    def broken(request):
+        raise RuntimeError("dispatcher timed out after 1200 seconds")
+
+    applier.cleanup = broken
+    runtime, _, _ = _runtime(clock, values, applier=applier)
+    await runtime.begin()
+    clock.advance(20)
+    await runtime.tick()
+    clock.advance(30)
+    session = await runtime.tick()
+    assert runtime.cleanup_in_progress is None and session.status == SessionStatus.DIRTY
+    assert "cleanup_exception:RuntimeError" in (session.cleanup.reason or "")
