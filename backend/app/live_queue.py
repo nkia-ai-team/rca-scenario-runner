@@ -234,13 +234,15 @@ ORACLE_CHECK_MAX_AGE = oracle_check_max_age(ORACLE_CHECK_DEFAULT_PERIOD)
 # Default 75 minutes, PETITION_ARCHIVE_STATE_MAX_AGE_SEC overrides. Off unless the directory is configured.
 # 119 load gate (questions.md Q44 answer, task 1): when other load on 119's host pushes it, its pollers fall behind
 # and write false DOWNs into a recording (11-25 21:57:59 the router read DOWN for 44 s at CPU 84.7 %, load 15.5 ~
-# 23.4 on 8 vCPUs). Right before an injection, the last 10 minutes of 119's CPU busy share (steal excluded) and its
-# highest 1-minute load average must stay under these; else the injection is held (not dirty, not a pause) and the
-# gate looks again. Thresholds from that case and 119's last 7 days (LOADGATE.md): 80 % and 20 (2.5 per vCPU) hold
-# 13.7 % of 10-minute windows and catch the case at every minute from 21:50. A reading that fails holds too.
+# 23.4 on 8 vCPUs). Right before an injection the injection is held (not dirty, not a pause; the gate looks again)
+# when one of three stayed up through the last 10 minutes: CPU user + system (10-minute average) 95 %, the 1-minute
+# load average (its lowest value in the window, so it was up the whole time) 32 (4 per vCPU), or steal (10-minute
+# average) 10 %. Review-session thresholds (board 11-27 12:0x, 12:1x, LG2.md): after P4 the first ones (80 %, a
+# load peak of 20) held 41.8 % of windows; steal catches the real cause, 104 taking CPU from 119. A failed read holds.
 MONITORING_LOAD_CHECK_NAME = "monitoring_load"
-MONITORING_CPU_MAX_PCT = 80.0
-MONITORING_LOAD1_MAX = 20.0
+MONITORING_CPU_MAX_PCT = 95.0
+MONITORING_LOAD1_MAX = 32.0
+MONITORING_STEAL_MAX_PCT = 10.0
 MONITORING_LOAD_RECHECK = timedelta(seconds=30)
 ARCHIVE_STATE_CHECK_NAME = "petition_archive_state"
 # The same check on the S testbed's dbsvr01 (S design §7-4 보관 배치 상태: same timer, same file, same verdict).
@@ -665,6 +667,7 @@ class LiveScenarioQueue:
         monitoring_load_peak: "Callable[[datetime, datetime], dict[str, Any]] | None" = None,
         monitoring_cpu_max_pct: float = MONITORING_CPU_MAX_PCT,
         monitoring_load1_max: float = MONITORING_LOAD1_MAX,
+        monitoring_steal_max_pct: float = MONITORING_STEAL_MAX_PCT,
     ) -> None:
         self.runner = runner
         # Per-domain preflight probes (spec-testbed-vm-3tier §6-4): a scenario of a domain listed here is judged on
@@ -685,6 +688,7 @@ class LiveScenarioQueue:
         self.monitoring_load_peak = monitoring_load_peak
         self.monitoring_cpu_max_pct = monitoring_cpu_max_pct
         self.monitoring_load1_max = monitoring_load1_max
+        self.monitoring_steal_max_pct = monitoring_steal_max_pct
         self._monitoring_looked: datetime | None = None
         self._monitoring_reading: dict[str, Any] | None = None
         # None while every testbed app pod is Ready, else what is not. None (no probe) leaves the
@@ -1783,11 +1787,14 @@ class LiveScenarioQueue:
         if "error" in reading:
             detail = f"119 load unreadable: {reading['error']}"
         else:
-            cpu, load = float(reading["cpu_busy_pct"]), float(reading["load1_max"])
-            if cpu < self.monitoring_cpu_max_pct and load < self.monitoring_load1_max:
+            cpu, load = float(reading["cpu_busy_pct"]), float(reading["load1_min"])
+            steal = float(reading["steal_pct"])
+            if (cpu < self.monitoring_cpu_max_pct and load < self.monitoring_load1_max
+                    and steal < self.monitoring_steal_max_pct):
                 return False, None
-            detail = (f"119 CPU busy {cpu:.1f}% (limit {self.monitoring_cpu_max_pct:g}), load1 max {load:.1f} "
-                      f"(limit {self.monitoring_load1_max:g}) over the last 10 minutes")
+            detail = (f"119 CPU user+system {cpu:.1f}% (limit {self.monitoring_cpu_max_pct:g}), load1 lowest "
+                      f"{load:.1f} (limit {self.monitoring_load1_max:g}), steal {steal:.1f}% "
+                      f"(limit {self.monitoring_steal_max_pct:g}) over the last 10 minutes")
         logger.warning("injection held: %s: %s", MONITORING_LOAD_CHECK_NAME, detail)
         return True, detail
 
@@ -3405,6 +3412,7 @@ class LiveScenarioQueue:
             document["monitoring_load_gate"] = {
                 **self._monitoring_reading,
                 "cpu_max_pct": self.monitoring_cpu_max_pct, "load1_max_limit": self.monitoring_load1_max,
+                "steal_max_pct": self.monitoring_steal_max_pct,
             }
         self._write_preflight_document(run_id, document)
 
@@ -3747,7 +3755,7 @@ def vm_testbed_queue_settings() -> dict[str, Any]:
 
 def monitoring_load_settings() -> dict[str, Any]:
     """The 119 load gate from the environment: on unless PREFLIGHT_119_LOAD_GATE is 0/off; limits
-    PREFLIGHT_119_CPU_MAX_PCT and PREFLIGHT_119_LOAD1_MAX (defaults MONITORING_*)."""
+    PREFLIGHT_119_CPU_MAX_PCT, PREFLIGHT_119_LOAD1_MAX and PREFLIGHT_119_STEAL_MAX_PCT (defaults MONITORING_*)."""
     if os.environ.get("PREFLIGHT_119_LOAD_GATE", "1").strip().lower() in {"0", "false", "no", "off"}:
         return {"monitoring_load_probe": None, "monitoring_load_peak": None}
     from app.preflight_probe import monitoring_load, monitoring_load_peak
@@ -3757,6 +3765,9 @@ def monitoring_load_settings() -> dict[str, Any]:
         "monitoring_load_peak": lambda start, end: monitoring_load_peak(start, end),
         "monitoring_cpu_max_pct": float(os.environ.get("PREFLIGHT_119_CPU_MAX_PCT", "") or MONITORING_CPU_MAX_PCT),
         "monitoring_load1_max": float(os.environ.get("PREFLIGHT_119_LOAD1_MAX", "") or MONITORING_LOAD1_MAX),
+        "monitoring_steal_max_pct": float(
+            os.environ.get("PREFLIGHT_119_STEAL_MAX_PCT", "") or MONITORING_STEAL_MAX_PCT
+        ),
     }
 
 

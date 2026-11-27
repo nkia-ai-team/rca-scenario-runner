@@ -679,21 +679,24 @@ def test_119_load_reads_cpu_without_steal_and_the_highest_load_from_119_s_own_ho
         class Response:
             def read(self):
                 q = query["query"][0]
-                value = "23.4" if "load_average" in q else "84.1"
+                value = "23.4" if "load_average" in q else ("3.2" if 'state="steal"' in q else "84.1")
                 return json.dumps({"data": {"result": [{"metric": {}, "value": [0, value]}]}}).encode()
 
         yield Response()
 
     reading = monitoring_load("http://vm", urlopen=urlopen)
-    assert reading == {"cpu_busy_pct": 84.1, "load1_max": 23.4, "window_sec": 600.0}
-    cpu, load = seen[0]["query"][0], seen[1]["query"][0]
-    assert f'target_id="{MONITORING_HOST_TARGET}"' in cpu and 'state!~"idle|wait|steal"' in cpu and "[600s]" in cpu
-    assert load == f'max_over_time(system.cpu.load_average.1m{{target_id="{MONITORING_HOST_TARGET}"}}[600s])'
+    assert reading == {"cpu_busy_pct": 84.1, "steal_pct": 3.2, "load1_min": 23.4, "window_sec": 600.0}
+    cpu, steal, load = seen[0]["query"][0], seen[1]["query"][0], seen[2]["query"][0]
+    assert f'target_id="{MONITORING_HOST_TARGET}"' in cpu and 'state=~"user|system"' in cpu and "[600s]" in cpu
+    assert 'state="steal"' in steal and "[600s]" in steal
+    # Held through the window: its lowest 1-minute load, not its peak.
+    assert load == f'min_over_time(system.cpu.load_average.1m{{target_id="{MONITORING_HOST_TARGET}"}}[600s])'
     start, end = datetime(2026, 11, 25, 12, 30, tzinfo=timezone.utc), datetime(2026, 11, 25, 13, 10, tzinfo=timezone.utc)
     peak = monitoring_load_peak(start, end, "http://vm", urlopen=urlopen)
     assert peak == {"from": "2026-11-25T12:30:00Z", "to": "2026-11-25T13:10:00Z", "cpu_busy_pct_max": 84.1,
-                    "load1_max": 23.4}
-    assert seen[-2]["query"][0].startswith("max_over_time((100 * sum(rate(") and "[2400s:1m]" in seen[-2]["query"][0]
+                    "steal_pct_max": 3.2, "load1_max": 23.4}
+    assert seen[-3]["query"][0].startswith("max_over_time((100 * sum(rate(") and "[2400s:1m]" in seen[-3]["query"][0]
+    assert 'state="steal"' in seen[-2]["query"][0] and "[2400s:1m]" in seen[-2]["query"][0]
     assert seen[-1]["time"] == [str(int(end.timestamp()))]
 
     @contextmanager

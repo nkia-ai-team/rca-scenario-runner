@@ -3202,14 +3202,14 @@ async def test_the_cycle_buffer_gate_holds_on_a_loaded_119_and_the_window_peak_g
     pause); once it starts, cooldown entry adds 119's highest CPU and load from the cycle start to the injection end
     to preflight.json before the capture reads it."""
     queue, runner, _, scheduler, clock = make_cycle_queue(tmp_path)
-    answers = [{"cpu_busy_pct": 90.0, "load1_max": 5.0, "window_sec": 600.0}]
+    answers = [{"cpu_busy_pct": 50.0, "steal_pct": 12.0, "load1_min": 5.0, "window_sec": 600.0}]
     queue.monitoring_load_probe = lambda: answers[0]
     from tests.test_live_queue import FakePreflightProbe
 
     queue.preflight_probe = FakePreflightProbe(FakePreflightProbe.CLEAN)
     peaks = []
     queue.monitoring_load_peak = lambda start, end: peaks.append((start, end)) or {
-        "from": "x", "to": "y", "cpu_busy_pct_max": 88.8, "load1_max": 23.4}
+        "from": "x", "to": "y", "cpu_busy_pct_max": 88.8, "steal_pct_max": 12.4, "load1_max": 23.4}
     await queue.start()
     state = await queue.tick()
     clock.value = state_expected(state)
@@ -3218,7 +3218,7 @@ async def test_the_cycle_buffer_gate_holds_on_a_loaded_119_and_the_window_peak_g
     clock.value = state_expected(state)
     state = await queue.tick()
     assert state.phase == "cycle_buffer" and runner.started == []
-    answers[0] = {"cpu_busy_pct": 50.0, "load1_max": 5.0, "window_sec": 600.0}
+    answers[0] = {"cpu_busy_pct": 50.0, "steal_pct": 1.0, "load1_min": 5.0, "window_sec": 600.0}
     clock.value += timedelta(seconds=30)
     state = await queue.tick()
     assert state.phase == "running" and runner.started == [("F01-R", "run")], state.reason
@@ -3228,6 +3228,7 @@ async def test_the_cycle_buffer_gate_holds_on_a_loaded_119_and_the_window_peak_g
     assert state.phase == "cycle_cooldown"
     recorded = json.loads((runner.artifact_store.root / run_id / "preflight.json").read_text())
     assert recorded["monitoring_load_window"]["load1_max"] == 23.4
+    assert recorded["monitoring_load_window"]["steal_pct_max"] == 12.4
     assert recorded["monitoring_load_gate"]["cpu_busy_pct"] == 50.0
     start, end = peaks[0]
     assert start == datetime.strptime(state.cycle_started_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)

@@ -2086,13 +2086,14 @@ def test_the_live_queue_singleton_takes_s_s_gates(tmp_path: Path, monkeypatch) -
 
 @pytest.mark.asyncio
 async def test_a_loaded_119_holds_the_injection_and_an_unloaded_one_lets_it_start(tmp_path: Path) -> None:
-    """Over either limit (CPU busy 80 %, load1 20) or an unreadable reading: the injection is held, not paused and
-    not dirty, and the gate looks again after MONITORING_LOAD_RECHECK. Under both: it starts, and preflight.json
-    (carried into meta.json) keeps the reading it started on."""
+    """Any one of the three held through the last 10 minutes (CPU user+system 95 %, the lowest load1 32, steal 10 %;
+    review-session thresholds, LG2) or an unreadable reading: the injection is held, not paused and not dirty, and
+    the gate looks again after MONITORING_LOAD_RECHECK. All three under: it starts, and preflight.json (carried into
+    meta.json) keeps the reading it started on."""
     from app.live_queue import MONITORING_LOAD_RECHECK
 
     queue, runner, _, _, clock = make_queue(tmp_path)
-    answers = [{"cpu_busy_pct": 84.1, "load1_max": 15.5, "window_sec": 600.0}]
+    answers = [{"cpu_busy_pct": 95.0, "steal_pct": 0.5, "load1_min": 15.5, "window_sec": 600.0}]
     calls = []
 
     def probe():
@@ -2109,33 +2110,41 @@ async def test_a_loaded_119_holds_the_injection_and_an_unloaded_one_lets_it_star
     assert runner.started == [] and state.phase != "paused" and len(calls) == 1
     state = await queue.tick()  # within the recheck: the same reading, no new query
     assert runner.started == [] and len(calls) == 1
-    for answer in ({"cpu_busy_pct": 60.0, "load1_max": 23.4, "window_sec": 600.0}, RuntimeError("no data")):
+    for answer in ({"cpu_busy_pct": 60.0, "steal_pct": 0.5, "load1_min": 32.0, "window_sec": 600.0},
+                   {"cpu_busy_pct": 60.0, "steal_pct": 10.0, "load1_min": 12.0, "window_sec": 600.0},
+                   RuntimeError("no data")):
         answers[0] = answer
         clock.value += MONITORING_LOAD_RECHECK
         state = await queue.tick()
         assert runner.started == [] and state.phase != "paused", answer
-    answers[0] = {"cpu_busy_pct": 79.9, "load1_max": 19.9, "window_sec": 600.0}
+    # The first thresholds' case (11-25 21:57, CPU 84 %, a load peak of 23) no longer holds by itself.
+    answers[0] = {"cpu_busy_pct": 94.9, "steal_pct": 9.9, "load1_min": 31.9, "window_sec": 600.0}
     clock.value += MONITORING_LOAD_RECHECK
     state = await queue.tick()
     assert runner.started == [("F01-R", "run")], state.reason
     recorded = json.loads((runner.artifact_store.root / "run-F01-R" / "preflight.json").read_text())
-    assert recorded["monitoring_load_gate"] == {"cpu_busy_pct": 79.9, "load1_max": 19.9, "window_sec": 600.0,
-                                                "cpu_max_pct": 80.0, "load1_max_limit": 20.0}
+    assert recorded["monitoring_load_gate"] == {"cpu_busy_pct": 94.9, "steal_pct": 9.9, "load1_min": 31.9,
+                                                "window_sec": 600.0, "cpu_max_pct": 95.0, "load1_max_limit": 32.0,
+                                                "steal_max_pct": 10.0}
     assert recorded["verdict"] == "clean"
 
 
 def test_the_119_load_gate_is_on_by_default_and_its_limits_come_from_the_environment(monkeypatch) -> None:
     from app import live_queue, preflight_probe
 
-    for name in ("PREFLIGHT_119_LOAD_GATE", "PREFLIGHT_119_CPU_MAX_PCT", "PREFLIGHT_119_LOAD1_MAX"):
+    for name in ("PREFLIGHT_119_LOAD_GATE", "PREFLIGHT_119_CPU_MAX_PCT", "PREFLIGHT_119_LOAD1_MAX",
+                 "PREFLIGHT_119_STEAL_MAX_PCT"):
         monkeypatch.delenv(name, raising=False)
     on = live_queue.monitoring_load_settings()
     assert on["monitoring_load_probe"] is preflight_probe.monitoring_load and on["monitoring_load_peak"] is not None
-    assert on["monitoring_cpu_max_pct"] == 80.0 and on["monitoring_load1_max"] == 20.0
+    assert on["monitoring_cpu_max_pct"] == 95.0 and on["monitoring_load1_max"] == 32.0
+    assert on["monitoring_steal_max_pct"] == 10.0
     monkeypatch.setenv("PREFLIGHT_119_CPU_MAX_PCT", "85")
     monkeypatch.setenv("PREFLIGHT_119_LOAD1_MAX", "24")
     assert live_queue.monitoring_load_settings()["monitoring_cpu_max_pct"] == 85.0
     assert live_queue.monitoring_load_settings()["monitoring_load1_max"] == 24.0
+    monkeypatch.setenv("PREFLIGHT_119_STEAL_MAX_PCT", "5")
+    assert live_queue.monitoring_load_settings()["monitoring_steal_max_pct"] == 5.0
     monkeypatch.setenv("PREFLIGHT_119_LOAD_GATE", "0")
     assert live_queue.monitoring_load_settings() == {"monitoring_load_probe": None, "monitoring_load_peak": None}
     compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text(encoding="utf-8")
