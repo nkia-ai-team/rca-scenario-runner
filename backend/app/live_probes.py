@@ -65,6 +65,10 @@ LOADGEN_FIELDS = {
     # already emitted per business_step/read_step tagging.
     "loadgen.frozen_bypass_completed_rate": "business_2xx_rate",
     "loadgen.normal_path_reject_rate": "read_nonok_rate",
+    # testbed-services F82-R (civil-petition): the p95 of every request's duration in the 30 s window, in ms, from the
+    # baseline monitor's --http-summary (a rate limit on the router slows the portal before it fails it, so the
+    # nonok rates stay low while the requests take seconds). Not a rate: the [0,1] check below does not apply.
+    "loadgen.http_p95_ms": "http_p95_ms",
 }
 # Observation plane separation (2026-07-29): a loadgen observation may name a
 # domain, in which case it reads that domain's *baseline* live document instead

@@ -640,6 +640,15 @@
         "domain"
       ]
     },
+    "loadgen.http_p95_ms": {
+      "adapter": "loadgen_summary",
+      "selector": "http.p95.ms",
+      "freshness_sec": 30,
+      "update_interval_sec": 30,
+      "allowed_parameters": [
+        "domain"
+      ]
+    },
     "host.disk_io_utilization": {
       "adapter": "host_probe",
       "selector": "scenario.target.disk_io_utilization",
